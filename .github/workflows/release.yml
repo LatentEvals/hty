@@ -73,3 +73,87 @@ jobs:
           files: upload/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  homebrew:
+    name: update homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: download sha256 files
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: read sha256 values
+        id: sha
+        run: |
+          for name in hty-aarch64-macos hty-x86_64-linux hty-aarch64-linux; do
+            sha=$(cat dist/${name}/${name}.tar.gz.sha256 | awk '{print $1}')
+            key=$(echo "$name" | tr '-' '_')
+            echo "${key}=${sha}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: generate formula
+        run: |
+          cat > hty.rb << 'FORMULA'
+          class Hty < Formula
+            desc "Interactive terminal automation for AI agents"
+            homepage "https://github.com/montanaflynn/hty"
+            version "${{ steps.version.outputs.version }}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/montanaflynn/hty/releases/download/v#{version}/hty-aarch64-macos.tar.gz"
+                sha256 "${{ steps.sha.outputs.hty_aarch64_macos }}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/montanaflynn/hty/releases/download/v#{version}/hty-x86_64-linux.tar.gz"
+                sha256 "${{ steps.sha.outputs.hty_x86_64_linux }}"
+              end
+              on_arm do
+                url "https://github.com/montanaflynn/hty/releases/download/v#{version}/hty-aarch64-linux.tar.gz"
+                sha256 "${{ steps.sha.outputs.hty_aarch64_linux }}"
+              end
+            end
+
+            def install
+              bin.install "hty"
+            end
+
+            test do
+              assert_match "Usage", shell_output("#{bin}/hty --help")
+            end
+          end
+          FORMULA
+          # fix indentation (heredoc adds leading spaces)
+          sed -i 's/^          //' hty.rb
+          cat hty.rb
+
+      - name: push to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          SHA=$(gh api repos/montanaflynn/homebrew-tap/contents/Formula/hty.rb --jq '.sha' 2>/dev/null || echo "")
+          CONTENT=$(base64 -w0 hty.rb)
+          if [ -n "$SHA" ]; then
+            gh api repos/montanaflynn/homebrew-tap/contents/Formula/hty.rb \
+              -X PUT \
+              -f message="update hty to ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT" \
+              -f sha="$SHA" \
+              --jq '.commit.sha'
+          else
+            gh api repos/montanaflynn/homebrew-tap/contents/Formula/hty.rb \
+              -X PUT \
+              -f message="add hty ${{ steps.version.outputs.version }}" \
+              -f content="$CONTENT" \
+              --jq '.commit.sha'
+          fi
