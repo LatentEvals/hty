@@ -5406,3 +5406,149 @@ test "headless protocol can launch top and quit" {
         _ = try expectTestOk(parsed);
     }
 }
+
+test "headless protocol can use emacs to write an org file" {
+    if (!commandExists("/opt/homebrew/bin/emacs") and !commandExists("/usr/bin/emacs") and !commandExists("/usr/local/bin/emacs")) return error.SkipZigTest;
+
+    const emacs_path: []const u8 = if (commandExists("/opt/homebrew/bin/emacs"))
+        "/opt/homebrew/bin/emacs"
+    else if (commandExists("/usr/local/bin/emacs"))
+        "/usr/local/bin/emacs"
+    else
+        "/usr/bin/emacs";
+
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-emacs-{d}.org", .{std.time.nanoTimestamp()});
+    defer std.testing.allocator.free(path);
+    std.fs.deleteFileAbsolute(path) catch {};
+    defer std.fs.deleteFileAbsolute(path) catch {};
+
+    // Spawn emacs in terminal mode with no init file.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "emacs",
+            .program = emacs_path,
+            .args = [_][]const u8{ "-nw", "-q", "--no-splash", path },
+            .rows = 24,
+            .cols = 80,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Wait for emacs to start.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "emacs",
+            .idle_ms = 500,
+            .timeout_ms = 10_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Type org-mode content.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "emacs",
+            .text = "* Hello from hty",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "emacs",
+            .key = "enter",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "emacs",
+            .text = "** TODO Write tests",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Save: C-x C-s
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "emacs",
+            .key = "ctrl-x",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "emacs",
+            .key = "ctrl-s",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Wait for save to complete.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "emacs",
+            .idle_ms = 500,
+            .timeout_ms = 5_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Quit: C-x C-c
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "emacs",
+            .key = "ctrl-x",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "emacs",
+            .key = "ctrl-c",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Wait for emacs to exit.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_exit",
+            .session = "emacs",
+            .timeout_ms = 5_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Verify file contents.
+    const file = try std.fs.openFileAbsolute(path, .{});
+    defer file.close();
+    const contents = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "* Hello from hty") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "** TODO Write tests") != null);
+}
