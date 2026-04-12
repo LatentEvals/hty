@@ -11,7 +11,7 @@ set -eu
 #
 # Options:
 #   --version VERSION    Release tag to install (default: latest)
-#   --install-dir DIR    Install directory (default: /usr/local/bin or HTY_INSTALL_DIR)
+#   --install-dir DIR    Install directory (default: ~/.local/bin or HTY_INSTALL_DIR)
 #   --verify MODE        auto | always | never — checksum verification (default: auto)
 #   --color MODE         auto | always | never (default: auto)
 #   --force              Overwrite existing binary without prompting
@@ -27,7 +27,7 @@ set -eu
 REPO="montanaflynn/hty"
 BINARY_NAME="hty"
 GITHUB_BASE_URL="https://github.com"
-INSTALL_DIR="${HTY_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${HTY_INSTALL_DIR:-${HOME}/.local/bin}"
 VERSION="latest"
 FORCE=0
 DRY_RUN=0
@@ -44,7 +44,7 @@ Usage:
 
 Options:
   --version VERSION    Release tag (default: latest)
-  --install-dir DIR    Install directory (default: /usr/local/bin)
+  --install-dir DIR    Install directory (default: ~/.local/bin)
   --verify MODE        auto | always | never (default: auto)
   --color MODE         auto | always | never (default: auto)
   --force              Overwrite existing binary
@@ -270,17 +270,67 @@ install_binary() {
   fi
 }
 
+detect_shell_profile() {
+  _shell="${SHELL:-/bin/sh}"
+  _shell_name=$(basename "$_shell")
+
+  case "$_shell_name" in
+    zsh)
+      if [ -f "${HOME}/.zshrc" ]; then
+        printf '%s' "${HOME}/.zshrc"
+      else
+        printf '%s' "${HOME}/.zprofile"
+      fi
+      ;;
+    bash)
+      if [ -f "${HOME}/.bashrc" ]; then
+        printf '%s' "${HOME}/.bashrc"
+      elif [ -f "${HOME}/.bash_profile" ]; then
+        printf '%s' "${HOME}/.bash_profile"
+      else
+        printf '%s' "${HOME}/.profile"
+      fi
+      ;;
+    fish)
+      printf '%s' "${HOME}/.config/fish/config.fish"
+      ;;
+    *)
+      printf '%s' "${HOME}/.profile"
+      ;;
+  esac
+}
+
+path_export_line() {
+  _shell="${SHELL:-/bin/sh}"
+  _shell_name=$(basename "$_shell")
+
+  case "$_shell_name" in
+    fish)
+      printf 'fish_add_path "%s"' "$INSTALL_DIR"
+      ;;
+    *)
+      printf 'export PATH="%s:$PATH"' "$INSTALL_DIR"
+      ;;
+  esac
+}
+
 path_hint() {
   case ":${PATH}:" in
     *:"${INSTALL_DIR}":*) ;;
     *)
+      _profile=$(detect_shell_profile)
+      _export=$(path_export_line)
+
       if [ "$JSON" -eq 1 ]; then
-        printf '{"level":"info","event":"path_hint","message":"%s is not on PATH"}\n' \
-          "$(json_escape "$INSTALL_DIR")"
+        printf '{"level":"info","event":"path_hint","message":"%s is not on PATH","profile":"%s","command":"%s"}\n' \
+          "$(json_escape "$INSTALL_DIR")" \
+          "$(json_escape "$_profile")" \
+          "$(json_escape "$_export")"
       elif [ "$SILENT" -eq 0 ]; then
         printf '\n' >&2
-        printf '  Add to your shell profile:\n' >&2
-        printf '  export PATH="%s:$PATH"\n' "$INSTALL_DIR" >&2
+        printf '  Run this to add hty to your PATH (or restart your shell):\n' >&2
+        printf '\n' >&2
+        printf '  echo '\''%s'\'' >> %s && source %s\n' "$_export" "$_profile" "$_profile" >&2
       fi
       ;;
   esac

@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
 ```
 
-Auto-detects your OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `/usr/local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target directory.
+Auto-detects your OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target directory.
 
 Or download a specific platform from the [releases page](https://github.com/montanaflynn/hty/releases/latest).
 
