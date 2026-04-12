@@ -29,6 +29,14 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: install test dependencies (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nano emacs-nox
+
+      - name: install test dependencies (macos)
+        if: runner.os == 'macOS'
+        run: brew install nano emacs
+
       - name: build
         run: zig build
 

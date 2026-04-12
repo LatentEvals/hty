@@ -5245,7 +5245,14 @@ test "session event log records spawn, input, output, killed" {
 }
 
 test "headless protocol can use nano to write a file" {
-    if (!commandExists("/usr/bin/nano")) return error.SkipZigTest;
+    if (!commandExists("/usr/bin/nano") and !commandExists("/opt/homebrew/bin/nano") and !commandExists("/usr/local/bin/nano")) return error.SkipZigTest;
+
+    const nano_path: []const u8 = if (commandExists("/opt/homebrew/bin/nano"))
+        "/opt/homebrew/bin/nano"
+    else if (commandExists("/usr/local/bin/nano"))
+        "/usr/local/bin/nano"
+    else
+        "/usr/bin/nano";
 
     var registry = SessionRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -5259,7 +5266,7 @@ test "headless protocol can use nano to write a file" {
         var parsed = try testRequest(&registry, .{
             .op = "spawn",
             .name = "nano",
-            .program = "/usr/bin/nano",
+            .program = nano_path,
             .args = [_][]const u8{path},
             .rows = 24,
             .cols = 80,
