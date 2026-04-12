@@ -1,0 +1,75 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: hty-aarch64-macos
+          - os: ubuntu-latest
+            name: hty-x86_64-linux
+          - os: ubuntu-24.04-arm
+            name: hty-aarch64-linux
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: build release binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: package
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/hty dist/hty
+          cd dist
+          tar -czf ${{ matrix.name }}.tar.gz hty
+          shasum -a 256 ${{ matrix.name }}.tar.gz > ${{ matrix.name }}.tar.gz.sha256
+          ls -la
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/${{ matrix.name }}.tar.gz
+            dist/${{ matrix.name }}.tar.gz.sha256
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: flatten
+        run: |
+          mkdir -p upload
+          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} upload/ \;
+          ls -la upload
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: upload/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

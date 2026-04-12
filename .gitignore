@@ -1,0 +1,5 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+.claude/
+.uncompact/

@@ -1,0 +1,779 @@
+const std = @import("std");
+const builtin = @import("builtin");
+pub const ghostty_vt = @import("ghostty-vt");
+
+// forkpty lives in <util.h> on macOS / BSD and <pty.h> on Linux.
+// Pick the right header at comptime based on the target OS.
+const c = @cImport({
+    @cInclude("errno.h");
+    @cInclude("signal.h");
+    @cInclude("stdlib.h");
+    @cInclude("sys/ioctl.h");
+    @cInclude("sys/types.h");
+    @cInclude("sys/wait.h");
+    @cInclude("termios.h");
+    @cInclude("unistd.h");
+    if (builtin.os.tag == .linux) {
+        @cInclude("pty.h");
+    } else {
+        @cInclude("util.h");
+    }
+});
+
+pub const EnvVar = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const CommandSpec = struct {
+    program: []const u8,
+    args: []const []const u8 = &.{},
+};
+
+pub const TerminalConfig = struct {
+    rows: u16 = 24,
+    cols: u16 = 80,
+    scrollback: usize = 10_000,
+    env: []const EnvVar = &.{},
+    cwd: ?[]const u8 = null,
+    emit_raw_bytes: bool = true,
+    emit_screen_updates: bool = true,
+    cell_width: u32 = 9,
+    cell_height: u32 = 18,
+};
+
+pub const InputEvent = union(enum) {
+    bytes: []const u8,
+    text: []const u8,
+    resize: struct {
+        rows: u16,
+        cols: u16,
+    },
+    close_stdin,
+};
+
+pub const OutputEvent = union(enum) {
+    started,
+    raw_bytes: []u8,
+    screen_update,
+    title_changed: []u8,
+    bell,
+    exited: ?i32,
+    failure: []u8,
+
+    pub fn deinit(self: *OutputEvent, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .raw_bytes => |bytes| alloc.free(bytes),
+            .title_changed => |title| alloc.free(title),
+            .failure => |message| alloc.free(message),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const ScreenSnapshot = struct {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    title: ?[]u8,
+    buffer: []const u8,
+    screen_ansi: []const u8,
+    lines: [][]const u8,
+
+    pub fn deinit(self: *ScreenSnapshot, alloc: std.mem.Allocator) void {
+        if (self.title) |title| alloc.free(title);
+        alloc.free(self.lines);
+        alloc.free(self.screen_ansi);
+        alloc.free(self.buffer);
+        self.* = undefined;
+    }
+};
+
+pub const InteractiveTerminal = struct {
+    alloc: std.mem.Allocator,
+    terminal: ghostty_vt.Terminal,
+    handler: ghostty_vt.TerminalStream.Handler,
+    stream: ghostty_vt.TerminalStream,
+    config: TerminalConfig,
+    master_fd: std.posix.fd_t,
+    child_pid: std.posix.pid_t,
+    reader_thread: ?std.Thread = null,
+    mutex: std.Thread.Mutex = .{},
+    write_mutex: std.Thread.Mutex = .{},
+    events: std.ArrayListUnmanaged(OutputEvent) = .{},
+    closed: bool = false,
+    exit_code: ?i32 = null,
+    last_title: ?[]u8 = null,
+
+    pub fn spawn(
+        alloc: std.mem.Allocator,
+        command: CommandSpec,
+        config: TerminalConfig,
+    ) !*InteractiveTerminal {
+        const argv = try buildArgv(alloc, command);
+        defer freeArgv(alloc, argv);
+
+        const cwd_z = if (config.cwd) |cwd| try alloc.dupeZ(u8, cwd) else null;
+        defer if (cwd_z) |cwd| alloc.free(cwd);
+
+        const env_z = try buildEnv(alloc, config.env);
+        defer freeEnv(alloc, env_z);
+
+        var winsize = std.mem.zeroes(c.winsize);
+        winsize.ws_row = config.rows;
+        winsize.ws_col = config.cols;
+        winsize.ws_xpixel = @intCast(config.cols * config.cell_width);
+        winsize.ws_ypixel = @intCast(config.rows * config.cell_height);
+
+        var master: c_int = -1;
+        const pid = c.forkpty(&master, null, null, &winsize);
+        if (pid < 0) return error.ForkPtyFailed;
+
+        if (pid == 0) {
+            if (cwd_z) |cwd| {
+                _ = c.chdir(cwd.ptr);
+            }
+            for (env_z) |entry| {
+                _ = c.setenv(entry.key.ptr, entry.value.ptr, 1);
+            }
+            _ = c.execvp(argv[0].?, @ptrCast(argv.ptr));
+            c._exit(127);
+        }
+
+        var self = try alloc.create(InteractiveTerminal);
+        errdefer alloc.destroy(self);
+
+        self.* = .{
+            .alloc = alloc,
+            .terminal = try ghostty_vt.Terminal.init(alloc, .{
+                .cols = config.cols,
+                .rows = config.rows,
+                .max_scrollback = config.scrollback,
+            }),
+            .handler = undefined,
+            .stream = undefined,
+            .config = config,
+            .master_fd = master,
+            .child_pid = @intCast(pid),
+        };
+        errdefer self.terminal.deinit(alloc);
+
+        self.handler = self.terminal.vtHandler();
+        self.stream = .initAlloc(alloc, self.handler);
+
+        self.pushEvent(.started);
+        self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
+        return self;
+    }
+
+    pub fn deinit(self: *InteractiveTerminal) void {
+        _ = self.kill() catch {};
+        if (self.reader_thread) |thread| {
+            thread.join();
+        }
+
+        self.stream.deinit();
+        self.terminal.deinit(self.alloc);
+        if (self.last_title) |title| self.alloc.free(title);
+        while (self.events.items.len > 0) {
+            var event = self.events.pop().?;
+            event.deinit(self.alloc);
+        }
+        self.events.deinit(self.alloc);
+        self.alloc.destroy(self);
+    }
+
+    pub fn send(self: *InteractiveTerminal, input: InputEvent) !void {
+        switch (input) {
+            .bytes => |bytes| try self.writeAll(bytes),
+            .text => |text| try self.writeAll(text),
+            .resize => |size| try self.resize(size.rows, size.cols),
+            .close_stdin => return error.CloseStdinUnsupported,
+        }
+    }
+
+    pub fn resize(self: *InteractiveTerminal, rows: u16, cols: u16) !void {
+        var winsize = std.mem.zeroes(c.winsize);
+        winsize.ws_row = rows;
+        winsize.ws_col = cols;
+        winsize.ws_xpixel = @intCast(cols * self.config.cell_width);
+        winsize.ws_ypixel = @intCast(rows * self.config.cell_height);
+
+        if (c.ioctl(self.master_fd, c.TIOCSWINSZ, &winsize) == -1) {
+            return error.ResizeFailed;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.terminal.resize(self.alloc, cols, rows);
+        self.config.rows = rows;
+        self.config.cols = cols;
+        if (self.config.emit_screen_updates) {
+            self.pushEventUnlocked(.screen_update);
+        }
+    }
+
+    pub fn snapshot(self: *InteractiveTerminal) !ScreenSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const buffer = try self.terminal.plainString(self.alloc);
+        errdefer self.alloc.free(buffer);
+
+        const screen_ansi = try renderScreenAnsi(
+            self.alloc,
+            &self.terminal,
+            self.config.rows,
+            self.config.cols,
+        );
+        errdefer self.alloc.free(screen_ansi);
+
+        const title = if (self.terminal.getTitle()) |value|
+            try self.alloc.dupe(u8, value)
+        else
+            null;
+        errdefer if (title) |owned| self.alloc.free(owned);
+
+        var line_count: usize = 1;
+        for (buffer) |ch| {
+            if (ch == '\n') line_count += 1;
+        }
+
+        const lines = try self.alloc.alloc([]const u8, line_count);
+        errdefer self.alloc.free(lines);
+
+        var it = std.mem.splitScalar(u8, buffer, '\n');
+        var index: usize = 0;
+        while (it.next()) |line| : (index += 1) {
+            lines[index] = line;
+        }
+
+        return .{
+            .rows = self.config.rows,
+            .cols = self.config.cols,
+            .cursor_row = self.terminal.screens.active.cursor.y + 1,
+            .cursor_col = self.terminal.screens.active.cursor.x + 1,
+            .title = title,
+            .buffer = buffer,
+            .screen_ansi = screen_ansi,
+            .lines = lines,
+        };
+    }
+
+    pub fn pollEvent(self: *InteractiveTerminal) ?OutputEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.events.items.len == 0) return null;
+        return self.events.orderedRemove(0);
+    }
+
+    pub fn kill(self: *InteractiveTerminal) !void {
+        self.mutex.lock();
+        const already_closed = self.closed;
+        self.closed = true;
+        self.mutex.unlock();
+
+        if (!already_closed) {
+            _ = c.kill(self.child_pid, c.SIGKILL);
+            std.posix.close(self.master_fd);
+        }
+    }
+
+    fn readerThreadMain(self: *InteractiveTerminal) void {
+        self.readerLoop() catch |err| {
+            self.pushErrorFmt("reader loop failed: {}", .{err});
+        };
+    }
+
+    fn readerLoop(self: *InteractiveTerminal) !void {
+        var buffer: [8192]u8 = undefined;
+
+        while (true) {
+            const n = std.posix.read(self.master_fd, &buffer) catch |err| switch (err) {
+                error.InputOutput => break,
+                error.NotOpenForReading => break,
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) break;
+
+            if (self.config.emit_raw_bytes) {
+                const bytes = try self.alloc.dupe(u8, buffer[0..n]);
+                self.pushEvent(.{ .raw_bytes = bytes });
+            }
+
+            for (buffer[0..n]) |byte| {
+                if (byte == 0x07) self.pushEvent(.bell);
+            }
+
+            self.mutex.lock();
+            self.stream.nextSlice(buffer[0..n]);
+            self.updateTitleEventUnlocked();
+            if (self.config.emit_screen_updates) {
+                self.pushEventUnlocked(.screen_update);
+            }
+            self.mutex.unlock();
+        }
+
+        const wait_result = std.posix.waitpid(self.child_pid, 0);
+        const status = @as(c_int, @intCast(wait_result.status));
+        const exit_code: ?i32 = if (c.WIFEXITED(status))
+            c.WEXITSTATUS(status)
+        else if (c.WIFSIGNALED(status))
+            -c.WTERMSIG(status)
+        else
+            null;
+
+        self.mutex.lock();
+        self.exit_code = exit_code;
+        self.closed = true;
+        self.pushEventUnlocked(.{ .exited = exit_code });
+        self.mutex.unlock();
+    }
+
+    fn writeAll(self: *InteractiveTerminal, bytes: []const u8) !void {
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+
+        var index: usize = 0;
+        while (index < bytes.len) {
+            const written = try std.posix.write(self.master_fd, bytes[index..]);
+            index += written;
+        }
+    }
+
+    fn pushEvent(self: *InteractiveTerminal, event: OutputEvent) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.pushEventUnlocked(event);
+    }
+
+    fn pushEventUnlocked(self: *InteractiveTerminal, event: OutputEvent) void {
+        self.events.append(self.alloc, event) catch {
+            var dropped = event;
+            dropped.deinit(self.alloc);
+        };
+    }
+
+    fn pushErrorFmt(self: *InteractiveTerminal, comptime fmt: []const u8, args: anytype) void {
+        const message = std.fmt.allocPrint(self.alloc, fmt, args) catch return;
+        self.pushEvent(.{ .failure = message });
+    }
+
+    fn updateTitleEventUnlocked(self: *InteractiveTerminal) void {
+        const current = self.terminal.getTitle() orelse "";
+        const last = self.last_title orelse "";
+        if (std.mem.eql(u8, current, last)) return;
+
+        const owned = self.alloc.dupe(u8, current) catch return;
+        if (self.last_title) |previous| self.alloc.free(previous);
+        self.last_title = owned;
+
+        const event_title = self.alloc.dupe(u8, current) catch return;
+        self.pushEventUnlocked(.{ .title_changed = event_title });
+    }
+};
+
+const SpawnEnv = struct {
+    key: [:0]u8,
+    value: [:0]u8,
+};
+
+fn buildArgv(
+    alloc: std.mem.Allocator,
+    command: CommandSpec,
+) ![]?[*:0]u8 {
+    const argv = try alloc.alloc(?[*:0]u8, command.args.len + 2);
+    errdefer alloc.free(argv);
+
+    const program = try alloc.dupeZ(u8, command.program);
+    argv[0] = program.ptr;
+
+    var built: usize = 1;
+    errdefer {
+        for (argv[0..built]) |maybe_ptr| {
+            if (maybe_ptr) |ptr| {
+                alloc.free(std.mem.span(ptr));
+            }
+        }
+    }
+
+    for (command.args, 0..) |arg, i| {
+        const duped = try alloc.dupeZ(u8, arg);
+        argv[i + 1] = duped.ptr;
+        built += 1;
+    }
+
+    argv[command.args.len + 1] = null;
+    return argv;
+}
+
+fn freeArgv(alloc: std.mem.Allocator, argv: []?[*:0]u8) void {
+    for (argv) |maybe_ptr| {
+        if (maybe_ptr) |ptr| {
+            alloc.free(std.mem.span(ptr));
+        }
+    }
+    alloc.free(argv);
+}
+
+fn buildEnv(
+    alloc: std.mem.Allocator,
+    env: []const EnvVar,
+) ![]SpawnEnv {
+    const has_term = hasEnvKey(env, "TERM");
+    const extra_entries: usize = if (has_term) 0 else 1;
+    const entries = try alloc.alloc(SpawnEnv, env.len + extra_entries);
+    errdefer alloc.free(entries);
+
+    var built: usize = 0;
+    errdefer {
+        for (entries[0..built]) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+    }
+
+    for (env, 0..) |entry, i| {
+        entries[i] = .{
+            .key = try alloc.dupeZ(u8, entry.key),
+            .value = try alloc.dupeZ(u8, entry.value),
+        };
+        built += 1;
+    }
+
+    if (!has_term) {
+        entries[built] = .{
+            .key = try alloc.dupeZ(u8, "TERM"),
+            .value = try alloc.dupeZ(u8, "xterm-256color"),
+        };
+        built += 1;
+    }
+    return entries;
+}
+
+fn freeEnv(alloc: std.mem.Allocator, env: []SpawnEnv) void {
+    for (env) |entry| {
+        alloc.free(entry.key);
+        alloc.free(entry.value);
+    }
+    alloc.free(env);
+}
+
+fn hasEnvKey(env: []const EnvVar, needle: []const u8) bool {
+    for (env) |entry| {
+        if (std.mem.eql(u8, entry.key, needle)) return true;
+    }
+    return false;
+}
+
+pub fn renderScreenAnsi(
+    alloc: std.mem.Allocator,
+    terminal: *ghostty_vt.Terminal,
+    rows: u16,
+    cols: u16,
+) ![]u8 {
+    var render_state: ghostty_vt.RenderState = .empty;
+    defer render_state.deinit(alloc);
+    try render_state.update(alloc, terminal);
+
+    var out = std.array_list.Managed(u8).init(alloc);
+    defer out.deinit();
+
+    const row_slice = render_state.row_data.slice();
+    const render_rows = row_slice.items(.cells);
+
+    for (0..rows) |y_usize| {
+        const y: u16 = @intCast(y_usize);
+        if (y_usize < render_rows.len) {
+            try appendAnsiRenderedRow(&out, &render_state, render_rows[y_usize], y, cols);
+        } else {
+            try appendSpacesAnsi(&out, cols);
+            try out.appendSlice("\x1b[0m");
+        }
+
+        if (y_usize + 1 < rows) try out.append('\n');
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn appendAnsiRenderedRow(
+    out: *std.array_list.Managed(u8),
+    render_state: *const ghostty_vt.RenderState,
+    row_cells: std.MultiArrayList(ghostty_vt.RenderState.Cell),
+    y: u16,
+    width: u16,
+) !void {
+    const slice = row_cells.slice();
+    const raw_cells = slice.items(.raw);
+    const styles = slice.items(.style);
+    const graphemes = slice.items(.grapheme);
+    const cursor = render_state.cursor.viewport;
+    var current_style: ?AnsiStyleState = null;
+    // Always render the full row width. Trimming to the last "significant"
+    // column leaves the trailing cells unpainted, which shows through to
+    // the observer's terminal background on rows with mostly-empty
+    // content (vim's cursor row, status line, etc.), visually breaking
+    // the screen into stripes of mismatched backgrounds.
+    const effective_width = width;
+
+    for (0..effective_width) |x_usize| {
+        const x: u16 = @intCast(x_usize);
+        if (x_usize >= raw_cells.len) {
+            const next_style = ansiStyleState(
+                render_state.colors.foreground,
+                render_state.colors.background,
+                .{},
+            );
+            try maybeAppendAnsiStyle(out, &current_style, next_style);
+            try out.append(' ');
+            continue;
+        }
+
+        const raw = raw_cells[x_usize];
+        var style: ghostty_vt.Style = .{};
+        if (raw.style_id > 0 or raw.content_tag == .bg_color_palette or raw.content_tag == .bg_color_rgb) {
+            style = styles[x_usize];
+        }
+
+        var fg = style.fg(.{
+            .default = render_state.colors.foreground,
+            .palette = &render_state.colors.palette,
+        });
+        var bg = style.bg(&raw, &render_state.colors.palette) orelse render_state.colors.background;
+
+        if (style.flags.inverse) {
+            const swap = fg;
+            fg = bg;
+            bg = swap;
+        }
+
+        if (cursor) |cursor_pos| {
+            if (cursor_pos.x == x and cursor_pos.y == y and render_state.cursor.visible) {
+                const swap = fg;
+                fg = bg;
+                bg = swap;
+            }
+        }
+
+        const next_style = ansiStyleState(fg, bg, style.flags);
+        try maybeAppendAnsiStyle(out, &current_style, next_style);
+
+        if (raw.wide == .spacer_tail or raw.wide == .spacer_head or style.flags.invisible) {
+            try out.append(' ');
+            continue;
+        }
+        if (raw.content_tag == .codepoint_grapheme and graphemes[x_usize].len > 0) {
+            for (graphemes[x_usize]) |cp| try appendCodepointAnsi(out, cp);
+        } else if (raw.codepoint() != 0) {
+            try appendCodepointAnsi(out, raw.codepoint());
+        } else {
+            try out.append(' ');
+        }
+    }
+
+    if (effective_width > 0) {
+        try out.appendSlice("\x1b[0m");
+    }
+}
+
+const AnsiStyleState = struct {
+    fg_r: u8,
+    fg_g: u8,
+    fg_b: u8,
+    bg_r: u8,
+    bg_g: u8,
+    bg_b: u8,
+    bold: bool,
+    italic: bool,
+    faint: bool,
+    underline: bool,
+    strikethrough: bool,
+};
+
+fn ansiStyleState(fg: anytype, bg: anytype, flags: anytype) AnsiStyleState {
+    const FlagsType = @TypeOf(flags);
+    return .{
+        .fg_r = fg.r,
+        .fg_g = fg.g,
+        .fg_b = fg.b,
+        .bg_r = bg.r,
+        .bg_g = bg.g,
+        .bg_b = bg.b,
+        .bold = if (@hasField(FlagsType, "bold")) flags.bold else false,
+        .italic = if (@hasField(FlagsType, "italic")) flags.italic else false,
+        .faint = if (@hasField(FlagsType, "faint")) flags.faint else false,
+        .underline = if (@hasField(FlagsType, "underline")) flags.underline != .none else false,
+        .strikethrough = if (@hasField(FlagsType, "strikethrough")) flags.strikethrough else false,
+    };
+}
+
+fn maybeAppendAnsiStyle(
+    out: *std.array_list.Managed(u8),
+    current: *?AnsiStyleState,
+    next: AnsiStyleState,
+) !void {
+    if (current.*) |existing| {
+        if (std.meta.eql(existing, next)) return;
+    }
+    current.* = next;
+    try appendAnsiStyle(out, next);
+}
+
+fn appendAnsiStyle(out: *std.array_list.Managed(u8), style: AnsiStyleState) !void {
+    try out.writer().print(
+        "\x1b[0{s}{s}{s}{s}{s};38;2;{};{};{};48;2;{};{};{}m",
+        .{
+            if (style.bold) ";1" else "",
+            if (style.italic) ";3" else "",
+            if (style.faint) ";2" else "",
+            if (style.underline) ";4" else "",
+            if (style.strikethrough) ";9" else "",
+            style.fg_r,
+            style.fg_g,
+            style.fg_b,
+            style.bg_r,
+            style.bg_g,
+            style.bg_b,
+        },
+    );
+}
+
+fn appendCodepointAnsi(out: *std.array_list.Managed(u8), cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const len = try std.unicode.utf8Encode(cp, &buf);
+    try out.appendSlice(buf[0..len]);
+}
+
+fn appendSpacesAnsi(out: *std.array_list.Managed(u8), count: u16) !void {
+    for (0..count) |_| try out.append(' ');
+}
+
+test "spawn captures snapshot and exit" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf 'hello from zig'" },
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "hello from zig", 2_000);
+    var snapshot = try terminal.snapshot();
+    defer snapshot.deinit(std.heap.c_allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.buffer, "hello from zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hello from zig") != null);
+    try waitForExit(terminal, 2_000);
+}
+
+test "send forwards bytes through the pty" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/cat",
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try terminal.send(.{ .text = "ping from input\n" });
+    try waitForText(terminal, "ping from input", 2_000);
+}
+
+test "title changes are emitted as events" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf '\\033]2;zig-title\\033\\\\'; sleep 0.1" },
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForTitleEvent(terminal, "zig-title", 2_000);
+}
+
+test "snapshot preserves ansi styling" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf '\\033[31;47mhi\\033[0m'" },
+    }, .{
+        .rows = 5,
+        .cols = 20,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "hi", 2_000);
+    var snapshot = try terminal.snapshot();
+    defer snapshot.deinit(std.heap.c_allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "\x1b[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "38;2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "48;2;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hi") != null);
+}
+
+fn waitForText(
+    terminal: *InteractiveTerminal,
+    needle: []const u8,
+    timeout_ms: u64,
+) !void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        var snapshot = try terminal.snapshot();
+        defer snapshot.deinit(std.heap.c_allocator);
+        if (std.mem.indexOf(u8, snapshot.buffer, needle) != null) return;
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+fn waitForExit(
+    terminal: *InteractiveTerminal,
+    timeout_ms: u64,
+) !void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        if (terminal.pollEvent()) |event| {
+            defer {
+                var owned = event;
+                owned.deinit(std.heap.c_allocator);
+            }
+            if (event == .exited) return;
+        }
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+fn waitForTitleEvent(
+    terminal: *InteractiveTerminal,
+    title: []const u8,
+    timeout_ms: u64,
+) !void {
+    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        if (terminal.pollEvent()) |event| {
+            defer {
+                var owned = event;
+                owned.deinit(std.heap.c_allocator);
+            }
+            switch (event) {
+                .title_changed => |value| {
+                    if (std.mem.eql(u8, value, title)) return;
+                },
+                else => {},
+            }
+        }
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
