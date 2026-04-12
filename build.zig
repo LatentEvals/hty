@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    headless.root_module.addCSourceFile(.{ .file = b.path("src/regex_helper.c") });
     b.installArtifact(headless);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -84,6 +85,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    headless_tests.root_module.addCSourceFile(.{ .file = b.path("src/regex_helper.c") });
     const run_headless_tests = b.addRunArtifact(headless_tests);
     test_step.dependOn(&run_headless_tests.step);
 }

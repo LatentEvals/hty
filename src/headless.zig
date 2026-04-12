@@ -10,8 +10,16 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/ioctl.h");
     @cInclude("time.h");
-    @cInclude("regex.h");
 });
+
+// POSIX regex helpers defined in regex_helper.c. We use a C helper
+// because Zig's @cImport translates regex_t as opaque on Linux,
+// making it impossible to allocate on the stack.
+const HtyRegex = opaque {};
+extern fn hty_regex_compile(pattern: [*:0]const u8) ?*HtyRegex;
+extern fn hty_regex_is_valid(re: *const HtyRegex) bool;
+extern fn hty_regex_match(re: *const HtyRegex, haystack: [*:0]const u8) bool;
+extern fn hty_regex_free(re: *HtyRegex) void;
 
 /// Suppress std.log output below error level across the whole binary.
 /// The Ghostty VT parser emits warn-level messages when it hits escape
@@ -1232,31 +1240,27 @@ fn handleWaitForText(
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
 
-    // If regex mode, compile the pattern once up front. The needle slice
-    // points into the parsed JSON which lives for the duration of the
-    // request, so it is safe to pass to regcomp.
-    var compiled_regex: c.regex_t = undefined;
+    // If regex mode, compile the pattern once up front.
+    var compiled_regex: ?*HtyRegex = null;
     if (use_regex) {
         const nul_pattern = try arena.dupeZ(u8, needle);
-        const rc = c.regcomp(&compiled_regex, nul_pattern.ptr, c.REG_EXTENDED | c.REG_NOSUB | c.REG_NEWLINE);
-        if (rc != 0) {
-            var errbuf: [256]u8 = undefined;
-            _ = c.regerror(rc, &compiled_regex, &errbuf, errbuf.len);
-            c.regfree(&compiled_regex);
+        compiled_regex = hty_regex_compile(nul_pattern.ptr);
+        if (compiled_regex == null or !hty_regex_is_valid(compiled_regex.?)) {
+            if (compiled_regex) |re| hty_regex_free(re);
             return error.InvalidRegex;
         }
     }
-    defer if (use_regex) c.regfree(&compiled_regex);
+    defer if (compiled_regex) |re| hty_regex_free(re);
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
         var snapshot = try sess.terminal.snapshot();
-        const matched = if (use_regex) blk: {
+        const matched = if (compiled_regex) |re| blk: {
             const nul_haystack = arena.dupeZ(u8, snapshot.buffer) catch {
                 snapshot.deinit(sess.alloc);
                 return error.OutOfMemory;
             };
-            break :blk c.regexec(&compiled_regex, nul_haystack.ptr, 0, null, 0) == 0;
+            break :blk hty_regex_match(re, nul_haystack.ptr);
         } else std.mem.indexOf(u8, snapshot.buffer, needle) != null;
         if (matched) {
             defer snapshot.deinit(sess.alloc);
