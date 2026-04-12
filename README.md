@@ -60,23 +60,13 @@ A PTY runtime built on [Ghostty](https://ghostty.org)'s VT engine, a persistent 
 
 ## Install
 
-### Prebuilt binaries
-
-Download the [latest release](https://github.com/montanaflynn/hty/releases/latest) for your platform:
-
 ```sh
-# macOS (Apple Silicon)
-curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-aarch64-macos.tar.gz | tar xz
-sudo mv hty /usr/local/bin/
-
-# Linux (x86_64)
-curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-x86_64-linux.tar.gz | tar xz
-sudo mv hty /usr/local/bin/
-
-# Linux (aarch64)
-curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-aarch64-linux.tar.gz | tar xz
-sudo mv hty /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
 ```
+
+Auto-detects your OS and architecture, downloads the latest release binary, and installs to `/usr/local/bin`. Set `HTY_INSTALL_DIR` to change the target directory.
+
+Or download a specific platform from the [releases page](https://github.com/montanaflynn/hty/releases/latest).
 
 ### From source
 
