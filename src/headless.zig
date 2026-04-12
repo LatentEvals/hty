@@ -2227,6 +2227,11 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
         }
 
         for (tokens) |token| {
+            if (token.kind == .delay) {
+                std.Thread.sleep(token.delay_ms * std.time.ns_per_ms);
+                continue;
+            }
+
             var payload_buf = std.array_list.Managed(u8).init(alloc);
             defer payload_buf.deinit();
             var writer = payload_buf.writer();
@@ -2240,6 +2245,7 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
                     try writer.writeAll("{\"op\":\"send_key\",\"key\":");
                     try writeJsonString(writer.any(), token.value);
                 },
+                .delay => unreachable,
             }
 
             if (session_ref) |sr| {
@@ -2288,13 +2294,15 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
 }
 
 const SeqToken = struct {
-    kind: enum { text, key },
+    kind: enum { text, key, delay },
     value: []const u8,
+    delay_ms: u64 = 0, // only meaningful when kind == .delay
 };
 
 /// Parse a --seq string into tokens.
 /// Quoted strings ("..." or '...') become text tokens.
-/// Unquoted whitespace-delimited words become key tokens.
+/// Bare words that look like durations (e.g. 200ms, 1s) become delay tokens.
+/// All other bare words become key tokens.
 /// Token values are slices into the input string (no allocation needed for values).
 fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
     var result: SeqTokenList = .{};
@@ -2318,15 +2326,40 @@ fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
             result.len += 1;
             pos += 1; // skip closing quote
         } else {
-            // Unquoted key token
+            // Bare word — could be a key name or a delay
             const start = pos;
             while (pos < input.len and input[pos] != ' ' and input[pos] != '\t') : (pos += 1) {}
-            result.tokens[result.len] = .{ .kind = .key, .value = input[start..pos] };
-            result.len += 1;
+            const word = input[start..pos];
+            if (looksLikeDuration(word)) {
+                if (parseDurationMs(word)) |ms| {
+                    result.tokens[result.len] = .{ .kind = .delay, .value = word, .delay_ms = ms };
+                    result.len += 1;
+                } else |_| {
+                    // Looked like a duration but failed to parse — treat as key
+                    result.tokens[result.len] = .{ .kind = .key, .value = word };
+                    result.len += 1;
+                }
+            } else {
+                result.tokens[result.len] = .{ .kind = .key, .value = word };
+                result.len += 1;
+            }
         }
     }
 
     return result;
+}
+
+/// Returns true if the word starts with a digit and ends with a duration
+/// suffix (ms, s, m, h). This avoids misinterpreting key names like "f1"
+/// as durations.
+fn looksLikeDuration(word: []const u8) bool {
+    if (word.len < 2) return false;
+    if (word[0] < '0' or word[0] > '9') return false;
+    if (std.mem.endsWith(u8, word, "ms")) return true;
+    if (std.mem.endsWith(u8, word, "s")) return true;
+    if (std.mem.endsWith(u8, word, "m")) return true;
+    if (std.mem.endsWith(u8, word, "h")) return true;
+    return false;
 }
 
 const SeqTokenList = struct {
@@ -4247,9 +4280,10 @@ fn sendHelpText() []const u8 {
     \\                    Supports ctrl-, alt-/meta-, shift- prefixes,
     \\                    function keys (f1-f12), and combinations like
     \\                    ctrl-alt-f or shift-up. Run `hty keys` for details.
-    \\  --seq STRING      Send a sequence of keys and text in one call.
-    \\                    Quoted strings are text, bare words are key names.
-    \\                    Example: --seq 'ctrl-s "hello" enter'
+    \\  --seq STRING      Send a sequence of keys, text, and delays in one call.
+    \\                    Quoted strings are text, durations (e.g. 200ms, 1s)
+    \\                    are pauses, and bare words are key names.
+    \\                    Example: --seq '"hello" 200ms enter 500ms "world"'
     \\  --bytes-hex HEX   Raw bytes encoded as hex.
     \\
     ;
@@ -4626,6 +4660,31 @@ test "parseSeqTokens: empty input" {
 test "parseSeqTokens: whitespace only" {
     const result = try parseSeqTokens("   ");
     try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parseSeqTokens: delay tokens" {
+    const result = try parseSeqTokens("\"hello\" 200ms enter 1s \"world\"");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 5), tokens.len);
+    try std.testing.expectEqual(.text, tokens[0].kind);
+    try std.testing.expectEqualStrings("hello", tokens[0].value);
+    try std.testing.expectEqual(.delay, tokens[1].kind);
+    try std.testing.expectEqual(@as(u64, 200), tokens[1].delay_ms);
+    try std.testing.expectEqual(.key, tokens[2].kind);
+    try std.testing.expectEqualStrings("enter", tokens[2].value);
+    try std.testing.expectEqual(.delay, tokens[3].kind);
+    try std.testing.expectEqual(@as(u64, 1000), tokens[3].delay_ms);
+    try std.testing.expectEqual(.text, tokens[4].kind);
+}
+
+test "parseSeqTokens: f-keys are not durations" {
+    const result = try parseSeqTokens("f1 f12");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 2), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("f1", tokens[0].value);
+    try std.testing.expectEqual(.key, tokens[1].kind);
+    try std.testing.expectEqualStrings("f12", tokens[1].value);
 }
 
 test "parseSeqTokens: unmatched quote is an error" {
