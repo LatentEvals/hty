@@ -82,7 +82,7 @@ should_use_color() {
 
 color_code() {
   if should_use_color; then
-    printf '%s' "$1"
+    printf '%b' "$1"
   fi
 }
 
