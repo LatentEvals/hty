@@ -4950,9 +4950,22 @@ fn expectTestOk(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
     return object;
 }
 
-fn commandExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
+/// Search PATH for a command and return its absolute path, or null.
+fn findCommand(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
+    const path_env = std.process.getEnvVarOwned(alloc, "PATH") catch return null;
+    defer alloc.free(path_env);
+
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name }) catch continue;
+        std.fs.accessAbsolute(full, .{}) catch {
+            alloc.free(full);
+            continue;
+        };
+        return full;
+    }
+    return null;
 }
 
 test "unknown operation returns actionable error" {
@@ -5245,14 +5258,8 @@ test "session event log records spawn, input, output, killed" {
 }
 
 test "headless protocol can use nano to write a file" {
-    if (!commandExists("/usr/bin/nano") and !commandExists("/opt/homebrew/bin/nano") and !commandExists("/usr/local/bin/nano")) return error.SkipZigTest;
-
-    const nano_path: []const u8 = if (commandExists("/opt/homebrew/bin/nano"))
-        "/opt/homebrew/bin/nano"
-    else if (commandExists("/usr/local/bin/nano"))
-        "/usr/local/bin/nano"
-    else
-        "/usr/bin/nano";
+    const nano_path = findCommand(std.testing.allocator, "nano") orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(nano_path);
 
     var registry = SessionRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -5363,7 +5370,8 @@ test "headless protocol can use nano to write a file" {
 }
 
 test "headless protocol can launch top and quit" {
-    if (!commandExists("/usr/bin/top")) return error.SkipZigTest;
+    const top_path = findCommand(std.testing.allocator, "top") orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(top_path);
 
     var registry = SessionRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -5372,7 +5380,7 @@ test "headless protocol can launch top and quit" {
         var parsed = try testRequest(&registry, .{
             .op = "spawn",
             .name = "top",
-            .program = "/usr/bin/top",
+            .program = top_path,
             .rows = 20,
             .cols = 80,
             .emit_raw_bytes = false,
@@ -5415,14 +5423,8 @@ test "headless protocol can launch top and quit" {
 }
 
 test "headless protocol can use emacs to write an org file" {
-    if (!commandExists("/opt/homebrew/bin/emacs") and !commandExists("/usr/bin/emacs") and !commandExists("/usr/local/bin/emacs")) return error.SkipZigTest;
-
-    const emacs_path: []const u8 = if (commandExists("/opt/homebrew/bin/emacs"))
-        "/opt/homebrew/bin/emacs"
-    else if (commandExists("/usr/local/bin/emacs"))
-        "/usr/local/bin/emacs"
-    else
-        "/usr/bin/emacs";
+    const emacs_path = findCommand(std.testing.allocator, "emacs") orelse return error.SkipZigTest;
+    defer std.testing.allocator.free(emacs_path);
 
     var registry = SessionRegistry.init(std.testing.allocator);
     defer registry.deinit();
