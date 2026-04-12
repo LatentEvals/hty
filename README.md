@@ -58,18 +58,36 @@ A PTY runtime built on [Ghostty](https://ghostty.org)'s VT engine, a persistent 
 
 **Status:** beta. The core surface is shipped — persistent server, named sessions, live observers (`hty watch`), interactive multi-writer attach (`hty attach`), append-only session event logs with `hty logs` / `hty replay`, the wait primitives, explicit session lifecycle (`hty kill` / `hty delete`), and remote observation via `$HTY_SOCKET` + SSH tunnels. See [docs/ROADMAP.md](docs/ROADMAP.md) for the post-beta polish backlog.
 
-## Build
+## Install
 
-Verified with Homebrew Zig `0.15.2_1`. Ghostty is the only runtime dependency and is fetched automatically by the Zig package manager (see [`build.zig.zon`](build.zig.zon)).
+### Prebuilt binaries
+
+Download the [latest release](https://github.com/montanaflynn/hty/releases/latest) for your platform:
 
 ```sh
-zig build
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-aarch64-macos.tar.gz | tar xz
+sudo mv hty /usr/local/bin/
+
+# Linux (x86_64)
+curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-x86_64-linux.tar.gz | tar xz
+sudo mv hty /usr/local/bin/
+
+# Linux (aarch64)
+curl -fsSL https://github.com/montanaflynn/hty/releases/latest/download/hty-aarch64-linux.tar.gz | tar xz
+sudo mv hty /usr/local/bin/
 ```
 
-Installed binaries:
+### From source
 
-- `./zig-out/bin/hty` — the subcommand CLI, which also hosts the background server (auto-started on first use)
-- `./zig-out/bin/hty-demo` — standalone framed wrapper (see [Debug utilities](#debug-utilities))
+Requires [Zig](https://ziglang.org) 0.15+. Ghostty's VT engine is fetched automatically by the Zig package manager.
+
+```sh
+git clone https://github.com/montanaflynn/hty.git
+cd hty
+zig build -Doptimize=ReleaseFast
+sudo cp zig-out/bin/hty /usr/local/bin/
+```
 
 ## Quick example
 
