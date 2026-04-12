@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: install zig
-        uses: mlugg/setup-zig@v2
+        uses: montanaflynn/setup-zig@main
         with:
           version: 0.15.2
 
