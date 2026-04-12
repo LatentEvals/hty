@@ -2171,6 +2171,9 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
     var key: ?[]const u8 = null;
     var bytes_hex: ?[]const u8 = null;
     var seq: ?[]const u8 = null;
+    var delay_before: ?[]const u8 = null;
+    var delay_after: ?[]const u8 = null;
+    var delay_char: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2191,6 +2194,18 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return printUsageAndExit("--seq requires a value");
             seq = args[i];
+        } else if (std.mem.eql(u8, arg, "--delay-before")) {
+            i += 1;
+            if (i >= args.len) return printUsageAndExit("--delay-before requires a value");
+            delay_before = args[i];
+        } else if (std.mem.eql(u8, arg, "--delay-after")) {
+            i += 1;
+            if (i >= args.len) return printUsageAndExit("--delay-after requires a value");
+            delay_after = args[i];
+        } else if (std.mem.eql(u8, arg, "--delay-char")) {
+            i += 1;
+            if (i >= args.len) return printUsageAndExit("--delay-char requires a value");
+            delay_char = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(ExitCode.generic);
@@ -2212,89 +2227,150 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
         std.process.exit(ExitCode.generic);
     }
 
-    // --seq: parse tokens and send each one as a separate request.
+    // Parse delay flags.
+    const before_ms: u64 = if (delay_before) |d| parseDurationMs(d) catch {
+        try printErr("invalid --delay-before value");
+        std.process.exit(ExitCode.generic);
+        unreachable;
+    } else 0;
+    const after_ms: u64 = if (delay_after) |d| parseDurationMs(d) catch {
+        try printErr("invalid --delay-after value");
+        std.process.exit(ExitCode.generic);
+        unreachable;
+    } else 0;
+    const char_ms: u64 = if (delay_char) |d| parseDurationMs(d) catch {
+        try printErr("invalid --delay-char value");
+        std.process.exit(ExitCode.generic);
+        unreachable;
+    } else 0;
+
+    if (char_ms > 0 and text == null and seq == null) {
+        try printErr("--delay-char only applies to --text or --seq");
+        std.process.exit(ExitCode.generic);
+    }
+
+    // Build token list — everything becomes a sequence internally.
+    var token_list: SeqTokenList = undefined;
+
     if (seq) |s| {
-        const token_list = parseSeqTokens(s) catch {
+        token_list = parseSeqTokens(s) catch {
             try printErr("invalid --seq syntax: unmatched quote");
             std.process.exit(ExitCode.generic);
             unreachable;
         };
-        const tokens = token_list.slice();
-
-        if (tokens.len == 0) {
+        if (token_list.len == 0) {
             try printErr("--seq requires at least one token");
             std.process.exit(ExitCode.generic);
         }
-
-        for (tokens) |token| {
-            if (token.kind == .delay) {
-                std.Thread.sleep(token.delay_ms * std.time.ns_per_ms);
-                continue;
-            }
-
-            var payload_buf = std.array_list.Managed(u8).init(alloc);
-            defer payload_buf.deinit();
-            var writer = payload_buf.writer();
-
-            switch (token.kind) {
-                .text => {
-                    try writer.writeAll("{\"op\":\"send_text\",\"text\":");
-                    try writeJsonString(writer.any(), token.value);
-                },
-                .key => {
-                    try writer.writeAll("{\"op\":\"send_key\",\"key\":");
-                    try writeJsonString(writer.any(), token.value);
-                },
-                .delay => unreachable,
-            }
-
-            if (session_ref) |sr| {
-                try writer.writeAll(",\"session\":");
-                try writeJsonString(writer.any(), sr);
-            }
-            try writer.writeAll("}");
-
-            const response_line = try sendRawRequest(alloc, payload_buf.items);
-            defer alloc.free(response_line);
-
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
-            defer parsed.deinit();
-            _ = try expectOkOrExit(parsed);
-        }
-        return;
-    }
-
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
-    defer payload_buf.deinit();
-    var writer = payload_buf.writer();
-
-    if (text) |t| {
-        try writer.writeAll("{\"op\":\"send_text\",\"text\":");
-        try writeJsonString(writer.any(), t);
+    } else if (text) |t| {
+        token_list = .{};
+        token_list.tokens[0] = .{ .kind = .text, .value = t };
+        token_list.len = 1;
     } else if (key) |k| {
-        try writer.writeAll("{\"op\":\"send_key\",\"key\":");
-        try writeJsonString(writer.any(), k);
+        token_list = .{};
+        token_list.tokens[0] = .{ .kind = .key, .value = k };
+        token_list.len = 1;
     } else if (bytes_hex) |b| {
-        try writer.writeAll("{\"op\":\"send_bytes_hex\",\"bytes_hex\":");
-        try writeJsonString(writer.any(), b);
+        token_list = .{};
+        token_list.tokens[0] = .{ .kind = .bytes_hex, .value = b };
+        token_list.len = 1;
+    } else unreachable;
+
+    // Expand --delay-char: split text tokens into per-character tokens
+    // with delay tokens interleaved.
+    if (char_ms > 0) {
+        var expanded: SeqTokenList = .{};
+        for (token_list.slice()) |token| {
+            if (token.kind == .text and token.value.len > 1) {
+                // Split into individual characters with delays between them.
+                var offset: usize = 0;
+                while (offset < token.value.len) {
+                    if (expanded.len >= expanded.tokens.len) break;
+                    // Handle multi-byte UTF-8: find the end of this codepoint.
+                    const byte = token.value[offset];
+                    const cp_len: usize = if (byte < 0x80) 1 else if (byte < 0xE0) 2 else if (byte < 0xF0) 3 else 4;
+                    const end = @min(offset + cp_len, token.value.len);
+                    expanded.tokens[expanded.len] = .{ .kind = .text, .value = token.value[offset..end] };
+                    expanded.len += 1;
+                    offset = end;
+                    // Add delay between characters (not after the last one).
+                    if (offset < token.value.len and expanded.len < expanded.tokens.len) {
+                        expanded.tokens[expanded.len] = .{ .kind = .delay, .value = "", .delay_ms = char_ms };
+                        expanded.len += 1;
+                    }
+                }
+            } else {
+                if (expanded.len >= expanded.tokens.len) break;
+                expanded.tokens[expanded.len] = token;
+                expanded.len += 1;
+            }
+        }
+        token_list = expanded;
     }
 
-    if (session_ref) |s| {
-        try writer.writeAll(",\"session\":");
-        try writeJsonString(writer.any(), s);
+    // Prepend delay-before, append delay-after.
+    if (before_ms > 0 or after_ms > 0) {
+        var final: SeqTokenList = .{};
+        if (before_ms > 0) {
+            final.tokens[final.len] = .{ .kind = .delay, .value = "", .delay_ms = before_ms };
+            final.len += 1;
+        }
+        for (token_list.slice()) |token| {
+            if (final.len >= final.tokens.len) break;
+            final.tokens[final.len] = token;
+            final.len += 1;
+        }
+        if (after_ms > 0 and final.len < final.tokens.len) {
+            final.tokens[final.len] = .{ .kind = .delay, .value = "", .delay_ms = after_ms };
+            final.len += 1;
+        }
+        token_list = final;
     }
-    try writer.writeAll("}");
 
-    const response_line = try sendRawRequest(alloc, payload_buf.items);
-    defer alloc.free(response_line);
+    // Execute the token list.
+    for (token_list.slice()) |token| {
+        if (token.kind == .delay) {
+            std.Thread.sleep(token.delay_ms * std.time.ns_per_ms);
+            continue;
+        }
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
-    defer parsed.deinit();
-    _ = try expectOkOrExit(parsed);
+        var payload_buf = std.array_list.Managed(u8).init(alloc);
+        defer payload_buf.deinit();
+        var writer = payload_buf.writer();
+
+        switch (token.kind) {
+            .text => {
+                try writer.writeAll("{\"op\":\"send_text\",\"text\":");
+                try writeJsonString(writer.any(), token.value);
+            },
+            .key => {
+                try writer.writeAll("{\"op\":\"send_key\",\"key\":");
+                try writeJsonString(writer.any(), token.value);
+            },
+            .bytes_hex => {
+                try writer.writeAll("{\"op\":\"send_bytes_hex\",\"bytes_hex\":");
+                try writeJsonString(writer.any(), token.value);
+            },
+            .delay => unreachable,
+        }
+
+        if (session_ref) |sr| {
+            try writer.writeAll(",\"session\":");
+            try writeJsonString(writer.any(), sr);
+        }
+        try writer.writeAll("}");
+
+        const response_line = try sendRawRequest(alloc, payload_buf.items);
+        defer alloc.free(response_line);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
+        defer parsed.deinit();
+        _ = try expectOkOrExit(parsed);
+    }
 }
 
 const SeqToken = struct {
-    kind: enum { text, key, delay },
+    kind: enum { text, key, bytes_hex, delay },
     value: []const u8,
     delay_ms: u64 = 0, // only meaningful when kind == .delay
 };
@@ -4275,16 +4351,22 @@ fn sendHelpText() []const u8 {
     \\--bytes-hex is required.
     \\
     \\Flags:
-    \\  --text STRING     UTF-8 text sent verbatim.
-    \\  --key NAME        Named key with optional modifiers.
-    \\                    Supports ctrl-, alt-/meta-, shift- prefixes,
-    \\                    function keys (f1-f12), and combinations like
-    \\                    ctrl-alt-f or shift-up. Run `hty keys` for details.
-    \\  --seq STRING      Send a sequence of keys, text, and delays in one call.
-    \\                    Quoted strings are text, durations (e.g. 200ms, 1s)
-    \\                    are pauses, and bare words are key names.
-    \\                    Example: --seq '"hello" 200ms enter 500ms "world"'
-    \\  --bytes-hex HEX   Raw bytes encoded as hex.
+    \\  --text STRING        UTF-8 text sent verbatim.
+    \\  --key NAME           Named key with optional modifiers.
+    \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
+    \\                       function keys (f1-f12), and combinations like
+    \\                       ctrl-alt-f or shift-up. Run `hty keys` for details.
+    \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
+    \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
+    \\                       are pauses, and bare words are key names.
+    \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
+    \\  --bytes-hex HEX      Raw bytes encoded as hex.
+    \\
+    \\Delay flags (optional, combine with any mode above):
+    \\  --delay-before DUR   Sleep before sending (e.g. 200ms, 1s).
+    \\  --delay-after DUR    Sleep after sending.
+    \\  --delay-char DUR     Send text character-by-character with a delay
+    \\                       between each. Only works with --text or --seq.
     \\
     ;
 }
