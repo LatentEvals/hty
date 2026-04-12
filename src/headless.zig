@@ -10,6 +10,7 @@ const c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/ioctl.h");
     @cInclude("time.h");
+    @cInclude("regex.h");
 });
 
 /// Suppress std.log output below error level across the whole binary.
@@ -1227,13 +1228,36 @@ fn handleWaitForText(
     id: ?i64,
 ) !Response {
     const needle = try readRequiredString(object, "text");
+    const use_regex = try readOptionalBool(object, "regex", false);
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+
+    // If regex mode, compile the pattern once up front. The needle slice
+    // points into the parsed JSON which lives for the duration of the
+    // request, so it is safe to pass to regcomp.
+    var compiled_regex: c.regex_t = undefined;
+    if (use_regex) {
+        const nul_pattern = try arena.dupeZ(u8, needle);
+        const rc = c.regcomp(&compiled_regex, nul_pattern.ptr, c.REG_EXTENDED | c.REG_NOSUB | c.REG_NEWLINE);
+        if (rc != 0) {
+            var errbuf: [256]u8 = undefined;
+            _ = c.regerror(rc, &compiled_regex, &errbuf, errbuf.len);
+            c.regfree(&compiled_regex);
+            return error.InvalidRegex;
+        }
+    }
+    defer if (use_regex) c.regfree(&compiled_regex);
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
         var snapshot = try sess.terminal.snapshot();
-        const matched = std.mem.indexOf(u8, snapshot.buffer, needle) != null;
+        const matched = if (use_regex) blk: {
+            const nul_haystack = arena.dupeZ(u8, snapshot.buffer) catch {
+                snapshot.deinit(sess.alloc);
+                return error.OutOfMemory;
+            };
+            break :blk c.regexec(&compiled_regex, nul_haystack.ptr, 0, null, 0) == 0;
+        } else std.mem.indexOf(u8, snapshot.buffer, needle) != null;
         if (matched) {
             defer snapshot.deinit(sess.alloc);
             return try snapshotResponse(arena, id, snapshot, sess);
@@ -2261,6 +2285,7 @@ fn runClientSnapshot(alloc: Allocator, args: []const []const u8) !void {
 fn runClientWait(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var wait_text: ?[]const u8 = null;
+    var use_regex = false;
     var idle_ms: ?u64 = null;
     var wait_exit = false;
     var timeout_ms: u64 = 10_000;
@@ -2272,6 +2297,11 @@ fn runClientWait(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return printUsageAndExit("--text requires a value");
             wait_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--regex")) {
+            i += 1;
+            if (i >= args.len) return printUsageAndExit("--regex requires a value");
+            wait_text = args[i];
+            use_regex = true;
         } else if (std.mem.eql(u8, arg, "--idle")) {
             i += 1;
             if (i >= args.len) return printUsageAndExit("--idle requires a value");
@@ -2295,7 +2325,7 @@ fn runClientWait(alloc: Allocator, args: []const []const u8) !void {
     if (idle_ms != null) modes += 1;
     if (wait_exit) modes += 1;
     if (modes != 1) {
-        try printErr("hty wait requires exactly one of --text, --idle, --exit");
+        try printErr("hty wait requires exactly one of --text, --regex, --idle, --exit");
         std.process.exit(ExitCode.generic);
     }
 
@@ -2306,6 +2336,7 @@ fn runClientWait(alloc: Allocator, args: []const []const u8) !void {
     if (wait_text) |t| {
         try writer.print("{{\"op\":\"wait_for_text\",\"text\":", .{});
         try writeJsonString(writer.any(), t);
+        if (use_regex) try writer.writeAll(",\"regex\":true");
         try writer.print(",\"timeout_ms\":{d}", .{timeout_ms});
     } else if (idle_ms) |ms| {
         try writer.print("{{\"op\":\"wait_for_idle\",\"idle_ms\":{d},\"timeout_ms\":{d}", .{ ms, timeout_ms });
@@ -3523,6 +3554,7 @@ fn requestErrorMessage(err: anyerror) []const u8 {
         error.InvalidKey => "invalid key name; run `hty keys` for the list",
         error.InvalidHex => "invalid hex bytes; expected an even-length hexadecimal string",
         error.UnknownOperation => "unknown op",
+        error.InvalidRegex => "invalid regex pattern",
         else => @errorName(err),
     };
 }
@@ -3918,18 +3950,20 @@ fn snapshotHelpText() []const u8 {
 
 fn waitHelpText() []const u8 {
     return
-    \\hty wait [SESSION] --text "..." | --idle MS | --exit [--timeout MS]
+    \\hty wait [SESSION] --text "..." | --regex "..." | --idle MS | --exit [--timeout MS]
     \\
     \\Block until the session matches a condition. Exactly one mode flag is
     \\required. Exit 0 on match, 3 on timeout.
     \\
     \\Modes:
-    \\  --text STRING   Wait until the rendered screen contains STRING.
-    \\  --idle MS       Wait until the screen has been unchanged for MS
-    \\                  milliseconds.
-    \\  --exit          Wait until the child process exits.
+    \\  --text STRING    Wait until the rendered screen contains STRING.
+    \\  --regex PATTERN  Wait until the rendered screen matches PATTERN
+    \\                   (POSIX extended regex).
+    \\  --idle MS        Wait until the screen has been unchanged for MS
+    \\                   milliseconds.
+    \\  --exit           Wait until the child process exits.
     \\
-    \\  --timeout MS    Max time to wait in milliseconds (default 10000).
+    \\  --timeout MS     Max time to wait in milliseconds (default 10000).
     \\
     ;
 }
@@ -4431,6 +4465,76 @@ test "headless protocol can drive cat and snapshot echoed text" {
 
     {
         var parsed = try testRequest(&registry, .{ .op = "kill", .session = "cat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+}
+
+test "wait_for_text with regex matches a pattern" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "rcat",
+            .program = "/bin/cat",
+            .rows = 12,
+            .cols = 50,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rcat",
+            .text = "order 42 confirmed\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Regex match: "order" followed by one or more digits.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "order [0-9]+ confirmed",
+            .regex = true,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const snapshot = object.get("snapshot") orelse return error.InvalidResponse;
+        const snapshot_object = switch (snapshot) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+        const buffer = snapshot_object.get("buffer") orelse return error.InvalidResponse;
+        try std.testing.expect(buffer == .string);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.string, "order 42 confirmed") != null);
+    }
+
+    // Regex that does NOT match should time out.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "^nothing here$",
+            .regex = true,
+            .timeout_ms = 200,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const to_val = object.get("timed_out") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(true, to_val.bool);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "rcat" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
