@@ -22,7 +22,7 @@ jobs:
             name: aarch64-linux
     steps:
       - name: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: install zig
         uses: mlugg/setup-zig@v2
