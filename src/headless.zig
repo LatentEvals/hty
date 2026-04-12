@@ -2170,6 +2170,7 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
     var text: ?[]const u8 = null;
     var key: ?[]const u8 = null;
     var bytes_hex: ?[]const u8 = null;
+    var seq: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -2186,6 +2187,10 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return printUsageAndExit("--bytes-hex requires a value");
             bytes_hex = args[i];
+        } else if (std.mem.eql(u8, arg, "--seq")) {
+            i += 1;
+            if (i >= args.len) return printUsageAndExit("--seq requires a value");
+            seq = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(ExitCode.generic);
@@ -2201,9 +2206,56 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
     if (text != null) op_count += 1;
     if (key != null) op_count += 1;
     if (bytes_hex != null) op_count += 1;
+    if (seq != null) op_count += 1;
     if (op_count != 1) {
-        try printErr("hty send requires exactly one of --text, --key, --bytes-hex");
+        try printErr("hty send requires exactly one of --text, --key, --bytes-hex, --seq");
         std.process.exit(ExitCode.generic);
+    }
+
+    // --seq: parse tokens and send each one as a separate request.
+    if (seq) |s| {
+        const token_list = parseSeqTokens(s) catch {
+            try printErr("invalid --seq syntax: unmatched quote");
+            std.process.exit(ExitCode.generic);
+            unreachable;
+        };
+        const tokens = token_list.slice();
+
+        if (tokens.len == 0) {
+            try printErr("--seq requires at least one token");
+            std.process.exit(ExitCode.generic);
+        }
+
+        for (tokens) |token| {
+            var payload_buf = std.array_list.Managed(u8).init(alloc);
+            defer payload_buf.deinit();
+            var writer = payload_buf.writer();
+
+            switch (token.kind) {
+                .text => {
+                    try writer.writeAll("{\"op\":\"send_text\",\"text\":");
+                    try writeJsonString(writer.any(), token.value);
+                },
+                .key => {
+                    try writer.writeAll("{\"op\":\"send_key\",\"key\":");
+                    try writeJsonString(writer.any(), token.value);
+                },
+            }
+
+            if (session_ref) |sr| {
+                try writer.writeAll(",\"session\":");
+                try writeJsonString(writer.any(), sr);
+            }
+            try writer.writeAll("}");
+
+            const response_line = try sendRawRequest(alloc, payload_buf.items);
+            defer alloc.free(response_line);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
+            defer parsed.deinit();
+            _ = try expectOkOrExit(parsed);
+        }
+        return;
     }
 
     var payload_buf = std.array_list.Managed(u8).init(alloc);
@@ -2234,6 +2286,57 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
     defer parsed.deinit();
     _ = try expectOkOrExit(parsed);
 }
+
+const SeqToken = struct {
+    kind: enum { text, key },
+    value: []const u8,
+};
+
+/// Parse a --seq string into tokens.
+/// Quoted strings ("..." or '...') become text tokens.
+/// Unquoted whitespace-delimited words become key tokens.
+/// Token values are slices into the input string (no allocation needed for values).
+fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
+    var result: SeqTokenList = .{};
+    var pos: usize = 0;
+
+    while (pos < input.len) {
+        // Skip whitespace
+        while (pos < input.len and (input[pos] == ' ' or input[pos] == '\t')) : (pos += 1) {}
+        if (pos >= input.len) break;
+
+        if (result.len >= result.tokens.len) return error.InvalidSeq;
+
+        if (input[pos] == '"' or input[pos] == '\'') {
+            // Quoted text token
+            const quote = input[pos];
+            pos += 1;
+            const start = pos;
+            while (pos < input.len and input[pos] != quote) : (pos += 1) {}
+            if (pos >= input.len) return error.InvalidSeq; // unmatched quote
+            result.tokens[result.len] = .{ .kind = .text, .value = input[start..pos] };
+            result.len += 1;
+            pos += 1; // skip closing quote
+        } else {
+            // Unquoted key token
+            const start = pos;
+            while (pos < input.len and input[pos] != ' ' and input[pos] != '\t') : (pos += 1) {}
+            result.tokens[result.len] = .{ .kind = .key, .value = input[start..pos] };
+            result.len += 1;
+        }
+    }
+
+    return result;
+}
+
+const SeqTokenList = struct {
+    tokens: [256]SeqToken = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const SeqTokenList) []const SeqToken {
+        return self.tokens[0..self.len];
+    }
+};
 
 fn runClientSnapshot(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
@@ -4133,10 +4236,10 @@ fn watchHelpText() []const u8 {
 
 fn sendHelpText() []const u8 {
     return
-    \\hty send [SESSION] --text "..." | --key NAME | --bytes-hex HEX
+    \\hty send [SESSION] --text "..." | --key NAME | --seq "..." | --bytes-hex HEX
     \\
-    \\Send input to a session. Exactly one of --text, --key, --bytes-hex is
-    \\required.
+    \\Send input to a session. Exactly one of --text, --key, --seq,
+    \\--bytes-hex is required.
     \\
     \\Flags:
     \\  --text STRING     UTF-8 text sent verbatim.
@@ -4144,6 +4247,9 @@ fn sendHelpText() []const u8 {
     \\                    Supports ctrl-, alt-/meta-, shift- prefixes,
     \\                    function keys (f1-f12), and combinations like
     \\                    ctrl-alt-f or shift-up. Run `hty keys` for details.
+    \\  --seq STRING      Send a sequence of keys and text in one call.
+    \\                    Quoted strings are text, bare words are key names.
+    \\                    Example: --seq 'ctrl-s "hello" enter'
     \\  --bytes-hex HEX   Raw bytes encoded as hex.
     \\
     ;
@@ -4471,6 +4577,60 @@ test "key encoding: multi-modifier combos" {
     try std.testing.expectEqualStrings("\x1b[1;7C", try keyToBytes(arena, "alt-ctrl-right"));
     // Duplicate modifier is an error
     try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "ctrl-ctrl-x"));
+}
+
+test "parseSeqTokens: keys only" {
+    const result = try parseSeqTokens("ctrl-c ctrl-t");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 2), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("ctrl-c", tokens[0].value);
+    try std.testing.expectEqual(.key, tokens[1].kind);
+    try std.testing.expectEqualStrings("ctrl-t", tokens[1].value);
+}
+
+test "parseSeqTokens: mixed text and keys" {
+    const result = try parseSeqTokens("ctrl-s \"TODO Learn\" enter");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("ctrl-s", tokens[0].value);
+    try std.testing.expectEqual(.text, tokens[1].kind);
+    try std.testing.expectEqualStrings("TODO Learn", tokens[1].value);
+    try std.testing.expectEqual(.key, tokens[2].kind);
+    try std.testing.expectEqualStrings("enter", tokens[2].value);
+}
+
+test "parseSeqTokens: single-quoted text" {
+    const result = try parseSeqTokens("'hello world' enter");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 2), tokens.len);
+    try std.testing.expectEqual(.text, tokens[0].kind);
+    try std.testing.expectEqualStrings("hello world", tokens[0].value);
+    try std.testing.expectEqual(.key, tokens[1].kind);
+}
+
+test "parseSeqTokens: text-only sequence" {
+    const result = try parseSeqTokens("\"yes\"");
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqual(.text, tokens[0].kind);
+    try std.testing.expectEqualStrings("yes", tokens[0].value);
+}
+
+test "parseSeqTokens: empty input" {
+    const result = try parseSeqTokens("");
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parseSeqTokens: whitespace only" {
+    const result = try parseSeqTokens("   ");
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "parseSeqTokens: unmatched quote is an error" {
+    try std.testing.expectError(error.InvalidSeq, parseSeqTokens("\"hello"));
+    try std.testing.expectError(error.InvalidSeq, parseSeqTokens("'hello"));
 }
 
 test "help text lists all subcommands" {
