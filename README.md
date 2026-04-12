@@ -2,6 +2,80 @@
 
 `hty` gives AI agents a way to use interactive TUI and CLI programs — `vim`, `git add -p`, `create-next-app`, `psql`, `btop`, `gh auth login` — by reading the rendered screen and sending keys.
 
+## Install
+
+### Install script
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
+```
+
+Auto-detects your OS and architecture, downloads the latest release binary, and installs to `/usr/local/bin`. Set `HTY_INSTALL_DIR` to change the target directory.
+
+Or download a specific platform from the [releases page](https://github.com/montanaflynn/hty/releases/latest).
+
+### Homebrew
+
+```sh
+brew install montanaflynn/tap/hty
+```
+
+### From source
+
+Requires [Zig](https://ziglang.org) 0.15+. Ghostty's VT engine is fetched automatically by the Zig package manager.
+
+```sh
+git clone https://github.com/montanaflynn/hty.git
+cd hty
+zig build -Doptimize=ReleaseFast
+sudo cp zig-out/bin/hty /usr/local/bin/
+```
+
+## Quick start
+
+An agent walking through `git add -p` to stage specific hunks:
+
+```sh
+hty run --name review -- git add -p
+hty wait review --text "Stage this hunk" --timeout 5000
+hty snapshot review                       # read the screen
+hty send review --text "y"                # stage this hunk
+hty send review --key enter
+hty wait review --idle 200 --timeout 3000
+hty send review --text "n"                # skip the next one
+hty send review --key enter
+hty send review --text "q"
+hty send review --key enter
+hty wait review --exit --timeout 2000
+```
+
+The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls and can be observed from other terminals with `hty watch`.
+
+### Try the demo
+
+`scripts/demo-vim.sh` drives `vim` end-to-end through `hty` while you watch it live from a second terminal.
+
+In terminal A:
+
+```sh
+zig build
+./scripts/demo-vim.sh
+```
+
+In terminal B (any time during the demo):
+
+```sh
+./zig-out/bin/hty watch demo-vim
+```
+
+Terminal B shows vim opening, `watched by another terminal` appearing character-by-character in insert mode, `:wq` at the status bar, and vim exiting — all unattended.
+
+Because every session is logged, you can re-watch the whole thing later with:
+
+```sh
+./zig-out/bin/hty replay demo-vim
+```
+
 ## Commands
 
 ```
@@ -52,86 +126,6 @@ Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the 
 | 4 | session prefix matched multiple sessions (ambiguous) |
 | 5 | a session with that name already exists |
 
-## Under the hood
-
-A PTY runtime built on [Ghostty](https://ghostty.org)'s VT engine, a persistent background server, and a flat subcommand CLI. Sessions live in the server across invocations; clients talk to it over a Unix socket. Every session is logged to an append-only JSONL file on disk so `hty logs` and `hty replay` work long after the session has ended.
-
-**Status:** beta. The core surface is shipped — persistent server, named sessions, live observers (`hty watch`), interactive multi-writer attach (`hty attach`), append-only session event logs with `hty logs` / `hty replay`, the wait primitives, explicit session lifecycle (`hty kill` / `hty delete`), and remote observation via `$HTY_SOCKET` + SSH tunnels. See [docs/ROADMAP.md](docs/ROADMAP.md) for the post-beta polish backlog.
-
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
-```
-
-Auto-detects your OS and architecture, downloads the latest release binary, and installs to `/usr/local/bin`. Set `HTY_INSTALL_DIR` to change the target directory.
-
-Or download a specific platform from the [releases page](https://github.com/montanaflynn/hty/releases/latest).
-
-### From source
-
-Requires [Zig](https://ziglang.org) 0.15+. Ghostty's VT engine is fetched automatically by the Zig package manager.
-
-```sh
-git clone https://github.com/montanaflynn/hty.git
-cd hty
-zig build -Doptimize=ReleaseFast
-sudo cp zig-out/bin/hty /usr/local/bin/
-```
-
-## Quick example
-
-An agent walking through `git add -p` to stage specific hunks:
-
-```sh
-hty run --name review -- git add -p
-hty wait review --text "Stage this hunk" --timeout 5000
-hty snapshot review                       # read the screen
-hty send review --text "y"                # stage this hunk
-hty send review --key enter
-hty wait review --idle 200 --timeout 3000
-hty send review --text "n"                # skip the next one
-hty send review --key enter
-hty send review --text "q"
-hty send review --key enter
-hty wait review --exit --timeout 2000
-```
-
-The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls and can be observed from other terminals with `hty watch`.
-
-## Try the demo
-
-`scripts/demo-vim.sh` drives `vim` end-to-end through `hty` while you watch it live from a second terminal.
-
-In terminal A:
-
-```sh
-zig build
-./scripts/demo-vim.sh
-```
-
-In terminal B (any time during the demo):
-
-```sh
-./zig-out/bin/hty watch demo-vim
-```
-
-Terminal B shows vim opening, `watched by another terminal` appearing character-by-character in insert mode, `:wq` at the status bar, and vim exiting — all unattended.
-
-Because every session is logged, you can re-watch the whole thing later with:
-
-```sh
-./zig-out/bin/hty replay demo-vim
-```
-
-## Tests
-
-```sh
-zig build test
-```
-
-Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, UUIDv7 generation, session registry behavior, the subcommand dispatch, and end-to-end integration against `/bin/cat`, `nano`, and `/usr/bin/top` using the wait primitives.
-
 ## Remote observation
 
 The client's socket path can be overridden with `$HTY_SOCKET`, which makes it straightforward to watch, attach to, or drive a session running on another machine via an SSH tunnel:
@@ -146,6 +140,20 @@ HTY_SOCKET=/tmp/hty-remote.sock hty attach foo
 ```
 
 When `$HTY_SOCKET` is set, the client never auto-spawns a local server — if the endpoint isn't reachable it fails fast, so a broken tunnel is obvious instead of silently shadowed by a fresh local server.
+
+## Under the hood
+
+A PTY runtime built on [Ghostty](https://ghostty.org)'s VT engine, a persistent background server, and a flat subcommand CLI. Sessions live in the server across invocations; clients talk to it over a Unix socket. Every session is logged to an append-only JSONL file on disk so `hty logs` and `hty replay` work long after the session has ended.
+
+**Status:** beta. The core surface is shipped — persistent server, named sessions, live observers (`hty watch`), interactive multi-writer attach (`hty attach`), append-only session event logs with `hty logs` / `hty replay`, the wait primitives, explicit session lifecycle (`hty kill` / `hty delete`), and remote observation via `$HTY_SOCKET` + SSH tunnels. See [docs/ROADMAP.md](docs/ROADMAP.md) for the post-beta polish backlog.
+
+## Tests
+
+```sh
+zig build test
+```
+
+Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, UUIDv7 generation, session registry behavior, the subcommand dispatch, and end-to-end integration against `/bin/cat`, `nano`, `emacs`, and `top` using the wait primitives.
 
 ## Debug utilities
 
