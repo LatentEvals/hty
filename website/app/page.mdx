@@ -1,0 +1,55 @@
+# hty
+
+**Puppeteer for the terminal.** Let AI agents drive any interactive CLI — editors, REPLs, auth flows, scaffolding wizards — by reading the screen and sending keys.
+
+---
+
+## The problem
+
+AI agents can run `bash -c "git commit -m 'fix'"`. They can't run `git add -p` and pick which hunks to stage. They can't answer the questions in `create-next-app`. They can't log in with `gh auth login`.
+
+Every interactive program is a wall. Agents either bail out and ask the human, or maintain brittle `--flag` workarounds that break the moment a tool adds a new prompt.
+
+## The fix
+
+`hty` wraps any program in a persistent PTY session. Your agent reads the rendered screen, sends keystrokes, and waits for the output to settle — the same loop a human uses, automated.
+
+```sh
+hty run --name setup -- create-next-app my-app
+hty wait setup --text "Would you like to use TypeScript?" --timeout 5000
+hty send setup --text "y\n"
+hty wait setup --text "Would you like to use ESLint?" --timeout 5000
+hty send setup --text "y\n"
+hty wait setup --text "Would you like to use Tailwind CSS?" --timeout 5000
+hty send setup --text "y\n"
+hty wait setup --exit --timeout 30000
+```
+
+No flags to memorize. No brittle expect scripts. The agent reads the question and answers it.
+
+## What you get
+
+- **Any interactive program works.** `vim`, `psql`, `btop`, `git add -p`, `gh auth login`, `create-next-app` — if a human can use it, an agent can too.
+- **Sessions persist.** The server auto-starts and keeps sessions alive across invocations. Pick up where you left off.
+- **Watch live.** Open another terminal and run `hty watch` to see exactly what the agent sees, in real time.
+- **Full replay.** Every session is recorded. `hty replay` plays it back through a fresh VT engine — debug what happened, or demo it to your team.
+- **Wait primitives that actually work.** `--text` for substring match, `--idle` for output settling, `--exit` for process completion. All with timeouts. No `sleep 2` and hope.
+- **Remote observation.** SSH tunnel to a remote machine and `watch` or `attach` to sessions running there. No protocol changes needed.
+- **Single binary, zero dependencies.** One `curl | sh` and you're running. Built on Ghostty's production-grade VT engine in Zig.
+
+## Get started in 30 seconds
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
+hty run --name demo -- top
+hty wait demo --idle 1000 --timeout 5000
+hty snapshot demo
+hty kill demo
+hty delete demo
+```
+
+[Install hty →](/installation)
+
+[See real-world examples →](/examples)
+
+[GitHub →](https://github.com/LatentEvals/hty)

@@ -1,0 +1,50 @@
+# Installation
+
+Single binary, zero runtime dependencies. Pick your method and you're running in seconds.
+
+## Homebrew (macOS)
+
+```sh
+brew install LatentEvals/tap/hty
+```
+
+## Install script (macOS and Linux)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
+```
+
+Auto-detects your OS and architecture, downloads the latest release binary, and verifies the checksum. Installs to `~/.local/bin` by default.
+
+Options:
+- `--install-dir /path` — change the install location
+- `HTY_INSTALL_DIR=/path` — same thing, via environment variable
+
+## Prebuilt binaries
+
+Download directly from the [releases page](https://github.com/LatentEvals/hty/releases/latest):
+
+| Platform | Architecture |
+| --- | --- |
+| macOS | arm64 (Apple Silicon) |
+| Linux | x86_64 |
+| Linux | arm64 |
+
+## From source
+
+Requires [Zig](https://ziglang.org) 0.15+.
+
+```sh
+git clone https://github.com/LatentEvals/hty.git
+cd hty
+zig build -Doptimize=ReleaseFast
+sudo cp zig-out/bin/hty /usr/local/bin/
+```
+
+## Verify
+
+```sh
+hty --help
+```
+
+If you see the help output, you're good. Head to [Getting Started](/getting-started) to run your first session.

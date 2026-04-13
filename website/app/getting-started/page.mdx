@@ -1,0 +1,93 @@
+# Getting Started
+
+Drive your first interactive program in under a minute. Make sure you've [installed hty](/installation) first.
+
+## Your first session
+
+Launch an interactive program, read its screen, and send it input:
+
+```sh
+# start vim in a detached session
+hty run --name demo -- vim /tmp/hello.txt
+
+# read what's on screen
+hty snapshot demo
+
+# type "ihello world", then Escape, then :wq to save and quit
+hty send demo --text "ihello world"
+hty send demo --key esc
+hty send demo --text ":wq\n"
+
+# wait for vim to exit
+hty wait demo --exit --timeout 3000
+
+# verify it worked
+cat /tmp/hello.txt
+```
+
+That's the core loop: **run**, **snapshot**, **send**, **wait**. Everything else builds on these four primitives.
+
+## Watch a session live
+
+While a session is running, open a second terminal and watch what's happening in real time:
+
+```sh
+hty watch demo
+```
+
+You see exactly what the agent sees — the fully rendered terminal screen, updated live. Press `Ctrl-C` to stop watching. The session keeps running.
+
+## Replay a session
+
+Every session is automatically recorded. Replay any session after it's finished:
+
+```sh
+hty replay demo
+hty replay demo --speed 3       # 3x speed
+```
+
+The replay runs through a fresh VT engine in memory — no side effects, no re-execution. Great for debugging what an agent did, or demoing a workflow.
+
+## Wait for things to happen
+
+The `wait` command is what makes `hty` reliable. Instead of `sleep 2` and hoping the program is ready, you wait for actual conditions:
+
+```sh
+# wait for specific text to appear on screen
+hty wait my-session --text "Stage this hunk" --timeout 5000
+
+# wait for output to settle (no new output for 300ms)
+hty wait my-session --idle 300 --timeout 5000
+
+# wait for the process to exit
+hty wait my-session --exit --timeout 30000
+```
+
+Always use `--timeout`. An agent stuck in an infinite wait is worse than one that fails fast.
+
+## How sessions work
+
+- The background server **auto-starts** on first use (like tmux) and auto-shuts down after 10 seconds of idle.
+- Sessions are identified by **name** (`--name demo`) or by their **UUIDv7** prefix.
+- Sessions **persist across invocations** — start one from your agent, observe it from your terminal, send more input later.
+- `hty kill` terminates the process but **keeps the recording** for `logs` and `replay`.
+- `hty delete` permanently removes a session and its log file.
+
+## Exit codes
+
+Predictable exit codes so your agent can branch on failures:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Generic error |
+| 2 | Session not found |
+| 3 | `wait` timed out |
+| 4 | Ambiguous session prefix |
+| 5 | Session name already exists |
+
+## Next steps
+
+- [Examples](/examples) — copy-pasteable scripts for common scenarios
+- [Commands](/commands) — full reference for every subcommand
+- [Remote sessions](/remote) — drive sessions on other machines via SSH
