@@ -1,0 +1,66 @@
+# Sessions
+
+An hty session is a pseudoterminal (PTY) process managed by the hty background server. Because the server persists across individual CLI invocations, a session continues running after the command that launched it returns. You can inspect it, send it input, take snapshots, and read its output at any point — from any process on the same machine.
+
+## Session identity
+
+Every session gets a UUIDv7 ID generated at spawn time. The full ID is a 36-character string like `018f4c2a-3b1d-7e90-a3c4-1f2d3e4f5a6b`. hty displays the first 8 characters as a short identifier in command output.
+
+You can reference a session in three ways:
+
+- **Full UUID** — the complete 36-character ID.
+- **Unique prefix** — any unambiguous prefix of the UUID. hty resolves it to the matching session or returns an error if the prefix is ambiguous.
+- **Name** — the human-readable name you assigned at launch with `--name`.
+
+```bash
+# Reference by UUID prefix
+hty snapshot abc12345
+
+# Reference by name
+hty snapshot my-session
+```
+
+If exactly one session is currently registered, you can omit the session argument entirely and hty will use it automatically.
+
+```bash
+# Works when only one session exists
+hty snapshot
+hty send --text "hello"
+```
+
+## Session status
+
+Each session moves through a set of statuses that reflect the state of its underlying process.
+
+| Status    | Meaning |
+|-----------|---------|
+| `running` | The process is alive and accepting input. |
+| `exited`  | The process terminated on its own with an exit code. |
+| `failed`  | The process could not be started or encountered a fatal error. |
+| `killed`  | The process was stopped with `hty kill`. |
+
+## Session lifecycle
+
+Sessions follow a straightforward lifecycle from creation to removal:
+
+1. **`hty run <program>`** — spawns the process and creates a `running` session.
+2. The process runs until it exits naturally (`exited`), encounters a startup error (`failed`), or is stopped by `hty kill` (`killed`).
+3. After the process ends, the session record remains in the registry. You can still read logs, replay output, and view session metadata.
+4. **`hty delete <session>`** — removes the session record from the registry and deletes the log file from disk. If the process is still running, `hty delete` kills it first.
+
+`hty kill` stops the process but keeps the session record intact. The log file is closed and preserved on disk, so you can replay the session later. Use `hty delete` when you want to remove everything.
+
+<Callout type="info">
+Exited, failed, and killed sessions remain in the registry until you explicitly run `hty delete`. This lets you inspect logs and replay output from completed sessions at any time.
+</Callout>
+## Naming sessions
+
+Pass `--name` to `hty run` to give a session a human-readable name:
+
+```bash
+hty run --name build-server -- python server.py
+```
+
+Names must be unique across all sessions currently in the registry. You cannot rename a session after it is created. Once a named session is deleted, its name becomes available again.
+
+The name is also used to create a convenience symlink in the log directory, so you can find the session's log file by name without knowing the UUID.

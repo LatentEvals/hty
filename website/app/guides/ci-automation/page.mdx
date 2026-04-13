@@ -1,0 +1,89 @@
+# CI Automation
+
+Some programs require interactive input even in CI — they prompt for confirmations, display menus, or wait for keystrokes that have no non-interactive equivalent. hty lets you script those interactions precisely: start the program, wait for each prompt, send the right input, and verify the output.
+
+## Basic CI pattern
+
+Run the program, wait for each prompt, send the expected input, confirm success, and clean up:
+
+```sh
+#!/usr/bin/env bash
+set -e
+
+# Clean up the session when the script exits (success or failure)
+trap 'hty delete auth-flow 2>/dev/null || true' EXIT
+
+# Start the interactive program
+hty run --name auth-flow -- gh auth login
+
+# Wait for the "What account do you want to log into?" prompt
+hty wait auth-flow --text "What account" --timeout 10000
+
+# Select GitHub.com (send Enter to accept the default)
+hty send auth-flow --text "\n"
+
+# Wait for the authentication method prompt
+hty wait auth-flow --text "How would you like to authenticate" --timeout 5000
+
+# Choose "Paste an authentication token"
+hty send auth-flow --text "2\n"
+
+# Wait for the token prompt
+hty wait auth-flow --text "Paste your authentication token" --timeout 5000
+
+# Send the token
+hty send auth-flow --text "${GITHUB_TOKEN}\n"
+
+# Wait for the program to exit
+hty wait auth-flow --exit --timeout 15000
+```
+
+The `trap` at the top ensures the session is always cleaned up, even if the script exits early due to `set -e`.
+
+## Handling failures
+
+When a wait times out, `hty wait` exits with code `3`. Capture the screen at that moment so you have a record of what the program was showing:
+
+```sh
+if ! hty wait session --text "Success" --timeout 30000; then
+  echo "=== Session screen at failure ==="
+  hty snapshot session | jq -r '.snapshot.buffer'
+  hty delete session
+  exit 1
+fi
+```
+
+The snapshot captures the exact state of the terminal at the moment of failure — the most useful artifact you can have when diagnosing a stuck CI run.
+
+## Session cleanup
+
+Always delete sessions when you're done in CI. Sessions persist in the hty server until explicitly removed, so failing to clean up can leave stale state.
+
+Use a `trap` to guarantee cleanup regardless of how the script exits:
+
+```sh
+trap 'hty delete my-session 2>/dev/null || true' EXIT
+hty run --name my-session -- my-interactive-program
+```
+
+<Callout type="info">
+The hty server auto-shuts-down 10 seconds after all running sessions end. You don't need to stop or clean up the server daemon in CI — it exits on its own once your sessions are gone.
+</Callout>
+## Capturing logs for debugging
+
+Every hty session is automatically logged. Save the log as a CI artifact for a complete record:
+
+```sh
+hty logs my-session > session.jsonl
+```
+
+Filter with `jq` to find specific events:
+
+```sh
+# Find when the program exited and what code it returned
+hty logs my-session | jq 'select(.kind == "exited")'
+```
+
+<Callout type="info">
+Set `--timeout` values conservatively large in CI. Network latency, cold container starts, and package installation can make programs significantly slower than on a developer laptop.
+</Callout>

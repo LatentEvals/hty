@@ -1,38 +1,66 @@
 # Installation
 
-Single binary, zero runtime dependencies. Pick your method and you're running in seconds.
-
-## Homebrew (macOS)
-
-```sh
-brew install LatentEvals/tap/hty
-```
+You can install hty in three ways: a one-line shell script that auto-detects your platform, a Homebrew tap, or building from source with Zig. All three produce the same single binary with no runtime dependencies.
 
 ## Install script (macOS and Linux)
+
+Run the install script with `curl`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
-Auto-detects your OS and architecture, downloads the latest release binary, and verifies the checksum. Installs to `~/.local/bin` by default.
+The script auto-detects your OS and architecture, downloads the matching release binary from GitHub, verifies the checksum, and installs to `~/.local/bin`.
 
-Options:
-- `--install-dir /path` — change the install location
-- `HTY_INSTALL_DIR=/path` — same thing, via environment variable
+To change the install directory, pass `--install-dir` or set the `HTY_INSTALL_DIR` environment variable:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh -s -- --install-dir /usr/local/bin
+```
+
+**All options:**
+
+| Option | Description |
+| --- | --- |
+| `--version VERSION` | Release tag to install (default: latest) |
+| `--install-dir DIR` | Install directory (default: `~/.local/bin` or `HTY_INSTALL_DIR`) |
+| `--verify MODE` | `auto` \| `always` \| `never` — checksum verification (default: `auto`) |
+| `--color MODE` | `auto` \| `always` \| `never` (default: `auto`) |
+| `--force` | Overwrite existing binary without prompting |
+| `--silent` | Suppress normal output |
+| `--json` | Emit structured JSON lines instead of human output |
+| `--dry-run` | Print what would happen without changing the system |
+
+<Callout type="info">
+If `~/.local/bin` is not on your `PATH`, the script prints the exact line to add to your shell profile. You can also add it manually:
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+</Callout>
+## Homebrew (macOS)
+
+Install hty from the official tap:
+
+```sh
+brew install LatentEvals/tap/hty
+```
+
+Homebrew handles PATH automatically. Run `brew upgrade LatentEvals/tap/hty` to upgrade to a newer release.
 
 ## Prebuilt binaries
 
 Download directly from the [releases page](https://github.com/LatentEvals/hty/releases/latest):
 
-| Platform | Architecture |
+| OS | Architecture |
 | --- | --- |
-| macOS | arm64 (Apple Silicon) |
-| Linux | x86_64 |
-| Linux | arm64 |
+| macOS | aarch64 (Apple Silicon) |
+| macOS | x86\_64 |
+| Linux | x86\_64 |
+| Linux | aarch64 |
 
 ## From source
 
-Requires [Zig](https://ziglang.org) 0.15+.
+Building from source requires [Zig](https://ziglang.org) 0.15 or later.
 
 ```sh
 git clone https://github.com/LatentEvals/hty.git
@@ -41,10 +69,12 @@ zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/hty /usr/local/bin/
 ```
 
-## Verify
+## Verify installation
+
+After installing, confirm the binary is on your `PATH` and working:
 
 ```sh
 hty --help
 ```
 
-If you see the help output, you're good. Head to [Getting Started](/getting-started) to run your first session.
+You should see the hty command list. If you get `command not found`, check that the install directory is on your `PATH`. Head to [Quick Start](/quickstart) to run your first session.

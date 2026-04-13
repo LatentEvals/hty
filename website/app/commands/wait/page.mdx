@@ -1,0 +1,73 @@
+# hty wait
+
+Block your script until a session reaches a specific condition — text appears on screen, a regex matches, the display stops changing, or the process exits. This eliminates fragile `sleep` calls and removes race conditions.
+
+## Synopsis
+
+```sh
+hty wait [session] --text "..." | --regex "..." | --idle <ms> | --exit [--timeout <ms>]
+```
+
+The `<session>` argument accepts a session name, a full UUID, or a unique UUID prefix. If only one session is running, you can omit it.
+
+## Modes
+
+### --text
+
+Wait until a literal substring appears anywhere in the rendered screen buffer.
+
+```sh
+hty wait my-session --text "Press any key" --timeout 5000
+hty wait my-session --text "Stage this hunk" --timeout 5000
+```
+
+### --regex
+
+Wait until a POSIX extended regular expression matches in the rendered screen buffer. This is a standalone mode — use it instead of `--text`, not alongside it.
+
+```sh
+hty wait my-session --regex "error|Error|ERROR" --timeout 5000
+hty wait my-session --regex '\$' --timeout 3000
+```
+
+### --idle
+
+Wait until the rendered screen has not changed for the given number of milliseconds. Useful after sending input when you don't know exactly what text to expect.
+
+```sh
+hty wait my-session --idle 500 --timeout 10000
+hty wait my-session --idle 1000 --timeout 30000
+```
+
+### --exit
+
+Wait until the session's process terminates, regardless of exit code.
+
+```sh
+hty wait my-session --exit --timeout 30000
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--text PATTERN` | Wait for a literal substring on screen |
+| `--regex PATTERN` | Wait for a POSIX regex match on screen |
+| `--idle MS` | Wait for no screen updates for the given duration |
+| `--exit` | Wait for the process to exit |
+| `--timeout MS` | Maximum wait time in milliseconds (exit code 3 on expiry) |
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Condition matched successfully |
+| 3 | Timed out before the condition was met |
+
+<Callout type="info">
+Always use `--timeout`. An agent stuck in an infinite wait is worse than one that fails fast.
+</Callout>
+
+<Callout type="warning">
+`--idle` measures the rendered screen rather than raw I/O. Programs that continuously redraw the screen — such as `top`, `htop`, or animated spinners — may never trigger idle.
+</Callout>

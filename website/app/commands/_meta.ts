@@ -1,0 +1,14 @@
+export default {
+  list: 'list',
+  run: 'run',
+  snapshot: 'snapshot',
+  send: 'send',
+  wait: 'wait',
+  kill: 'kill',
+  delete: 'delete',
+  logs: 'logs',
+  replay: 'replay',
+  watch: 'watch',
+  attach: 'attach',
+  keys: 'keys'
+}

@@ -1,0 +1,63 @@
+# Environment Variables
+
+hty reads several environment variables to control its behavior without requiring config files. You can set them per-command inline or export them in your shell profile or CI environment.
+
+## Quick reference
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HTY_SOCKET` | `$XDG_RUNTIME_DIR/hty/sock` or `~/.local/state/hty/sock` | Unix socket path for client-server communication |
+| `HTY_INSTALL_DIR` | `~/.local/bin` | Install directory used by `install.sh` |
+| `XDG_RUNTIME_DIR` | OS-provided | Base directory for runtime files including the socket |
+| `XDG_STATE_HOME` | `~/.local/state` | Base directory for persistent state including session logs |
+| `SHELL` | `/bin/sh` | Fallback program when `hty run` is called with no arguments |
+| `NO_COLOR` | (unset) | Disable color output in `install.sh` when set to any value |
+| `TERM` | `xterm-256color` | Set in spawned sessions if not already present |
+
+## HTY_SOCKET
+
+`HTY_SOCKET` overrides the default Unix socket path that hty uses for client-server communication.
+
+When you set `HTY_SOCKET`, the client never tries to auto-spawn a local server. If the socket is unreachable, hty fails immediately with an error instead of falling back to a local spawn. This makes it safe to use in environments where a stale or missing socket should be treated as a hard failure.
+
+The primary use case is routing commands to a remote hty server over an SSH tunnel:
+
+```sh
+# Forward the remote socket to a local path
+ssh -L /tmp/hty-remote.sock:/run/user/1000/hty/sock user@host -N &
+
+# All commands now talk to the remote server
+HTY_SOCKET=/tmp/hty-remote.sock hty list
+HTY_SOCKET=/tmp/hty-remote.sock hty snapshot my-session
+```
+
+<Callout type="info">
+Export `HTY_SOCKET` in your shell session to avoid repeating it on every command while working with a remote server.
+</Callout>
+## HTY_INSTALL_DIR
+
+`HTY_INSTALL_DIR` controls where `install.sh` places the `hty` binary. It only affects the install script — the hty binary itself does not read this variable at runtime.
+
+```sh
+# Install to /usr/local/bin instead of ~/.local/bin
+HTY_INSTALL_DIR=/usr/local/bin sh install.sh
+
+# Equivalent using the flag
+sh install.sh --install-dir /usr/local/bin
+```
+
+## XDG directories
+
+hty follows the [XDG Base Directory Specification](https://specifications.freedesktop.org/basedir-spec/latest/) for locating its runtime files and session logs.
+
+### XDG_RUNTIME_DIR
+
+hty places its Unix socket at `$XDG_RUNTIME_DIR/hty/sock`. If `XDG_RUNTIME_DIR` is not set, hty falls back to `~/.local/state/hty/sock`.
+
+### XDG_STATE_HOME
+
+hty stores session log files at `$XDG_STATE_HOME/hty/logs`. If `XDG_STATE_HOME` is not set, hty falls back to `~/.local/state/hty/logs`.
+
+<Callout type="info">
+hty creates these directories automatically with mode `0700` when the server starts. The directory must be owned by the current user — hty refuses to use a directory owned by a different UID as a defense against symlink attacks.
+</Callout>

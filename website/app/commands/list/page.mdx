@@ -1,0 +1,57 @@
+# hty list
+
+Show all sessions the server knows about, including sessions that are still running and those that have exited or been killed. Also scans log files on disk, so historical sessions appear even after a server restart.
+
+## Synopsis
+
+```sh
+hty list [--json]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit JSON output instead of the default table format |
+
+## Default output
+
+By default, `hty list` prints a formatted table:
+
+```
+ID       NAME     PROGRAM  STATUS   STARTED
+019687a2 editor   vim      running  2m ago
+019687a1 build    make     exited   5m ago
+```
+
+If no sessions exist, it prints "no sessions" to stderr.
+
+## JSON output
+
+With `--json`, the output is a JSON object:
+
+```json
+{
+  "ok": true,
+  "sessions": [
+    {
+      "id": "019687a2-b4c1-7e3a-8f02-d4c9a1e07b55",
+      "name": "editor",
+      "program": "vim",
+      "args": "/tmp/notes.txt",
+      "status": "running",
+      "created_at_ms": 1749823441000
+    }
+  ]
+}
+```
+
+## Session statuses
+
+| Status | Meaning |
+|--------|---------|
+| `running` | The process is alive and accepting input |
+| `exited` | The process terminated on its own |
+| `killed` | The process was stopped with `hty kill` |
+| `failed` | The process could not be started |
+| `stale` | Found on disk from a prior server instance with no clean exit event |

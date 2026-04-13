@@ -1,0 +1,150 @@
+# Quick Start
+
+Install hty and walk through a complete example: driving `git add -p` to stage specific hunks. This is the same workflow an AI agent uses — start a session, wait for the right text on screen, send keystrokes, and repeat until the task is done.
+
+## Install hty
+
+Run the one-line install script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
+```
+
+The script auto-detects your OS and architecture, downloads the latest release binary, verifies its checksum, and installs to `~/.local/bin`.
+
+<Callout type="info">
+Looking for Homebrew, building from source, or installing to a custom directory? See the [installation page](/installation) for all options.
+</Callout>
+## Your first session
+
+### 1. Start a session
+
+Run `git add -p` inside a new hty session named `review`:
+
+```sh
+hty run --name review -- git add -p
+```
+
+This launches `git add -p` in a detached PTY session. The hty server starts automatically in the background on first use and keeps the session alive across individual `hty` commands — you do not need to keep a shell open.
+
+### 2. Wait for the prompt
+
+Block until the text `Stage this hunk` appears on screen:
+
+```sh
+hty wait review --text "Stage this hunk" --timeout 5000
+```
+
+`hty wait` polls the rendered screen and returns as soon as the text matches. The `--timeout` flag sets the maximum time to wait in milliseconds. If the timeout expires before the text appears, `hty wait` exits with code `3`.
+
+<Callout type="info">
+Exit code `3` always means "timed out". Check `$?` in your script to handle the case where a prompt never appears.
+</Callout>
+### 3. Read the screen
+
+Take a snapshot of the current rendered terminal screen:
+
+```sh
+hty snapshot review
+```
+
+The command returns a JSON object describing the full screen state:
+
+```json
+{
+  "ok": true,
+  "snapshot": {
+    "rows": 24,
+    "cols": 80,
+    "buffer": "@@ -1,4 +1,4 @@\n-foo\n+bar\n Stage this hunk [y,n,q,a,d,/,e,?]? ",
+    "lines": [
+      "@@ -1,4 +1,4 @@",
+      "-foo",
+      "+bar",
+      " Stage this hunk [y,n,q,a,d,/,e,?]? "
+    ],
+    "cursor_row": 3,
+    "cursor_col": 38,
+    "status": "running"
+  }
+}
+```
+
+Use `snapshot.buffer` for plain-text matching or `snapshot.lines` to inspect individual rows. `snapshot.status` is `"running"` while the process is alive and `"exited"` once it has finished.
+
+### 4. Send input
+
+Stage the current hunk by sending `y` followed by a newline:
+
+```sh
+hty send review --text "y\n"   # stage this hunk
+```
+
+The `\n` is interpreted as a newline character (Enter), just as if you typed it. The program receives the keystroke immediately.
+
+### 5. Wait for the screen to settle
+
+After sending input, wait until the screen has been idle for 200 ms before continuing:
+
+```sh
+hty wait review --idle 200 --timeout 3000
+```
+
+`--idle` tells `hty wait` to block until no screen updates have occurred for the specified number of milliseconds. This is a reliable way to know that `git add -p` has finished processing your input and is ready for the next response.
+
+### 6. Send more input
+
+Skip the next hunk, then quit:
+
+```sh
+hty send review --text "n\n"   # skip the next hunk
+hty send review --text "q\n"   # quit
+```
+
+### 7. Wait for exit
+
+Block until the session's process exits:
+
+```sh
+hty wait review --exit --timeout 2000
+```
+
+`hty wait` returns as soon as `git add -p` exits. The session record stays in the server so you can still inspect logs or replay the session afterward.
+
+## Watch it live
+
+While a session is running, you can observe its rendered screen in real time from a second terminal:
+
+```sh
+hty watch review
+```
+
+`hty watch` connects to the session and streams screen updates as they arrive. It is read-only — you cannot send input through `hty watch`. Use it to monitor long-running sessions, debug what an agent is seeing, or share a live view with a teammate.
+
+## Clean up
+
+Stop the process and remove the session record when you are done:
+
+```sh
+hty kill review    # stop the process (the record stays for replay)
+hty delete review  # remove the session record permanently
+```
+
+`hty kill` terminates the child process but keeps the session record in the server, so `hty logs review` and `hty replay review` still work. `hty delete` removes the record and its log file from disk entirely.
+
+## List sessions
+
+See all sessions the server knows about:
+
+```sh
+hty list
+```
+
+Sessions are identified by their full UUIDv7, the first 8 characters of that UUID, or by their human-readable `--name`. Any unambiguous prefix works wherever a session ID is expected.
+
+## Next steps
+
+- [All commands](/commands/run) — Complete flag reference for every hty subcommand
+- [AI agent guide](/guides/ai-agents) — Patterns for driving TUI programs from an AI agent
+- [Core concepts](/concepts/sessions) — Sessions, the server, and how sessions are resolved
+- [Session replay](/guides/session-replay) — Replay recorded sessions to debug or audit agent actions

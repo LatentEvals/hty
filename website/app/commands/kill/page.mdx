@@ -1,0 +1,19 @@
+# hty kill
+
+Send SIGKILL to a session's process. The process is terminated immediately. The session record stays in the server — `hty list` continues to show it with status `killed`, and the log file is kept on disk.
+
+## Synopsis
+
+```sh
+hty kill <session>
+```
+
+## Example
+
+```sh
+hty kill my-session
+```
+
+<Callout type="info">
+`hty kill` is non-destructive. The log file is preserved after a kill, so you can still run `hty logs` or `hty replay` on the session afterwards. Use `hty delete` when you are done and want to remove the record entirely.
+</Callout>

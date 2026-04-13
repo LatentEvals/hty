@@ -1,0 +1,19 @@
+# hty delete
+
+Remove the session record from the server and delete the log file from disk. If the session is still running, hty kills it first.
+
+## Synopsis
+
+```sh
+hty delete <session>
+```
+
+## Example
+
+```sh
+hty delete my-session
+```
+
+<Callout type="warning">
+Deletion is permanent. Once you run `hty delete`, the log file is gone and cannot be recovered. Run `hty logs` or `hty replay` first if you want to review the session before removing it.
+</Callout>

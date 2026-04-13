@@ -1,0 +1,105 @@
+# AI Agents
+
+AI agents can use hty to interact with any terminal program the same way a human would — by reading the rendered screen and typing. Because hty exposes every operation as a plain shell command, your agent doesn't need a special SDK: it runs programs, takes screenshots of the terminal, and sends keystrokes using the same primitives it would use for any other shell task.
+
+## The agent loop
+
+Every agent-driven terminal interaction follows the same pattern:
+
+1. **Run** — start the program in a named hty session
+2. **Snapshot** — read the current screen to understand the program's state
+3. **Decide** — choose what to type based on what you see
+4. **Send** — type the input
+5. **Wait** — block until the screen is ready for the next decision
+6. **Repeat** — loop back to snapshot until the task is done
+
+The `wait` commands are what make this reliable. Instead of inserting arbitrary `sleep` calls, you wait for a specific condition — a text string appearing, the screen going idle, or the program exiting — before reading and acting again.
+
+## A complete example: git add -p
+
+The following script drives `git add -p` to stage one hunk and skip another:
+
+```sh
+hty run --name review -- git add -p
+hty wait review --text "Stage this hunk" --timeout 5000
+hty snapshot review          # read the screen
+hty send review --text "y\n" # stage this hunk
+hty wait review --idle 200 --timeout 3000
+hty send review --text "n\n" # skip the next one
+hty send review --text "q\n"
+hty wait review --exit --timeout 2000
+```
+
+Step by step:
+
+- `hty run --name review -- git add -p` starts `git add -p` in a new session named `review`. The session runs detached; the command returns immediately.
+- `hty wait review --text "Stage this hunk" --timeout 5000` blocks until that exact string appears on screen, or 5 seconds pass.
+- `hty snapshot review` reads the rendered screen as JSON so the agent can inspect which file and hunk is shown.
+- `hty send review --text "y\n"` types `y` followed by Enter, staging the hunk.
+- `hty wait review --idle 200 --timeout 3000` waits for the screen to stop updating for 200 ms — git is rendering the next hunk.
+- `hty send review --text "n\n"` skips the next hunk.
+- `hty send review --text "q\n"` quits the interactive session.
+- `hty wait review --exit --timeout 2000` blocks until the process exits.
+
+## Reading the screen
+
+`hty snapshot` returns JSON. Use `jq` to extract the parts you need:
+
+```sh
+# Get plain text content — the full rendered buffer as a single string
+hty snapshot my-session | jq -r '.snapshot.buffer'
+
+# Get an individual line by index (0-based)
+hty snapshot my-session | jq -r '.snapshot.lines[0]'
+
+# Check if specific text is present
+hty snapshot my-session | jq -r '.snapshot.buffer' | grep -q "error" && echo "error found"
+```
+
+## Waiting for the right moment
+
+`hty wait` supports three modes. Use the one that matches what you're waiting for:
+
+```sh
+# Wait for a specific string to appear (e.g., a shell prompt)
+hty wait session --text "$ " --timeout 5000
+
+# Wait for a regex pattern (POSIX extended regex)
+hty wait session --text "(error|Error|ERROR)" --regex --timeout 5000
+
+# Wait for the screen to stop updating — useful after sending input
+hty wait session --idle 300 --timeout 10000
+
+# Wait for the program to exit
+hty wait session --exit --timeout 30000
+```
+
+Use `--text` when you know exactly what string signals readiness. Use `--idle` when the program produces output whose exact content you don't know in advance. Use `--exit` to confirm the program has finished before checking its results.
+
+## Handling timeouts
+
+`hty wait` exits with code `3` when the timeout expires. Always check for this and capture the screen state on failure:
+
+```sh
+hty wait my-session --text "ready" --timeout 5000
+if [ $? -eq 3 ]; then
+  echo "Timed out waiting for ready"
+  hty snapshot my-session | jq -r '.snapshot.buffer'
+  exit 1
+fi
+```
+
+## Programs hty works with
+
+hty works with any program that runs in a terminal. A few common ones:
+
+- **`vim`, `neovim`** — modal editors; send `esc` with `--key esc`, enter insert mode with `--text "i"`, save and quit with `--text ":wq\n"`
+- **`git add -p`** — interactive staging; respond to each hunk prompt with `y`, `n`, `q`, etc.
+- **`psql`** — interactive SQL prompt; send queries as text, wait for the `=#` prompt between statements
+- **`gh auth login`** — interactive auth flows that require reading prompts and typing responses
+- **`btop`, `htop`** — monitoring TUIs; useful for observing system state without modifying it
+- **`create-next-app`** and other interactive scaffolding tools — answer the setup questionnaire programmatically
+
+<Callout type="info">
+Use `--name` to give sessions descriptive names. Your agent code is much easier to debug when sessions are named `review`, `psql-prod`, or `auth-flow` rather than identified by a UUID prefix.
+</Callout>

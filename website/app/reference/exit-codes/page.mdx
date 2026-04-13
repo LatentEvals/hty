@@ -1,0 +1,51 @@
+# Exit Codes
+
+hty uses structured exit codes so shell scripts can react to specific error conditions without parsing JSON output. Check `$?` immediately after a command to branch on the result.
+
+## Exit code table
+
+| Code | Name | When it occurs |
+|------|------|----------------|
+| `0` | Success | Command completed successfully |
+| `1` | Generic error | Unspecified error (invalid flags, I/O errors, etc.) |
+| `2` | Session not found | The specified session doesn't exist |
+| `3` | Wait timed out | `hty wait` reached its timeout without matching |
+| `4` | Ambiguous prefix | The session reference matches more than one session |
+| `5` | Name already exists | `hty run --name` used a name that's already taken |
+
+## Using exit codes in scripts
+
+The most common patterns are checking for timeouts, verifying a session exists before operating on it, and handling duplicate session names.
+
+```sh
+# Check for timeout
+hty wait my-session --text "ready" --timeout 5000
+if [ $? -eq 3 ]; then
+  echo "Timeout — program not ready"
+  exit 1
+fi
+
+# Check if session exists before operating on it
+hty snapshot my-session 2>/dev/null
+if [ $? -eq 2 ]; then
+  echo "Session does not exist"
+  exit 1
+fi
+
+# Handle duplicate names
+hty run --name build -- make
+if [ $? -eq 5 ]; then
+  echo "Session 'build' already running — kill it first"
+  hty kill build
+fi
+```
+
+## Prefix ambiguity
+
+Exit code `4` occurs when the prefix you gave matches more than one session. hty resolves session references against full UUIDs, session names, and UUID prefixes. If two or more sessions share the same prefix, hty can't pick one and returns exit code `4` instead of guessing.
+
+To resolve the ambiguity, use a longer prefix, the full UUID, or the session name you assigned with `--name`.
+
+<Callout type="info">
+Session names are always unambiguous. If you assign a name with `hty run --name <name>`, you can use that name as an exact reference in any subsequent command.
+</Callout>

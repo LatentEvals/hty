@@ -1,0 +1,37 @@
+# What is hty?
+
+hty gives AI agents, scripts, and CI pipelines a way to use interactive terminal programs — without a human at the keyboard. You start a named session, read the rendered screen, send keystrokes, and wait for specific conditions before moving on. A persistent background server keeps sessions alive across individual commands, so multiple tools can observe or drive the same session at the same time.
+
+## Key capabilities
+
+- **Named sessions** — Every program runs inside a named session managed by a persistent server. Sessions outlive individual `hty` invocations, so scripts can pick up where they left off.
+- **Live observation** — Use `hty watch` to observe any session's rendered screen in real time from a second terminal — read-only, with no interference.
+- **Wait primitives** — Block until specific text appears on screen, the session goes idle, or the process exits. Every wait has a configurable timeout and returns a meaningful exit code.
+- **Session replay** — Every session is logged to an append-only JSONL file. Use `hty replay` to re-watch any session long after it has ended — with no side effects.
+
+## What you can do with hty
+
+hty works with any program that runs in a terminal. Common use cases include:
+
+- Automate `vim` to open a file, make edits in insert mode, and save with `:wq`
+- Drive `git add -p` to stage specific hunks non-interactively from an AI agent
+- Run `psql` or any other database REPL and read query output from the rendered screen
+- Watch `btop` or `top` and capture resource metrics at a point in time
+- Complete interactive setup wizards like `create-next-app` or `gh auth login`
+- Test TUI applications end-to-end in CI without a real display
+- Observe a long-running process from a second terminal while automation drives it
+
+## How it works
+
+From your perspective, hty has four moving parts:
+
+- **Persistent server** — the server auto-starts the first time you run any `hty` command and keeps running in the background. You never manage it manually. It owns all session state.
+- **Named sessions** — each session is identified by a name you choose (or a UUID prefix). Sessions are isolated PTYs managed by the server.
+- **Unix socket** — every `hty` client command talks to the server over a Unix domain socket at a well-known path. You can override the socket path with `$HTY_SOCKET` to reach a server on a remote machine over an SSH tunnel.
+- **JSONL event logs** — every session is recorded to an append-only JSONL log file on disk. `hty logs` streams raw events; `hty replay` feeds them back through an in-memory VT engine so you can re-watch exactly what happened.
+
+The VT engine is powered by [Ghostty](https://ghostty.org)'s terminal emulator, which means hty accurately handles color, cursor position, wide characters, and all the escape sequences real TUI programs emit.
+
+<Callout type="info">
+hty is currently in **beta**. The core surface is fully shipped: persistent server, named sessions, live observers (`hty watch`), interactive multi-writer attach (`hty attach`), append-only session event logs with `hty logs` and `hty replay`, wait primitives, explicit session lifecycle (`hty kill` / `hty delete`), and remote observation via `$HTY_SOCKET` and SSH tunnels.
+</Callout>

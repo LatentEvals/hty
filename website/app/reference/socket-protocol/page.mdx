@@ -1,0 +1,203 @@
+# Socket Protocol
+
+The hty CLI is a thin client over a Unix domain socket protocol. Every command you run — `hty snapshot`, `hty send`, `hty wait` — serializes a JSON request, sends it to the server over a local socket, and parses the JSON response. You can build your own clients or integrations by speaking this same protocol directly.
+
+<Callout type="info">
+The CLI covers all common operations. This reference is for building custom clients or integrations that need direct socket access.
+</Callout>
+## Connection
+
+Connect to the Unix domain socket at the path determined by `$HTY_SOCKET` or the default XDG path. See [Environment Variables](/reference/environment-variables) for the full path resolution rules.
+
+The protocol is request-response over newline-delimited JSON (JSONL):
+
+1. Send one JSON object terminated by `\n`.
+2. Receive one JSON object terminated by `\n`.
+
+The `attach` operation is the exception — it keeps the connection open and streams frames in both directions after the initial acknowledgement.
+
+## Request format
+
+Every request is a JSON object with an `"op"` field naming the operation, plus any operation-specific fields.
+
+```json
+{"op": "<operation>", "session": "<id-or-name>", ...fields}
+```
+
+You can include an optional integer `"id"` field on any request. The server echoes it back in the response for request-response correlation.
+
+## Response format
+
+Every response is a JSON object with a boolean `"ok"` field. A successful response may include a `"snapshot"`, `"event"`, `"session"`, or `"sessions"` field depending on the operation. A failed response includes an `"error"` string.
+
+```json
+{"ok": true, "id": 1, "snapshot": {...}}
+{"ok": false, "error": "session not found"}
+{"ok": true, "timed_out": true}
+```
+
+## Operations
+
+### spawn — start a new session
+
+Start a new terminal session running the specified program.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"spawn"` |
+| `program` | string | yes | Path or name of the program to run |
+| `args` | string[] | no | Arguments to pass to the program |
+| `name` | string | no | Human-readable name for the session |
+| `rows` | integer | no | Terminal rows (default: `24`) |
+| `cols` | integer | no | Terminal columns (default: `80`) |
+| `scrollback` | integer | no | Scrollback buffer lines (default: `10000`) |
+| `cwd` | string | no | Working directory for the spawned process |
+| `env` | `{key, value}[]` | no | Additional environment variables |
+
+```json
+// Request
+{"op": "spawn", "program": "bash", "args": ["-c", "echo hello"], "name": "my-session", "rows": 24, "cols": 80}
+
+// Response
+{"ok": true, "session": {"id": "019612ab-...", "name": "my-session", "program": "bash", "status": "running"}}
+```
+
+### list — list all sessions
+
+```json
+// Request
+{"op": "list"}
+
+// Response
+{"ok": true, "sessions": [{"id": "019612ab-...", "name": "my-session", "program": "bash", "status": "running"}]}
+```
+
+### snapshot — read the current screen
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"snapshot"` |
+| `session` | string | no | Session ID, name, or UUID prefix. Omit if only one session exists. |
+
+```json
+// Request
+{"op": "snapshot", "session": "my-session"}
+
+// Response
+{"ok": true, "snapshot": {"rows": 24, "cols": 80, "cursor_row": 1, "cursor_col": 6, "buffer": "hello\n...", "lines": ["hello", ""], "status": "running"}}
+```
+
+### send_text — send text input
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"send_text"` |
+| `session` | string | no | Session reference |
+| `text` | string | yes | Text to send |
+
+```json
+{"op": "send_text", "session": "my-session", "text": "ls -la\n"}
+```
+
+### send_key — send a named key
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"send_key"` |
+| `session` | string | no | Session reference |
+| `key` | string | yes | Key name (see [keys](/commands/keys)) |
+
+```json
+{"op": "send_key", "session": "my-session", "key": "ctrl-c"}
+```
+
+### send_bytes_hex — send raw bytes
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"send_bytes_hex"` |
+| `session` | string | no | Session reference |
+| `bytes_hex` | string | yes | Hex-encoded bytes to send |
+
+```json
+{"op": "send_bytes_hex", "session": "my-session", "bytes_hex": "0d"}
+```
+
+### resize — resize the PTY
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"resize"` |
+| `session` | string | no | Session reference |
+| `rows` | integer | yes | New row count |
+| `cols` | integer | yes | New column count |
+
+### wait_for_text — block until text appears
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"wait_for_text"` |
+| `session` | string | no | Session reference |
+| `text` | string | yes | Needle string or regex pattern |
+| `regex` | boolean | no | Treat `text` as a POSIX regex (default: `false`) |
+| `timeout_ms` | integer | no | Timeout in milliseconds (default: `10000`) |
+
+Returns a snapshot on match, or `{"ok": true, "timed_out": true}` on timeout.
+
+### wait_for_idle — block until the screen stops changing
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"wait_for_idle"` |
+| `session` | string | no | Session reference |
+| `idle_ms` | integer | no | Quiet period required in milliseconds (default: `250`) |
+| `timeout_ms` | integer | no | Timeout in milliseconds (default: `10000`) |
+
+### wait_for_exit — block until the process exits
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `op` | string | yes | `"wait_for_exit"` |
+| `session` | string | no | Session reference |
+| `timeout_ms` | integer | no | Timeout in milliseconds (default: `10000`) |
+
+Returns `{"ok": true, "event": {"kind": "exited", "code": 0}}` on exit.
+
+### kill — terminate the process
+
+```json
+{"op": "kill", "session": "my-session"}
+```
+
+### delete — remove session and log
+
+```json
+{"op": "delete", "session": "my-session"}
+```
+
+### attach — bidirectional streaming
+
+Unlike other operations, `attach` keeps the connection open and uses a streaming frame protocol after the initial acknowledgement.
+
+**Initial request:**
+```json
+{"op": "attach", "session": "my-session", "rows": 24, "cols": 80}
+```
+
+**Server sends ack, then streams frames:**
+```json
+{"ok": true}
+{"kind": "output", "bytes_hex": "68656c6c6f"}
+{"kind": "exited", "code": 0}
+```
+
+**Client can send at any time after ack:**
+```json
+{"op": "input", "bytes_hex": "6c73200a"}
+{"op": "resize", "rows": 40, "cols": 120}
+{"op": "detach"}
+```
+
+<Callout type="warning">
+The socket protocol may evolve between versions. Prefer the hty CLI for day-to-day use and long-term script stability. Use the socket protocol directly only when you need capabilities not exposed by the CLI.
+</Callout>

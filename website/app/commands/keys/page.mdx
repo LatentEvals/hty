@@ -1,0 +1,74 @@
+# hty keys
+
+`hty send --key` accepts symbolic key names instead of raw bytes, making scripts easier to read and write. Run `hty keys` at any time to print the authoritative list of supported key names for the version of hty you have installed.
+
+## Synopsis
+
+```sh
+hty keys
+```
+
+## Using --key
+
+Pass any supported key name to `hty send --key`. Names are case-insensitive.
+
+```sh
+hty send my-session --key esc
+hty send my-session --key enter
+hty send my-session --key ctrl-c
+hty send my-session --key up
+hty send my-session --key pagedown
+hty send my-session --key f5
+```
+
+## Supported key names
+
+### Navigation keys
+
+| Key name | Description |
+|---|---|
+| `up` | Up arrow |
+| `down` | Down arrow |
+| `left` | Left arrow |
+| `right` | Right arrow |
+| `home` | Home key |
+| `end` | End key |
+| `pageup` | Page Up |
+| `pagedown` | Page Down |
+| `insert` | Insert key |
+| `delete` | Delete (forward delete) |
+
+### Action keys
+
+| Key name | Description |
+|---|---|
+| `enter` | Enter / Return |
+| `tab` | Tab |
+| `backspace` | Backspace (sends DEL, `0x7f`) |
+| `esc` | Escape (also: `escape`) |
+| `space` | Space character |
+
+### Modifier prefixes
+
+| Prefix | Aliases | Description |
+|---|---|---|
+| `ctrl-` | `c-`, `ctrl+` | Control modifier |
+| `alt-` | `m-`, `alt+` | Alt / Meta modifier |
+| `shift-` | `s-`, `shift+` | Shift modifier |
+
+Modifiers can be combined: `ctrl-a` through `ctrl-z`, `alt-left`, `shift-tab`, etc.
+
+### Function keys
+
+| Key name | Description |
+|---|---|
+| `f1` through `f4` | Function keys 1-4 (SS3 encoding) |
+| `f5` through `f12` | Function keys 5-12 (tilde encoding) |
+
+<Callout type="info">
+`hty keys` always prints the authoritative list for the version you have installed. If the table above differs from what `hty keys` prints, trust the command output.
+</Callout>
+
+<Callout type="info">
+For keys not in this list, use `hty send --bytes-hex` with the raw escape sequence. For example, to send a literal ESC followed by `[` you can run: `hty send my-session --bytes-hex 1b5b`.
+</Callout>

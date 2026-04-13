@@ -1,0 +1,42 @@
+# Background Server
+
+hty separates the CLI you type into from the process that actually runs your terminal sessions. The background server is the component that manages sessions, holds PTY file descriptors, and streams output to subscribers. Because sessions must outlive the individual CLI calls that create or inspect them, the server runs as a separate process that persists between invocations.
+
+<Callout type="info">
+The server runs silently in the background — it produces no output in your terminal. If the server fails to start, the hty client reports that the server is unreachable.
+</Callout>
+## Auto-start and auto-shutdown
+
+You do not need to start the server manually. The first time any `hty` command runs, the client checks whether a server is already listening on the socket. If not, it forks a child process, daemonizes it, and connects once it's ready.
+
+The server shuts itself down automatically after all running sessions have ended and 10 seconds have passed with no new sessions. This grace period is intentional: it absorbs rapid sequences like `hty kill` followed immediately by `hty run` without forcing a cold server restart.
+
+Sessions in a terminal state — `exited`, `failed`, or `killed` — do not count toward the running session total. A server that holds only zombie records will still shut down after the grace period.
+
+## Socket path
+
+The server listens on a Unix domain socket. The default path depends on your environment:
+
+| Condition | Socket path |
+|-----------|-------------|
+| `$XDG_RUNTIME_DIR` is set | `$XDG_RUNTIME_DIR/hty/sock` |
+| `$XDG_STATE_HOME` is set | `$XDG_STATE_HOME/hty/sock` |
+| Neither is set | `~/.local/state/hty/sock` |
+
+You can override the socket path by setting the `HTY_SOCKET` environment variable:
+
+```bash
+export HTY_SOCKET=/run/user/1000/my-hty.sock
+hty list
+```
+
+When `HTY_SOCKET` is set, the client never auto-spawns a local server. If the socket is not reachable, the command fails immediately. This is by design — `HTY_SOCKET` signals that you are connecting to a server running elsewhere, and spawning a local one would be the wrong behavior.
+
+<Callout type="info">
+Use `HTY_SOCKET` to connect to a remote hty server over an SSH tunnel. Forward the remote socket to a local path, set `HTY_SOCKET` to that path, and all `hty` commands will talk to the remote server as if it were local.
+</Callout>
+## Multiple clients
+
+Multiple CLI invocations can connect to the same server simultaneously. The server handles each connection sequentially on a single thread, but because most requests are fast (snapshot, send, list), concurrent callers rarely have to wait.
+
+Long-lived commands like `hty watch` and `hty attach` can both observe the same session at the same time. `hty attach` registers as a subscriber and receives raw PTY output as it arrives; `hty watch` polls the server for snapshots on its own schedule. Neither blocks the other, and neither blocks other CLI commands from running against the same session.

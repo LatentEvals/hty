@@ -1,0 +1,42 @@
+# hty replay
+
+Re-feed recorded output events through a fresh in-memory VT engine and render the result in your terminal. You see the session play back exactly as it appeared when it ran, including color, cursor movement, and full-screen TUI frames.
+
+Replay has no side effects. It does not re-run the program, does not touch the original log file, and does not send any input.
+
+## Synopsis
+
+```sh
+hty replay <session> [--speed <n>] [--at <time>] [--to <time>] [--loop]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--speed <n>` | Playback speed multiplier (e.g., `3` for 3x speed) |
+| `--at <time>` | Jump to a specific time offset (e.g., `5s`) |
+| `--to <time>` | Stop replay at a specific time offset (e.g., `10s`) |
+| `--loop` | Loop the replay continuously |
+
+Press **Ctrl+C** or **Ctrl+Q** to exit replay at any time.
+
+## Examples
+
+```sh
+# Replay at normal speed
+hty replay my-session
+
+# Replay at 3x speed
+hty replay my-session --speed 3
+
+# Jump to a time range
+hty replay my-session --at 5s --to 10s
+
+# Loop continuously
+hty replay my-session --loop
+```
+
+<Callout type="info">
+Replay renders output events only. Keyboard input events that were recorded in the log (from `hty send` or `hty attach`) are not re-sent during replay.
+</Callout>

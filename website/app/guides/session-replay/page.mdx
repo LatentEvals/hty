@@ -1,0 +1,77 @@
+# Session Replay
+
+hty automatically records every session from the moment it starts. You can replay a session later like a video, feeding its recorded output back through an in-memory VT engine, or inspect the raw event stream to debug exactly what happened and when.
+
+## How recording works
+
+When a session starts, hty opens an append-only JSONL log file at `~/.local/state/hty/logs/{uuid}.jsonl`. Every event is written to this file as it happens:
+
+- **`output`** — raw bytes received from the program's PTY
+- **`input`** — bytes sent to the program (via `hty send` or `hty attach`)
+- **`spawn`** — the program name, arguments, terminal dimensions, and session name
+- **`title`** — terminal title changes
+- **`bell`** — bell events
+- **`exited`** — the program's exit code
+- **`killed`** — written when `hty kill` terminates the session
+
+If you gave the session a name with `--name`, hty also creates a symlink at `~/.local/state/hty/logs/by-name/{name}.jsonl` pointing to the UUID log file.
+
+## Replaying a session
+
+Use `hty replay` to re-watch a recorded session. It feeds the logged output bytes through a fresh in-memory VT engine and renders them to your terminal:
+
+```sh
+# Replay a named session
+hty replay my-session
+
+# Replay a session by ID prefix
+hty replay abc12345
+```
+
+The replay renders at roughly the same speed as the original session. Press `Ctrl+C` to stop at any point. The replay has no side effects — no programs are re-run, and no files are modified.
+
+## Inspecting the event log
+
+`hty logs` prints the raw JSONL event stream for a session. Each line is a self-contained JSON object with a `t` field (Unix timestamp in milliseconds) and a `kind` field:
+
+```sh
+# View the raw JSONL log
+hty logs my-session
+
+# Filter for output events only
+hty logs my-session | jq 'select(.kind == "output")'
+
+# Find the timestamps when output was produced
+hty logs my-session | jq 'select(.kind == "output") | .t'
+
+# Check the exit code
+hty logs my-session | jq 'select(.kind == "exited")'
+```
+
+## Log retention and cleanup
+
+Logs persist on disk until you explicitly remove them:
+
+- `hty delete` removes the session record and deletes the log file from disk
+- `hty kill` terminates the running process and closes the log file, but leaves it on disk — the session remains replayable
+- The server auto-shutdown does not delete logs
+
+Log files are stored at:
+
+```
+~/.local/state/hty/logs/{uuid}.jsonl
+~/.local/state/hty/logs/by-name/{name}.jsonl  (symlink, for named sessions)
+```
+
+If `$XDG_STATE_HOME` is set, hty uses `$XDG_STATE_HOME/hty/logs` instead.
+
+## Use cases for replay
+
+- **Debugging** — re-watch exactly what happened in a failed CI run, frame by frame
+- **Audit** — review precisely what an agent typed and what the program displayed in response
+- **Demo** — record a workflow once and replay it for others without re-running the underlying commands
+- **Testing** — compare session output across runs to detect regressions in TUI rendering
+
+<Callout type="info">
+`hty replay` has no side effects. It feeds logged output through an in-memory VT engine only — no programs are re-run, no files are written, and no network requests are made.
+</Callout>

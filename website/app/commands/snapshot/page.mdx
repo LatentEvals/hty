@@ -1,0 +1,75 @@
+# hty snapshot
+
+Capture the current state of a session's terminal screen.
+
+## Synopsis
+
+```sh
+hty snapshot [session] [--json] [--ansi]
+```
+
+The `<session>` argument accepts a session name, a full UUID, or a unique UUID prefix. If only one session is running, you can omit it.
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Output the full screen state as JSON |
+| `--ansi` | Output the screen with ANSI escape codes preserved (colors, styles) |
+
+## Default output
+
+By default, `hty snapshot` prints the rendered screen as plain text — no escape codes, no JSON wrapper. This is the same content a human would see in the terminal.
+
+```sh
+hty snapshot my-session
+```
+
+## JSON output
+
+With `--json`, the output includes structured metadata:
+
+```json
+{
+  "ok": true,
+  "snapshot": {
+    "rows": 24,
+    "cols": 80,
+    "cursor_row": 1,
+    "cursor_col": 1,
+    "title": "notes.txt - VIM",
+    "buffer": "hello world\n~\n~\n...",
+    "screen_ansi": "\u001b[?25l\u001b[H...",
+    "lines": ["hello world", "~", "~"],
+    "status": "running"
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `buffer` | Plain text screen, rows joined by `\n`. ANSI codes stripped. |
+| `screen_ansi` | Same screen with ANSI escape codes preserved. |
+| `lines` | Each row as a separate string in an array. |
+| `cursor_row`, `cursor_col` | Cursor position, 1-indexed. |
+| `title` | Window title set by the program, or `null`. |
+| `status` | Session status: `running`, `exited`, `failed`, or `killed`. |
+
+## Parsing the output
+
+Pipe the JSON output to `jq` to extract specific parts of the screen:
+
+```sh
+# Print the full plain-text screen
+hty snapshot my-session --json | jq -r '.snapshot.buffer'
+
+# Read the first line of the screen
+hty snapshot my-session --json | jq -r '.snapshot.lines[0]'
+
+# Check whether the session is still running
+hty snapshot my-session --json | jq -r '.snapshot.status'
+```
+
+<Callout type="info">
+Use the default plain-text output for simple text matching. Use `--json` when you need cursor position, status, or structured line access. Use `--ansi` when you need color information.
+</Callout>

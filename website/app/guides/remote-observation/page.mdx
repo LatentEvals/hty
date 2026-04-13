@@ -1,0 +1,75 @@
+# Remote Observation
+
+hty's `$HTY_SOCKET` environment variable lets you point any hty client at a remote server's Unix socket forwarded over SSH. With a single SSH tunnel, you can list sessions, watch them in real time, attach interactively, or drive them with `hty send` and `hty wait` — all from your local machine.
+
+## How it works
+
+By default, each hty client resolves the socket path from `$XDG_RUNTIME_DIR/hty/sock`, falling back to `~/.local/state/hty/sock`. When `$HTY_SOCKET` is set to any non-empty value, the client uses that path instead and skips the auto-spawn logic entirely.
+
+This means:
+
+- When `$HTY_SOCKET` is set, the client never auto-spawns a local server
+- If the socket at that path is not reachable, the client fails immediately
+- There is no silent fallback to a local server
+
+This behavior is intentional. A broken tunnel fails fast and loudly, so you always know whether you're operating on the remote server or not.
+
+## Step-by-step setup
+
+### 1. Start a session on the remote machine
+
+SSH into the remote host and start an hty session:
+
+```sh
+# On the remote machine
+hty run --name foo -- vim /tmp/bar.txt
+```
+
+The session runs in the remote hty server. You can disconnect your SSH shell — the session persists.
+
+### 2. Find the remote socket path
+
+Run `hty info` on the remote machine to see the socket path:
+
+```sh
+$ hty info
+socket:  /run/user/1000/hty/sock
+logs:    /home/user/.local/state/hty/logs
+server:  running
+```
+
+### 3. Open an SSH tunnel
+
+From your laptop, forward the remote Unix socket to a local path:
+
+```sh
+ssh -L /tmp/hty-remote.sock:/run/user/1000/hty/sock user@remote-host
+```
+
+Keep this SSH connection open — the tunnel only exists while the connection is active.
+
+### 4. Connect your local hty to the remote server
+
+In a new terminal on your laptop, set `HTY_SOCKET` and run hty commands as usual:
+
+```sh
+export HTY_SOCKET=/tmp/hty-remote.sock
+hty list          # see remote sessions
+hty watch foo     # watch the remote session live (read-only)
+hty attach foo    # attach bidirectionally
+```
+
+All hty commands in this shell now target the remote server.
+
+<Callout type="warning">
+If your SSH tunnel drops while you're running commands, hty will fail on the next invocation rather than silently falling back to a local server. This is intentional — it prevents accidentally operating on a local session when you intended to operate on a remote one.
+</Callout>
+## Watching a CI session remotely
+
+If you're running a long CI job on a remote machine and want to observe it from your laptop:
+
+1. Ensure the CI job uses named sessions (`hty run --name build -- ...`)
+2. Open an SSH tunnel to the CI machine as described above
+3. Set `HTY_SOCKET` and run `hty watch build`
+
+You'll see the terminal output of the running CI session in real time. Press `Ctrl+C` to stop watching — the remote session continues unaffected.

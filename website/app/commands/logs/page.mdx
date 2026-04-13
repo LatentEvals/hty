@@ -1,0 +1,65 @@
+# hty logs
+
+Stream the event log for a session. Works on running and exited sessions.
+
+## Synopsis
+
+```sh
+hty logs <session> [--json] [--follow] [--since <duration>]
+```
+
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit raw JSONL instead of the default human-readable table |
+| `-f`, `--follow` | Tail the log in real time (like `tail -f`) |
+| `--since <duration>` | Show events from the given duration ago (e.g., `30s`, `5m`) |
+
+## Default output
+
+By default, `hty logs` prints a human-readable table:
+
+```
+TIMESTAMP            KIND    DETAIL
+2025-01-15 10:30:00  spawn   vim /tmp/notes.txt
+2025-01-15 10:30:01  output  (42 bytes)
+2025-01-15 10:30:02  input   (5 bytes)
+2025-01-15 10:30:05  exited  code=0
+```
+
+## JSON output
+
+With `--json`, each line is a self-contained JSON object:
+
+```json
+{"t":1715000000000,"kind":"spawn","program":"vim","args":["/tmp/foo.txt"],"name":"demo","rows":24,"cols":80}
+{"t":1715000000100,"kind":"output","bytes_hex":"1b5b..."}
+{"t":1715000000300,"kind":"input","bytes_hex":"3a77710a"}
+{"t":1715000000400,"kind":"exited","code":0}
+```
+
+## Event kinds
+
+| Kind | Description |
+|------|-------------|
+| `spawn` | Session created; includes program, args, PTY dimensions |
+| `output` | Bytes from the program's PTY, hex-encoded in `bytes_hex` |
+| `input` | Bytes sent to the PTY by a client, hex-encoded in `bytes_hex` |
+| `title` | Terminal title changed |
+| `bell` | The program rang the terminal bell |
+| `exited` | Process exited; includes exit `code` |
+| `killed` | Session was killed with `hty kill` |
+
+## Examples
+
+```sh
+# Follow a running session's log in real time
+hty logs my-session --follow
+
+# Show events from the last 30 seconds as JSON
+hty logs my-session --since 30s --json
+
+# Extract just the exit code with jq
+hty logs my-session --json | jq 'select(.kind == "exited") | .code'
+```

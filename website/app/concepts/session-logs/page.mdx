@@ -1,0 +1,78 @@
+# Session Logs
+
+Every session hty manages is automatically recorded to a log file on disk. Recording starts the moment the process spawns and ends when the process exits, is killed, or fails. Because logs persist independently of the server, you can inspect and replay a session long after it has finished — even after the server has shut down.
+
+## Log file location
+
+Log files are stored under your XDG state directory:
+
+| Condition | Log directory |
+|-----------|---------------|
+| `$XDG_STATE_HOME` is set | `$XDG_STATE_HOME/hty/logs/` |
+| `$XDG_STATE_HOME` is not set | `~/.local/state/hty/logs/` |
+
+Each session's log file is named after its full UUID:
+
+```
+~/.local/state/hty/logs/018f4c2a-3b1d-7e90-a3c4-1f2d3e4f5a6b.jsonl
+```
+
+If you launched the session with `--name`, hty also creates a symlink for convenient access by name:
+
+```
+~/.local/state/hty/logs/by-name/my-session.jsonl → ../018f4c2a-3b1d-7e90-a3c4-1f2d3e4f5a6b.jsonl
+```
+
+## Log format
+
+Log files are plain JSONL — one JSON object per line. Every event has a `t` field containing the Unix timestamp in milliseconds and a `kind` field identifying the event type.
+
+```json
+{"t":1715000000000,"kind":"spawn","program":"vim","args":["/tmp/foo.txt"],"name":"demo-vim","rows":24,"cols":80}
+{"t":1715000000100,"kind":"output","bytes_hex":"1b5b..."}
+{"t":1715000000200,"kind":"title","title":"foo.txt - VIM"}
+{"t":1715000000300,"kind":"input","bytes_hex":"3a77710a"}
+{"t":1715000000400,"kind":"exited","code":0}
+```
+
+The event kinds are:
+
+| Kind      | Description |
+|-----------|-------------|
+| `spawn`   | First event in every log. Records the program, arguments, name, and initial terminal dimensions. |
+| `output`  | Raw bytes written by the process to the PTY, hex-encoded in `bytes_hex`. |
+| `input`   | Raw bytes sent to the process (from `hty send` or `hty attach`), hex-encoded in `bytes_hex`. |
+| `title`   | The terminal title changed (typically via an OSC escape sequence from the program). |
+| `bell`    | The process rang the terminal bell. |
+| `exited`  | The process exited. Includes `code` with the exit status. |
+| `failure` | The process could not start or the server encountered a fatal error. Includes `message`. |
+| `killed`  | The process was stopped with `hty kill`. Always the last event when a session is killed. |
+
+## Viewing logs
+
+Use `hty logs` to stream a session's raw JSONL to stdout:
+
+```bash
+hty logs my-session
+hty logs 018f4c2a
+```
+
+This works for sessions in any state, including sessions that have already exited. The command reads from the log file on disk, so it does not require the server to be running.
+
+## Replaying sessions
+
+`hty replay` re-renders a session's recorded output through an in-memory VT engine and prints the result:
+
+```bash
+hty replay my-session
+hty replay 018f4c2a
+```
+
+<Callout type="info">
+`hty replay` has no side effects. It does not re-run the original program, open a PTY, or send any input. It reads the `output` events from the log file and feeds them through a virtual terminal to reconstruct what the screen looked like.
+</Callout>
+## Log retention
+
+Log files persist on disk until you delete the session. `hty kill` closes the log file and stops new events from being written, but leaves the file on disk so you can still replay it.
+
+`hty delete` removes both the session record from the server registry and the log file from disk. If a by-name symlink exists, it is removed as well. Once deleted, the session and its log are gone permanently.
