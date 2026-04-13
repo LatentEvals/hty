@@ -80,6 +80,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: trigger tap update
-        run: gh workflow run update-hty.yml --repo montanaflynn/homebrew-tap
+        run: gh workflow run update-hty.yml --repo LatentEvals/homebrew-tap
         env:
           GH_TOKEN: ${{ secrets.TAP_TOKEN }}

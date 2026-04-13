@@ -7,17 +7,17 @@
 ### Install script
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
 Auto-detects your OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target directory.
 
-Or download a specific platform from the [releases page](https://github.com/montanaflynn/hty/releases/latest).
+Or download a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
 
 ### Homebrew
 
 ```sh
-brew install montanaflynn/tap/hty
+brew install LatentEvals/tap/hty
 ```
 
 ### From source
@@ -25,7 +25,7 @@ brew install montanaflynn/tap/hty
 Requires [Zig](https://ziglang.org) 0.15+.
 
 ```sh
-git clone https://github.com/montanaflynn/hty.git
+git clone https://github.com/LatentEvals/hty.git
 cd hty
 zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/hty /usr/local/bin/

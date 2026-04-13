@@ -36,7 +36,7 @@ Roughly ordered by how often a typical developer hits them:
 - **`hty logs`** — reads the log from disk (works for exited sessions, across server restarts). `--follow`, `--since`, `--json`.
 - **`hty replay`** — pure-visualization replay through a fresh in-memory Ghostty VT engine. `--speed`, `--at`, `--to`, `--loop`. Holds on the final frame until Ctrl-C.
 - **Remote observation** via `$HTY_SOCKET` + SSH tunnels. No protocol changes needed.
-- **Install tooling:** `curl | sh` installer, prebuilt release binaries (macOS arm64, Linux x86_64, Linux arm64), Homebrew tap (`brew install montanaflynn/tap/hty`), auto-updated on each release.
+- **Install tooling:** `curl | sh` installer, prebuilt release binaries (macOS arm64, Linux x86_64, Linux arm64), Homebrew tap (`brew install LatentEvals/tap/hty`), auto-updated on each release.
 - **CI:** GitHub Actions test matrix (macOS arm64, Linux x86_64, Linux arm64), tag-triggered release workflow with Homebrew tap auto-update.
 
 ## Backlog

@@ -4,7 +4,7 @@ set -eu
 # install.sh — download and install the latest hty release binary.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/montanaflynn/hty/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 #   sh install.sh --version v0.2.0
 #   sh install.sh --install-dir ~/.local/bin
 #   HTY_INSTALL_DIR=~/.local/bin sh install.sh
@@ -24,7 +24,7 @@ set -eu
 #   HTY_INSTALL_DIR      Override the default install directory
 #   NO_COLOR             Disable color output when set
 
-REPO="montanaflynn/hty"
+REPO="LatentEvals/hty"
 BINARY_NAME="hty"
 GITHUB_BASE_URL="https://github.com"
 INSTALL_DIR="${HTY_INSTALL_DIR:-${HOME}/.local/bin}"
