@@ -209,7 +209,10 @@ ensure_install_dir() {
   if [ "$DRY_RUN" -eq 1 ]; then
     return
   fi
-  mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+  if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+    info install "creating ${INSTALL_DIR} requires elevated privileges"
+    sudo mkdir -p "$INSTALL_DIR" || die "failed to create install directory: ${INSTALL_DIR}"
+  fi
 }
 
 checksum_verify() {
