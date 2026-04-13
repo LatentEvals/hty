@@ -71,8 +71,16 @@ fn resolveRuntimeDir(alloc: Allocator) ![]u8 {
             return std.fmt.allocPrint(alloc, "{s}/hty", .{runtime});
         }
     }
-    const uid = c.getuid();
-    return std.fmt.allocPrint(alloc, "/tmp/hty-{d}", .{uid});
+    // No XDG_RUNTIME_DIR (typical on macOS). Fall back to ~/.local/state/hty
+    // alongside the log directory — keeps everything in one place and avoids
+    // world-listable /tmp.
+    if (std.posix.getenv("XDG_STATE_HOME")) |state| {
+        if (state.len > 0) {
+            return std.fmt.allocPrint(alloc, "{s}/hty", .{state});
+        }
+    }
+    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    return std.fmt.allocPrint(alloc, "{s}/.local/state/hty", .{home});
 }
 
 fn resolveLogDir(alloc: Allocator) ![]u8 {
@@ -4270,6 +4278,44 @@ fn writeSupportedKeys() !void {
     try printRaw(supportedKeysText());
 }
 
+fn runInfo(alloc: Allocator) !void {
+    const socket_path = try resolveSocketPath(alloc);
+    defer alloc.free(socket_path);
+    const log_dir = try resolveLogDir(alloc);
+    defer alloc.free(log_dir);
+
+    // Check server status by trying to connect.
+    const server_status: []const u8 = blk: {
+        if (tryConnect(socket_path)) |stream| {
+            stream.close();
+            break :blk "running";
+        } else |_| {
+            break :blk "not running";
+        }
+    };
+
+    var buf: std.ArrayListUnmanaged(u8) = .{};
+    defer buf.deinit(alloc);
+    const w = buf.writer(alloc);
+
+    try w.print("socket:  {s}\n", .{socket_path});
+    try w.print("logs:    {s}\n", .{log_dir});
+    try w.print("server:  {s}\n", .{server_status});
+
+    // Show relevant env vars if set.
+    if (std.posix.getenv("HTY_SOCKET")) |v| {
+        if (v.len > 0) try w.print("\n$HTY_SOCKET={s}\n", .{v});
+    }
+    if (std.posix.getenv("XDG_RUNTIME_DIR")) |v| {
+        if (v.len > 0) try w.print("$XDG_RUNTIME_DIR={s}\n", .{v});
+    }
+    if (std.posix.getenv("XDG_STATE_HOME")) |v| {
+        if (v.len > 0) try w.print("$XDG_STATE_HOME={s}\n", .{v});
+    }
+
+    try printRaw(buf.items);
+}
+
 fn writeUsageError(arg: []const u8) !void {
     const alloc = std.heap.c_allocator;
     const message = try std.fmt.allocPrint(alloc, "unknown subcommand: {s}\n\n{s}", .{ arg, generalHelpText() });
@@ -4291,6 +4337,7 @@ fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
     if (std.mem.eql(u8, topic, "attach")) return attachHelpText();
     if (std.mem.eql(u8, topic, "keys")) return supportedKeysText();
+    if (std.mem.eql(u8, topic, "info")) return infoHelpText();
     return null;
 }
 
@@ -4313,6 +4360,7 @@ fn generalHelpText() []const u8 {
     \\            through a fresh in-memory VT engine. No side effects.
     \\  attach    Interactively attach to a running session (bidirectional)
     \\  keys      Print supported symbolic key names for `hty send --key`
+    \\  info      Show resolved paths and server status
     \\  help      Print help. Pass a subcommand for details.
     \\
     \\Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
@@ -4536,6 +4584,24 @@ fn logsHelpText() []const u8 {
     ;
 }
 
+fn infoHelpText() []const u8 {
+    return
+    \\hty info
+    \\
+    \\Show resolved paths and server status. Useful for finding the socket
+    \\path when setting up SSH tunnels for remote observation.
+    \\
+    \\Output includes:
+    \\  socket    Path to the Unix domain socket
+    \\  logs      Directory where session logs are stored
+    \\  server    Whether the server is currently running
+    \\
+    \\Environment variables that affect paths ($HTY_SOCKET, $XDG_RUNTIME_DIR,
+    \\$XDG_STATE_HOME) are shown if set.
+    \\
+    ;
+}
+
 fn supportedKeysText() []const u8 {
     return
     \\Supported send_key names
@@ -4603,6 +4669,10 @@ pub fn main() !void {
     }
     if (std.mem.eql(u8, verb, "keys")) {
         try writeSupportedKeys();
+        return;
+    }
+    if (std.mem.eql(u8, verb, "info")) {
+        try runInfo(alloc);
         return;
     }
 
