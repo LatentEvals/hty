@@ -2264,7 +2264,12 @@ fn runClientSend(alloc: Allocator, args: []const []const u8) !void {
         }
     } else if (text) |t| {
         token_list = .{};
-        token_list.tokens[0] = .{ .kind = .text, .value = t };
+        const unescaped = unescapeText(alloc, t) catch {
+            try printErr("invalid escape sequence in --text value");
+            std.process.exit(ExitCode.generic);
+            unreachable;
+        };
+        token_list.tokens[0] = .{ .kind = .text, .value = unescaped };
         token_list.len = 1;
     } else if (key) |k| {
         token_list = .{};
@@ -2446,6 +2451,38 @@ const SeqTokenList = struct {
         return self.tokens[0..self.len];
     }
 };
+
+/// Process C-style escape sequences in --text values.
+/// Supports: \n \t \r \\ \e (ESC). A trailing backslash or an
+/// unrecognised escape like \z is an error.
+/// If the input contains no backslashes the original slice is returned
+/// (no allocation).
+fn unescapeText(alloc: Allocator, input: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, input, '\\') == null) return input;
+
+    var buf = std.array_list.Managed(u8).init(alloc);
+    errdefer buf.deinit();
+
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '\\') {
+            i += 1;
+            if (i >= input.len) return error.InvalidEscape;
+            switch (input[i]) {
+                'n' => try buf.append('\n'),
+                't' => try buf.append('\t'),
+                'r' => try buf.append('\r'),
+                'e' => try buf.append(0x1B),
+                '\\' => try buf.append('\\'),
+                else => return error.InvalidEscape,
+            }
+        } else {
+            try buf.append(input[i]);
+        }
+        i += 1;
+    }
+    return buf.toOwnedSlice();
+}
 
 fn runClientSnapshot(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
@@ -4351,7 +4388,7 @@ fn sendHelpText() []const u8 {
     \\--bytes-hex is required.
     \\
     \\Flags:
-    \\  --text STRING        UTF-8 text sent verbatim.
+    \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
     \\  --key NAME           Named key with optional modifiers.
     \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
     \\                       function keys (f1-f12), and combinations like
@@ -4772,6 +4809,50 @@ test "parseSeqTokens: f-keys are not durations" {
 test "parseSeqTokens: unmatched quote is an error" {
     try std.testing.expectError(error.InvalidSeq, parseSeqTokens("\"hello"));
     try std.testing.expectError(error.InvalidSeq, parseSeqTokens("'hello"));
+}
+
+test "unescapeText: no escapes returns original slice" {
+    const input = "hello";
+    const result = try unescapeText(std.testing.allocator, input);
+    try std.testing.expectEqualStrings("hello", result);
+    try std.testing.expect(result.ptr == input.ptr); // no allocation
+}
+
+test "unescapeText: newline, tab, carriage return" {
+    const result = try unescapeText(std.testing.allocator, "y\\n");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("y\n", result);
+
+    const result2 = try unescapeText(std.testing.allocator, "a\\tb\\rc");
+    defer std.testing.allocator.free(result2);
+    try std.testing.expectEqualStrings("a\tb\rc", result2);
+}
+
+test "unescapeText: escaped backslash" {
+    const result = try unescapeText(std.testing.allocator, "a\\\\b");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a\\b", result);
+}
+
+test "unescapeText: escape for ESC (0x1B)" {
+    const result = try unescapeText(std.testing.allocator, "\\e[31m");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(u8, 0x1B), result[0]);
+    try std.testing.expectEqualStrings("[31m", result[1..]);
+}
+
+test "unescapeText: trailing backslash is an error" {
+    try std.testing.expectError(error.InvalidEscape, unescapeText(std.testing.allocator, "hello\\"));
+}
+
+test "unescapeText: unknown escape is an error" {
+    try std.testing.expectError(error.InvalidEscape, unescapeText(std.testing.allocator, "hello\\z"));
+}
+
+test "unescapeText: multiple escapes in one string" {
+    const result = try unescapeText(std.testing.allocator, "line1\\nline2\\ttab\\\\backslash");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("line1\nline2\ttab\\backslash", result);
 }
 
 test "help text lists all subcommands" {

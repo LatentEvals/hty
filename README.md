@@ -22,7 +22,7 @@ brew install montanaflynn/tap/hty
 
 ### From source
 
-Requires [Zig](https://ziglang.org) 0.15+. Ghostty's VT engine is fetched automatically by the Zig package manager.
+Requires [Zig](https://ziglang.org) 0.15+.
 
 ```sh
 git clone https://github.com/montanaflynn/hty.git
@@ -39,13 +39,10 @@ An agent walking through `git add -p` to stage specific hunks:
 hty run --name review -- git add -p
 hty wait review --text "Stage this hunk" --timeout 5000
 hty snapshot review                       # read the screen
-hty send review --text "y"                # stage this hunk
-hty send review --key enter
+hty send review --text "y\n"              # stage this hunk
 hty wait review --idle 200 --timeout 3000
-hty send review --text "n"                # skip the next one
-hty send review --key enter
-hty send review --text "q"
-hty send review --key enter
+hty send review --text "n\n"              # skip the next one
+hty send review --text "q\n"
 hty wait review --exit --timeout 2000
 ```
 
