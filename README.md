@@ -94,6 +94,7 @@ Commands:
             through a fresh in-memory VT engine. No side effects.
   attach    Interactively attach to a running session (bidirectional)
   keys      Print supported symbolic key names for `hty send --key`
+  info      Show resolved paths and server status
   help      Print help. Pass a subcommand for details.
 
 Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
@@ -128,12 +129,12 @@ Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the 
 The client's socket path can be overridden with `$HTY_SOCKET`, which makes it straightforward to watch, attach to, or drive a session running on another machine via an SSH tunnel:
 
 ```sh
-# on the remote machine
-hty run --name foo -- vim /tmp/bar.txt
+# on the remote machine — find the socket path
+hty info
 
-# on your laptop
-ssh -L /tmp/hty-remote.sock:/tmp/hty-501/sock user@remote
-HTY_SOCKET=/tmp/hty-remote.sock hty attach foo
+# on your laptop — tunnel the remote socket locally
+ssh -L ~/.local/state/hty/remote.sock:<socket-from-hty-info> user@remote
+HTY_SOCKET=~/.local/state/hty/remote.sock hty attach foo
 ```
 
 When `$HTY_SOCKET` is set, the client never auto-spawns a local server — if the endpoint isn't reachable it fails fast, so a broken tunnel is obvious instead of silently shadowed by a fresh local server.
