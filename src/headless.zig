@@ -148,72 +148,39 @@ pub const std_options: std.Options = .{
 };
 
 // ============================================================================
-// Client subcommands
+// Client subcommand dispatch
 // ============================================================================
 
-const run_cmd = @import("commands/run.zig");
-const runClientRun = run_cmd.run;
+const commands = struct {
+    const common_mod = @import("commands/common.zig");
+    const help_mod = @import("commands/help.zig");
+    const run_mod = @import("commands/run.zig");
+    const list_mod = @import("commands/list.zig");
+    const kill_mod = @import("commands/kill.zig");
+    const delete_mod = @import("commands/delete.zig");
+    const send_mod = @import("commands/send.zig");
+    const snapshot_mod = @import("commands/snapshot.zig");
+    const wait_mod = @import("commands/wait.zig");
+    const watch_mod = @import("commands/watch.zig");
+    const attach_mod = @import("commands/attach.zig");
+    const replay_mod = @import("commands/replay.zig");
+    const logs_mod = @import("commands/logs.zig");
+    const keys_mod = @import("commands/keys.zig");
+    const info_mod = @import("commands/info.zig");
+};
 
-const list_cmd = @import("commands/list.zig");
-const runClientList = list_cmd.run;
-
-const kill_cmd = @import("commands/kill.zig");
-const runClientKill = kill_cmd.run;
-
-const delete_cmd = @import("commands/delete.zig");
-const runClientDelete = delete_cmd.run;
-
-const send_cmd = @import("commands/send.zig");
-const runClientSend = send_cmd.run;
-
-const snapshot_cmd = @import("commands/snapshot.zig");
-const runClientSnapshot = snapshot_cmd.run;
-
-const wait_cmd = @import("commands/wait.zig");
-const runClientWait = wait_cmd.run;
-
-const watch_cmd = @import("commands/watch.zig");
-const runClientWatch = watch_cmd.run;
-const enterAltScreen = watch_cmd.enterAltScreen;
-const leaveAltScreen = watch_cmd.leaveAltScreen;
-
-const attach_cmd = @import("commands/attach.zig");
-const runClientAttach = attach_cmd.run;
-
-const replay_cmd = @import("commands/replay.zig");
-const runClientReplay = replay_cmd.run;
-const replayToTerminal = replay_cmd.replayToTerminal;
-
-const logs_cmd = @import("commands/logs.zig");
-const runClientLogs = logs_cmd.run;
-const resolveLogPath = logs_cmd.resolveLogPath;
-const parseDurationMs = common.parseDurationMs;
-
-// ============================================================================
-// Misc helpers
-// ============================================================================
-
-// ============================================================================
-// Help text
-// ============================================================================
-
-const keys_cmd = @import("commands/keys.zig");
-fn writeSupportedKeys() !void {
-    try keys_cmd.run(std.heap.c_allocator, &.{});
-}
-
-const info_cmd = @import("commands/info.zig");
-const runInfo = info_cmd.run;
+// Aliases still referenced by the in-file integration test block.
+const replayToTerminal = commands.replay_mod.replayToTerminal;
+const resolveLogPath = commands.logs_mod.resolveLogPath;
+const parseDurationMs = commands.common_mod.parseDurationMs;
 
 fn writeUsageError(arg: []const u8) !void {
     const alloc = std.heap.c_allocator;
-    const message = try std.fmt.allocPrint(alloc, "unknown subcommand: {s}\n\n{s}", .{ arg, generalHelpText() });
+    const message = try std.fmt.allocPrint(alloc, "unknown subcommand: {s}\n\n{s}", .{ arg, commands.help_mod.generalHelpText() });
     defer alloc.free(message);
     var stderr = std.fs.File.stderr();
     _ = try stderr.writeAll(message);
 }
-
-
 
 // ============================================================================
 // Entry point
@@ -225,7 +192,7 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     if (args.len < 2) {
-        try printRaw(generalHelpText());
+        try commands.common_mod.printRaw(commands.help_mod.generalHelpText());
         return;
     }
 
@@ -234,38 +201,31 @@ pub fn main() !void {
     // Hidden server entry point.
     if (std.mem.eql(u8, verb, "__server__")) {
         if (args.len < 3) {
-            try printErr("__server__ requires a socket path");
+            try commands.common_mod.printErr("__server__ requires a socket path");
             std.process.exit(ExitCode.generic);
         }
         try runServer(alloc, args[2]);
         return;
     }
 
-    if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "help")) {
-        try writeHelp(alloc, args[2..]);
-        return;
-    }
-    if (std.mem.eql(u8, verb, "keys")) {
-        try writeSupportedKeys();
-        return;
-    }
-    if (std.mem.eql(u8, verb, "info")) {
-        try runInfo(alloc);
-        return;
-    }
-
     const subargs = args[2..];
-    if (std.mem.eql(u8, verb, "run")) return runClientRun(alloc, subargs);
-    if (std.mem.eql(u8, verb, "list")) return runClientList(alloc, subargs);
-    if (std.mem.eql(u8, verb, "watch")) return runClientWatch(alloc, subargs);
-    if (std.mem.eql(u8, verb, "send")) return runClientSend(alloc, subargs);
-    if (std.mem.eql(u8, verb, "snapshot")) return runClientSnapshot(alloc, subargs);
-    if (std.mem.eql(u8, verb, "wait")) return runClientWait(alloc, subargs);
-    if (std.mem.eql(u8, verb, "kill")) return runClientKill(alloc, subargs);
-    if (std.mem.eql(u8, verb, "delete")) return runClientDelete(alloc, subargs);
-    if (std.mem.eql(u8, verb, "logs")) return runClientLogs(alloc, subargs);
-    if (std.mem.eql(u8, verb, "replay")) return runClientReplay(alloc, subargs);
-    if (std.mem.eql(u8, verb, "attach")) return runClientAttach(alloc, subargs);
+    if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "help")) {
+        try commands.help_mod.run(alloc, subargs);
+        return;
+    }
+    if (std.mem.eql(u8, verb, "keys")) return commands.keys_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "info")) return commands.info_mod.run(alloc);
+    if (std.mem.eql(u8, verb, "run")) return commands.run_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "list")) return commands.list_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "watch")) return commands.watch_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "send")) return commands.send_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "snapshot")) return commands.snapshot_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "wait")) return commands.wait_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "kill")) return commands.kill_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "delete")) return commands.delete_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "logs")) return commands.logs_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "replay")) return commands.replay_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "attach")) return commands.attach_mod.run(alloc, subargs);
 
     try writeUsageError(verb);
     std.process.exit(ExitCode.generic);
