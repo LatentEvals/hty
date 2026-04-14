@@ -21,16 +21,28 @@ const navbar = (
 
 const footer = (
   <Footer>
-    MIT {new Date().getFullYear()} © hty
+    <div
+      style={{
+        display: 'flex',
+        gap: '1.25rem',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        fontSize: '0.875rem'
+      }}
+    >
+      <span>© {new Date().getFullYear()} Montana Flynn · MIT License</span>
+      <span style={{ opacity: 0.5 }}>·</span>
+      <a href="https://github.com/LatentEvals/hty">GitHub</a>
+      <a href="https://latentevals.com">LatentEvals</a>
+      <a href="/llms.txt">llms.txt</a>
+    </div>
   </Footer>
 )
 
 export default async function RootLayout({ children }) {
   return (
     <html lang="en" dir="ltr" suppressHydrationWarning>
-      <Head>
-        <link rel="icon" href="/favicon.ico" />
-      </Head>
+      <Head />
       <body>
         <Layout
           navbar={navbar}
