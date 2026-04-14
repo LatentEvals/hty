@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Extract help-text strings from src/headless.zig and write one _help.txt
+// Extract help-text strings from src/help_text.zig and write one _help.txt
 // per command into website/app/commands/<cmd>/. The goal is to make the Zig
 // source the single source of truth for CLI synopsis + flags so the docs
 // can't drift from the binary.
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const websiteRoot = join(__dirname, '..')
 const repoRoot = join(websiteRoot, '..')
-const sourcePath = join(repoRoot, 'src', 'headless.zig')
+const sourcePath = join(repoRoot, 'src', 'help_text.zig')
 
 // Map website directory name → Zig function name.
 // Most commands use `<cmd>HelpText`; `keys` uses `supportedKeysText`.
