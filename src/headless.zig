@@ -120,6 +120,8 @@ const ExitCode = common.ExitCode;
 comptime {
     _ = @import("keys.zig");
     _ = @import("uuid.zig");
+    _ = @import("ops.zig");
+    _ = @import("server_attach.zig");
     _ = @import("commands/help.zig");
     _ = @import("commands/send.zig");
     _ = @import("commands/logs.zig");
@@ -234,30 +236,6 @@ pub fn main() !void {
 // ============================================================================
 // Tests
 // ============================================================================
-
-test "detectAttachOp recognizes attach requests" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\",\"session\":\"foo\"}"));
-    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"snapshot\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"spawn\",\"program\":\"/bin/sh\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "not json"));
-    try std.testing.expect(!detectAttachOp(alloc, "[\"attach\"]"));
-}
-
-test "joinArgs handles empty, single, multi" {
-    const empty_result = try joinArgs(std.testing.allocator, &.{});
-    defer std.testing.allocator.free(empty_result);
-    try std.testing.expectEqualStrings("", empty_result);
-
-    const single_result = try joinArgs(std.testing.allocator, &.{"foo"});
-    defer std.testing.allocator.free(single_result);
-    try std.testing.expectEqualStrings("foo", single_result);
-
-    const multi_result = try joinArgs(std.testing.allocator, &.{ "foo", "bar baz", "qux" });
-    defer std.testing.allocator.free(multi_result);
-    try std.testing.expectEqualStrings("foo bar baz qux", multi_result);
-}
 
 // ============================================================================
 // Integration test helpers (drive the in-process dispatch without sockets)
