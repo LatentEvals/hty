@@ -10,7 +10,7 @@
 const std = @import("std");
 
 pub fn helpForTopic(topic: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, topic, "run")) return runHelpText();
+    if (std.mem.eql(u8, topic, "run")) return @import("commands/run.zig").helpText();
     if (std.mem.eql(u8, topic, "list")) return listHelpText();
     if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
     if (std.mem.eql(u8, topic, "send")) return sendHelpText();
@@ -60,30 +60,6 @@ pub fn generalHelpText() []const u8 {
     \\  hty send debug-vim --key esc
     \\  hty wait debug-vim --idle 300 --timeout 2000
     \\  hty kill debug-vim
-    \\
-    ;
-}
-
-pub fn runHelpText() []const u8 {
-    return
-    \\hty run [--name NAME] [--rows N] [--cols N] [--cwd PATH] [--scrollback N] -- program [args...]
-    \\
-    \\Create a new session and start `program` inside a fresh PTY. The session
-    \\is detached from your terminal; observe it with `hty watch` and drive it
-    \\with `hty send`/`hty snapshot`/`hty wait`.
-    \\
-    \\Flags:
-    \\  --name NAME       Human-friendly alias for the session. Must be unique.
-    \\  --rows N          Initial row count (default 24)
-    \\  --cols N          Initial column count (default 80)
-    \\  --cwd PATH        Child's working directory
-    \\  --scrollback N    Scrollback buffer size (default 10000)
-    \\
-    \\`-d` / `--detach` is accepted as a no-op — every `hty run` session is
-    \\detached by default. Use `hty attach` for an interactive view.
-    \\
-    \\Example:
-    \\  hty run --name debug-vim -- vim /tmp/foo.txt
     \\
     ;
 }
