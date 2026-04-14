@@ -30,9 +30,9 @@
 
 AI agents can write, test, and ship a feature end-to-end. They freeze the moment a CLI asks a question.
 
-Every real terminal workflow has prompts in it — `git add -p`, `gh auth login`, `create-next-app`, `psql`, `vim`. When an agent hits one, you have two bad options: bail out and wait for a human, or bolt on brittle `--flag` workarounds that break the next time the tool adds a prompt.
+The tools you actually use are interactive. `git add -p` for staging hunks. `create-next-app` for scaffolding. `gh auth login` for authentication. `vim` for edits. `psql` for queries. Every one of them stops and asks. When your agent hits that stop, you have two bad options: wait for a human, or paper over the prompt with brittle `--flag` workarounds that break the next time the tool changes.
 
-`hty` gives you a third. It wraps any program in a persistent PTY session so your agent can read the rendered screen, decide what to type, and send keystrokes — the same loop a human uses, automated. No flags to memorize. No expect scripts. If `create-next-app` ships a new prompt next month, the same loop still handles it.
+`hty` turns every interactive program into an agent-ready tool. Your agent reads the rendered terminal the way you do and types the way you would — no SDK, no wrapper, no cooperation from upstream. Any program with a TTY just works. When `create-next-app` ships a new prompt next month, the same loop still handles it.
 
 ## Quickstart
 
