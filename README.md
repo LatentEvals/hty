@@ -28,11 +28,11 @@
 
 ## Why hty exists
 
-AI agents can write, test, and ship a feature end-to-end. They freeze the moment a CLI asks a question.
+Unlock a world of TUI and CLI software for your AI agent.
 
-The tools you actually use are interactive. `git add -p` for staging hunks. `create-next-app` for scaffolding. `gh auth login` for authentication. `vim` for edits. `psql` for queries. Every one of them stops and asks. When your agent hits that stop, you have two bad options: wait for a human, or paper over the prompt with brittle `--flag` workarounds that break the next time the tool changes.
+If you've used agents, you've seen them struggle with things like `create-next-app`, or cram a sprawling diff into a single commit because logical ones are out of reach. If only they could use `git add -p`. Well, now they can.
 
-`hty` turns every interactive program into an agent-ready tool. Your agent reads the rendered terminal the way you do and types the way you would — no SDK, no wrapper, no cooperation from upstream. Any program with a TTY just works. When `create-next-app` ships a new prompt next month, the same loop still handles it.
+`hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would — no SDK, no wrapper, no cooperation from upstream. Every program with a TTY just works.
 
 ## Quickstart
 
