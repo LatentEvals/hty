@@ -515,30 +515,8 @@ fn formatAge(alloc: Allocator, age_ms: i64) ![]u8 {
     return std.fmt.allocPrint(alloc, "{d}d ago", .{days});
 }
 
-fn runClientKill(alloc: Allocator, args: []const []const u8) !void {
-    const session_ref = if (args.len > 0) args[0] else null;
-
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
-    defer payload_buf.deinit();
-    try payload_buf.appendSlice("{\"op\":\"kill\"");
-    if (session_ref) |s| {
-        try payload_buf.appendSlice(",\"session\":");
-        try writeJsonString(payload_buf.writer().any(), s);
-    }
-    try payload_buf.appendSlice("}");
-
-    const response_line = try sendRawRequest(alloc, payload_buf.items);
-    defer alloc.free(response_line);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
-    defer parsed.deinit();
-    _ = try expectOkOrExit(parsed);
-
-    const display = session_ref orelse "session";
-    const msg = try std.fmt.allocPrint(alloc, "killed {s} (record kept — `hty delete` to remove)", .{display});
-    defer alloc.free(msg);
-    try printLine(msg);
-}
+const kill_cmd = @import("commands/kill.zig");
+const runClientKill = kill_cmd.run;
 
 fn runClientDelete(alloc: Allocator, args: []const []const u8) !void {
     const session_ref = if (args.len > 0) args[0] else null;

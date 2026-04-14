@@ -16,7 +16,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "send")) return sendHelpText();
     if (std.mem.eql(u8, topic, "snapshot")) return snapshotHelpText();
     if (std.mem.eql(u8, topic, "wait")) return waitHelpText();
-    if (std.mem.eql(u8, topic, "kill")) return killHelpText();
+    if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
     if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
@@ -168,21 +168,6 @@ pub fn waitHelpText() []const u8 {
     \\  --exit           Wait until the child process exits.
     \\
     \\  --timeout MS     Max time to wait in milliseconds (default 10000).
-    \\
-    ;
-}
-
-pub fn killHelpText() []const u8 {
-    return
-    \\hty kill [SESSION]
-    \\
-    \\Terminate a session's underlying process. The session RECORD stays in
-    \\place (same id, same name) so `hty list`, `hty logs` and `hty replay`
-    \\keep working on it — use `hty delete` to free the name and remove the
-    \\log file permanently.
-    \\
-    \\If SESSION is omitted and exactly one session is running, that one
-    \\is killed.
     \\
     ;
 }
