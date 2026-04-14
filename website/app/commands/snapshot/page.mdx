@@ -2,28 +2,15 @@
 
 Capture the current state of a session's terminal screen.
 
-## Synopsis
-
-```sh
-hty snapshot [session] [--json] [--ansi]
-```
-
 The `<session>` argument accepts a session name, a full UUID, or a unique UUID prefix. If only one session is running, you can omit it.
 
-## Flags
+## Reference
 
-| Flag | Description |
-|------|-------------|
-| `--json` | Output the full screen state as JSON |
-| `--ansi` | Output the screen with ANSI escape codes preserved (colors, styles) |
+<HelpBlock cmd="snapshot" />
 
 ## Default output
 
 By default, `hty snapshot` prints the rendered screen as plain text — no escape codes, no JSON wrapper. This is the same content a human would see in the terminal.
-
-```sh
-hty snapshot my-session
-```
 
 ## JSON output
 

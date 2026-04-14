@@ -4,22 +4,9 @@ Re-feed recorded output events through a fresh in-memory VT engine and render th
 
 Replay has no side effects. It does not re-run the program, does not touch the original log file, and does not send any input.
 
-## Synopsis
+## Reference
 
-```sh
-hty replay <session> [--speed <n>] [--at <time>] [--to <time>] [--loop]
-```
-
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| `--speed <n>` | Playback speed multiplier (e.g., `3` for 3x speed) |
-| `--at <time>` | Jump to a specific time offset (e.g., `5s`) |
-| `--to <time>` | Stop replay at a specific time offset (e.g., `10s`) |
-| `--loop` | Loop the replay continuously |
-
-Press **Ctrl+C** or **Ctrl+Q** to exit replay at any time.
+<HelpBlock cmd="replay" />
 
 ## Examples
 

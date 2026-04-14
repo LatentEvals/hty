@@ -1,3 +1,6 @@
 node_modules/
 .next/
 out/
+
+# Generated from src/headless.zig at build time — see scripts/extract-help.mjs
+app/commands/*/_help.txt

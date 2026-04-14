@@ -2,19 +2,9 @@
 
 Stream the event log for a session. Works on running and exited sessions.
 
-## Synopsis
+## Reference
 
-```sh
-hty logs <session> [--json] [--follow] [--since <duration>]
-```
-
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| `--json` | Emit raw JSONL instead of the default human-readable table |
-| `-f`, `--follow` | Tail the log in real time (like `tail -f`) |
-| `--since <duration>` | Show events from the given duration ago (e.g., `30s`, `5m`) |
+<HelpBlock cmd="logs" />
 
 ## Default output
 
@@ -22,10 +12,10 @@ By default, `hty logs` prints a human-readable table:
 
 ```
 TIMESTAMP            KIND    DETAIL
-2025-01-15 10:30:00  spawn   vim /tmp/notes.txt
-2025-01-15 10:30:01  output  (42 bytes)
-2025-01-15 10:30:02  input   (5 bytes)
-2025-01-15 10:30:05  exited  code=0
+2026-01-15 10:30:00  spawn   vim /tmp/notes.txt
+2026-01-15 10:30:01  output  (42 bytes)
+2026-01-15 10:30:02  input   (5 bytes)
+2026-01-15 10:30:05  exited  code=0
 ```
 
 ## JSON output

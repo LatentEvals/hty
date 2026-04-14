@@ -3,8 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build && pagefind --site out --output-path out/_pagefind",
+    "dev": "node scripts/extract-help.mjs && next dev",
+    "build": "node scripts/extract-help.mjs && next build && pagefind --site out --output-path out/_pagefind",
     "start": "next start"
   },
   "dependencies": {

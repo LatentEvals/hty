@@ -7,9 +7,10 @@ export default {
     type: 'separator',
     title: 'Get Started'
   },
-  introduction: 'Introduction',
-  quickstart: 'Quick Start',
-  installation: 'Installation',
+  'get-started': {
+    title: 'Get Started',
+    display: 'children'
+  },
   '---2': {
     type: 'separator',
     title: 'Core Concepts'

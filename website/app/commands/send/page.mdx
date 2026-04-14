@@ -2,73 +2,33 @@
 
 Deliver input to a running session's PTY, exactly as if a user had typed it. You can send plain text, symbolic key names, raw bytes, or a sequenced combination of all three.
 
-## Synopsis
-
-```sh
-hty send <session> (--text <text> | --key <key> | --bytes-hex <hex> | --seq <sequence>)
-```
-
 The `<session>` argument accepts a session name, a full UUID, or a unique UUID prefix. If only one session is running, you can omit it.
 
-## Modes
+## Reference
 
-### --text
+<HelpBlock cmd="send" />
 
-Send a string of characters directly to the PTY. Escape sequences are interpreted: `\n` becomes a literal newline, `\t` a tab, `\r` a carriage return, `\e` an ESC byte (0x1B), and `\\` a backslash.
+## Examples
 
 ```sh
+# Type into an insert-mode editor
 hty send my-session --text "ihello world"
+
+# Confirm a yes/no prompt
 hty send my-session --text "y\n"
-```
 
-### --key
-
-Press a symbolic key by name. Key names are case-insensitive. Modifier prefixes `ctrl-`, `alt-`, and `shift-` can be combined (short forms `c-`, `m-`, `s-` also work). Run `hty keys` for the full list.
-
-```sh
+# Press Escape
 hty send my-session --key esc
-hty send my-session --key enter
+
+# Send Ctrl-C
 hty send my-session --key ctrl-c
-```
 
-### --bytes-hex
+# Type text, then press enter after 200ms
+hty send my-session --seq '"hello" 200ms enter'
 
-Send arbitrary bytes expressed as a lowercase hexadecimal string (no spaces, no `0x` prefix).
-
-```sh
+# Send raw bytes (the up-arrow escape sequence)
 hty send my-session --bytes-hex "1b5b41"
 ```
-
-### --seq
-
-Send a sequence of text, keys, and delays in a single call. Text is quoted, key names are bare, and delays are specified with a time suffix.
-
-```sh
-hty send my-session --seq '"hello" 200ms enter 500ms "world"'
-```
-
-## Delay flags
-
-| Flag | Description |
-|------|-------------|
-| `--delay-before` | Delay before sending input (e.g., `200ms`) |
-| `--delay-after` | Delay after sending input |
-| `--delay-char` | Delay between each character |
-
-## Common key names
-
-| Key name | Description |
-|----------|-------------|
-| `esc` | Escape (0x1B) |
-| `enter` | Carriage return (0x0D) |
-| `tab` | Horizontal tab (0x09) |
-| `backspace` | DEL (0x7F) |
-| `ctrl-c` | Send interrupt signal |
-| `ctrl-d` | Send end-of-file |
-| `up` | Up arrow |
-| `down` | Down arrow |
-| `left` | Left arrow |
-| `right` | Right arrow |
 
 <Callout type="info">
 Every input sent via `hty send` is recorded in the session log as an input event, making sessions fully reproducible and auditable.
