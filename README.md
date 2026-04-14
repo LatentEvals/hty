@@ -1,28 +1,57 @@
-# hty
+<p align="center">
+  <img src="website/app/icon.svg" alt="hty" width="96">
+</p>
 
-`hty` gives AI agents a way to use interactive TUI and CLI programs — `vim`, `git add -p`, `create-next-app`, `psql`, `btop`, `gh auth login` — by reading the rendered screen and sending keys.
+<h1 align="center">hty</h1>
+
+<p align="center">
+  <strong>Puppeteer for the terminal. Drive any interactive CLI with AI.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/LatentEvals/hty/actions/workflows/test.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/LatentEvals/hty/test.yml?branch=main&label=tests"></a>
+  <a href="https://github.com/LatentEvals/hty/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/LatentEvals/hty?include_prereleases"></a>
+  <a href="#license"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://ziglang.org"><img alt="Built with Zig" src="https://img.shields.io/badge/built%20with-Zig-F7A41D?logo=zig&logoColor=white"></a>
+  <a href="https://hty.sh"><img alt="Docs" src="https://img.shields.io/badge/docs-hty.sh-0969da"></a>
+</p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#commands">Commands</a> ·
+  <a href="https://hty.sh">Docs</a> ·
+  <a href="https://hty.sh/llms.txt">llms.txt</a>
+</p>
+
+---
+
+## Why hty exists
+
+Unlock a world of TUI and CLI software for your AI agent.
+
+If you've used agents, you've seen them struggle with things like `create-next-app`, or watched them try to stage a sprawling diff by shuffling files into `/tmp`, `rm`-ing changes, and getting hopelessly confused. If only they could use `git add -p`. Well, now they can.
+
+`hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would.
 
 ## Install
-
-### Install script
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
-Auto-detects your OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target directory.
+Auto-detects OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target. Or grab a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
 
-Or download a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
+<details>
+<summary>Other install methods</summary>
 
-### Homebrew
+**Homebrew**
 
 ```sh
 brew install LatentEvals/tap/hty
 ```
 
-### From source
-
-Requires [Zig](https://ziglang.org) 0.15+.
+**From source** — requires [Zig](https://ziglang.org) 0.15+.
 
 ```sh
 git clone https://github.com/LatentEvals/hty.git
@@ -31,9 +60,11 @@ zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/hty /usr/local/bin/
 ```
 
-## Quick start
+</details>
 
-An agent walking through `git add -p` to stage specific hunks:
+## Quickstart
+
+Drive `git add -p` — the interactive git workflow agents can't handle today:
 
 ```sh
 hty run --name review -- git add -p
@@ -46,37 +77,64 @@ hty send review --text "q\n"
 hty wait review --exit --timeout 2000
 ```
 
-The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls and can be observed from other terminals with `hty watch`.
+The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls. Open a second terminal and run `hty watch review` while the session is live to see exactly what the agent sees.
 
-### Try the demo
+## Features
 
-`scripts/demo-vim.sh` drives `vim` end-to-end through `hty` while you watch it live from a second terminal.
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Any interactive program</strong><br />
+      <code>vim</code>, <code>psql</code>, <code>btop</code>, <code>git add -p</code>, <code>gh auth login</code>, <code>create-next-app</code>. If a human can use it, an agent can.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Sessions persist</strong><br />
+      The server auto-starts and keeps sessions alive across invocations. Multiple tools can drive one session concurrently.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Watch live</strong><br />
+      Run <code>hty watch</code> from another terminal to see exactly what the agent sees, in real time. Read-only, no interference.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Full replay</strong><br />
+      Every session is recorded to an append-only JSONL log. <code>hty replay</code> plays it back through a fresh VT engine.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Wait primitives</strong><br />
+      <code>--text</code> for substring, <code>--idle</code> for output settling, <code>--exit</code> for process end. All with timeouts.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Remote observation</strong><br />
+      Point <code>$HTY_SOCKET</code> at an SSH-tunneled remote server. <code>watch</code> or <code>attach</code> with zero protocol changes.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>Single binary</strong><br />
+      One <code>curl | sh</code> and you're running. Zero runtime dependencies. Fast startup, easy distribution.
+    </td>
+    <td width="33%" valign="top">
+      <strong>Production VT engine</strong><br />
+      Powered by <a href="https://ghostty.org">Ghostty</a>. Accurate color, cursor, wide characters, and every escape sequence.
+    </td>
+    <td width="33%" valign="top">
+      <strong>AI-readable docs</strong><br />
+      The <a href="https://hty.sh">docs site</a> serves <a href="https://hty.sh/llms.txt">llms.txt</a> and a <code>.md</code> of every page for agent ingestion.
+    </td>
+  </tr>
+</table>
 
-In terminal A:
+## Concepts
 
-```sh
-zig build
-./scripts/demo-vim.sh
-```
-
-In terminal B (any time during the demo):
-
-```sh
-./zig-out/bin/hty watch demo-vim
-```
-
-Terminal B shows vim opening, `watched by another terminal` appearing character-by-character in insert mode, `:wq` at the status bar, and vim exiting — all unattended.
-
-Because every session is logged, you can re-watch the whole thing later with:
-
-```sh
-./zig-out/bin/hty replay demo-vim
-```
+- **[Sessions](https://hty.sh/concepts/sessions)** — a session is a real PTY running your program, identified by a UUID or a human-friendly `--name`. Sessions are isolated from each other and from your terminal.
+- **[Background server](https://hty.sh/concepts/server)** — a persistent process that owns all session state. It auto-starts on first use, talks to clients over a Unix socket, and keeps sessions alive across individual `hty` commands.
+- **[Session logs](https://hty.sh/concepts/session-logs)** — every input and output byte is written to a per-session append-only JSONL log. `hty logs` streams raw events; `hty replay` feeds them back through a fresh VT engine long after the session has ended.
 
 ## Commands
 
 ```
-$ hty --help
 Usage:
   hty <command> [args...]
 
@@ -100,29 +158,20 @@ Commands:
 Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
 human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
-
-Examples:
-  hty run --name debug-vim -- vim /tmp/foo.txt
-  hty list
-  hty watch debug-vim
-  hty send debug-vim --text "ihello"
-  hty send debug-vim --key esc
-  hty wait debug-vim --idle 300 --timeout 2000
-  hty kill debug-vim
 ```
 
-Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names.
+Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
 
 ### Exit codes
 
 | code | meaning |
-| --- | --- |
-| 0 | success |
-| 1 | generic error |
-| 2 | session not found |
-| 3 | `wait` timed out |
-| 4 | session prefix matched multiple sessions (ambiguous) |
-| 5 | a session with that name already exists |
+| :--: | ------- |
+| 0    | success |
+| 1    | generic error |
+| 2    | session not found |
+| 3    | `wait` timed out |
+| 4    | session prefix matched multiple sessions (ambiguous) |
+| 5    | a session with that name already exists |
 
 ## Remote observation
 
@@ -139,23 +188,24 @@ HTY_SOCKET=~/.local/state/hty/remote.sock hty attach foo
 
 When `$HTY_SOCKET` is set, the client never auto-spawns a local server — if the endpoint isn't reachable it fails fast, so a broken tunnel is obvious instead of silently shadowed by a fresh local server.
 
-## Under the hood
+## Built with
 
-A PTY runtime built on [Ghostty](https://ghostty.org)'s VT engine, a persistent background server, and a flat subcommand CLI. Sessions live in the server across invocations; clients talk to it over a Unix socket. Every session is logged to an append-only JSONL file on disk so `hty logs` and `hty replay` work long after the session has ended.
+- **[Ghostty](https://ghostty.org)** — production-grade VT engine for accurate terminal emulation.
+- **[Zig](https://ziglang.org)** — fast startup, single-binary distribution, no runtime.
 
-**Status:** beta. The core surface is shipped — persistent server, named sessions, live observers (`hty watch`), interactive multi-writer attach (`hty attach`), append-only session event logs with `hty logs` / `hty replay`, the wait primitives, explicit session lifecycle (`hty kill` / `hty delete`), and remote observation via `$HTY_SOCKET` + SSH tunnels. See [docs/ROADMAP.md](docs/ROADMAP.md) for the post-beta polish backlog.
+## Development
 
-## Tests
+### Tests
 
 ```sh
 zig build test
 ```
 
-Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, UUIDv7 generation, session registry behavior, the subcommand dispatch, and end-to-end integration against `/bin/cat`, `nano`, `emacs`, and `top` using the wait primitives.
+Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, UUIDv7 generation, session registry behavior, subcommand dispatch, and end-to-end integration against `/bin/cat`, `nano`, `emacs`, and `top` using the wait primitives.
 
-## Debug utilities
+### Debug utilities
 
-`hty-demo` is a standalone framed wrapper that opens its own PTY in its own process — it does **not** talk to the session server. It's kept as a development aid for the VT engine and as the base code `hty attach` will be built on top of in a future phase. For normal use, prefer `hty run` + `hty watch`.
+`hty-demo` is a standalone framed wrapper that opens its own PTY in its own process — it does **not** talk to the session server. It's kept as a development aid for the VT engine. For normal use, prefer `hty run` + `hty watch`.
 
 ```sh
 ./zig-out/bin/hty-demo btop
@@ -164,7 +214,14 @@ Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, U
 
 `Ctrl-Q` kills the child and exits.
 
-## More
+## License
 
-- [docs/ROADMAP.md](docs/ROADMAP.md) — vision, shipped phases, and what's next.
-- [docs/BLOG.md](docs/BLOG.md) — long-form design notes and draft blog posts.
+MIT License
+
+Copyright (c) 2026 Montana Flynn & [LatentEvals](https://latentevals.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
