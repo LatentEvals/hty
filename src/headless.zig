@@ -101,6 +101,20 @@ const buildSessionSummary = ops.buildSessionSummary;
 const joinArgs = ops.joinArgs;
 const eventToPayload = ops.eventToPayload;
 
+const common = @import("commands/common.zig");
+const sendRequest = common.sendRequest;
+const sendRawRequest = common.sendRawRequest;
+const printJsonLine = common.printJsonLine;
+const printLine = common.printLine;
+const printRaw = common.printRaw;
+const printErr = common.printErr;
+const printErrFmt = common.printErrFmt;
+const expectOkOrExit = common.expectOkOrExit;
+const errorToExitCode = common.errorToExitCode;
+const printUsageAndExit = common.printUsageAndExit;
+const writeJsonString = common.writeJsonString;
+const ExitCode = common.ExitCode;
+
 // Force Zig's test discovery to walk the extracted modules even when the root
 // file only references specific decls from them.
 comptime {
@@ -129,157 +143,6 @@ const c = @cImport({
 pub const std_options: std.Options = .{
     .log_level = .err,
 };
-
-// ============================================================================
-// Exit codes (stable contract across versions once we ship 0.1)
-// ============================================================================
-
-const ExitCode = struct {
-    const ok: u8 = 0;
-    const generic: u8 = 1;
-    const not_found: u8 = 2;
-    const wait_timeout: u8 = 3;
-    const ambiguous_prefix: u8 = 4;
-    const name_exists: u8 = 5;
-};
-
-
-// ============================================================================
-// Client-side request helper
-// ============================================================================
-
-fn sendRequest(alloc: Allocator, request_value: anytype) !std.json.Parsed(std.json.Value) {
-    const socket_path = try resolveSocketPath(alloc);
-    defer alloc.free(socket_path);
-
-    var stream = try ensureServer(alloc, socket_path, .{});
-    defer stream.close();
-
-    const payload = try std.json.Stringify.valueAlloc(alloc, request_value, .{});
-    defer alloc.free(payload);
-
-    try stream.writeAll(payload);
-    try stream.writeAll("\n");
-
-    var response_buf = std.array_list.Managed(u8).init(alloc);
-    defer response_buf.deinit();
-
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = try stream.read(&chunk);
-        if (n == 0) break;
-        try response_buf.appendSlice(chunk[0..n]);
-        if (std.mem.indexOfScalar(u8, response_buf.items, '\n') != null) break;
-    }
-
-    const newline = std.mem.indexOfScalar(u8, response_buf.items, '\n') orelse response_buf.items.len;
-    return std.json.parseFromSlice(std.json.Value, alloc, response_buf.items[0..newline], .{});
-}
-
-/// Low-level: send a pre-built JSON string to the server; return raw response.
-/// Caller owns the returned slice.
-fn sendRawRequest(alloc: Allocator, request_json: []const u8) ![]u8 {
-    const socket_path = try resolveSocketPath(alloc);
-    defer alloc.free(socket_path);
-
-    var stream = try ensureServer(alloc, socket_path, .{});
-    defer stream.close();
-
-    try stream.writeAll(request_json);
-    try stream.writeAll("\n");
-
-    var response_buf = std.array_list.Managed(u8).init(alloc);
-    defer response_buf.deinit();
-
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = try stream.read(&chunk);
-        if (n == 0) break;
-        try response_buf.appendSlice(chunk[0..n]);
-        if (std.mem.indexOfScalar(u8, response_buf.items, '\n') != null) break;
-    }
-
-    const newline = std.mem.indexOfScalar(u8, response_buf.items, '\n') orelse response_buf.items.len;
-    return alloc.dupe(u8, response_buf.items[0..newline]);
-}
-
-fn printJsonLine(object: anytype) !void {
-    const alloc = std.heap.c_allocator;
-    const json = try std.json.Stringify.valueAlloc(alloc, object, .{});
-    defer alloc.free(json);
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(json);
-    _ = try stdout.writeAll("\n");
-}
-
-fn printLine(text: []const u8) !void {
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(text);
-    _ = try stdout.writeAll("\n");
-}
-
-fn printRaw(text: []const u8) !void {
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(text);
-}
-
-fn printErr(text: []const u8) !void {
-    var stderr = std.fs.File.stderr();
-    _ = try stderr.writeAll(text);
-    _ = try stderr.writeAll("\n");
-}
-
-fn printErrFmt(comptime fmt: []const u8, args: anytype) !void {
-    const alloc = std.heap.c_allocator;
-    const msg = try std.fmt.allocPrint(alloc, fmt, args);
-    defer alloc.free(msg);
-    try printErr(msg);
-}
-
-/// Check that a response envelope has ok=true; return the response object.
-/// Emits an error message to stderr and exits with the appropriate code on failure.
-fn expectOkOrExit(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
-    const object = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try printErr("invalid response from server");
-            std.process.exit(ExitCode.generic);
-        },
-    };
-    const ok = object.get("ok") orelse {
-        try printErr("malformed response: missing ok field");
-        std.process.exit(ExitCode.generic);
-    };
-    switch (ok) {
-        .bool => |v| if (!v) {
-            const msg = if (object.get("error")) |err_val|
-                switch (err_val) {
-                    .string => |s| s,
-                    else => "unknown error",
-                }
-            else
-                "unknown error";
-            try printErrFmt("error: {s}", .{msg});
-            const code = errorToExitCode(msg);
-            std.process.exit(code);
-        },
-        else => {
-            try printErr("malformed response: ok is not a boolean");
-            std.process.exit(ExitCode.generic);
-        },
-    }
-    return object;
-}
-
-fn errorToExitCode(msg: []const u8) u8 {
-    if (std.mem.indexOf(u8, msg, "session not found") != null) return ExitCode.not_found;
-    if (std.mem.indexOf(u8, msg, "SessionNotFound") != null) return ExitCode.not_found;
-    if (std.mem.indexOf(u8, msg, "ambiguous") != null) return ExitCode.ambiguous_prefix;
-    if (std.mem.indexOf(u8, msg, "AmbiguousPrefix") != null) return ExitCode.ambiguous_prefix;
-    if (std.mem.indexOf(u8, msg, "already exists") != null) return ExitCode.name_exists;
-    if (std.mem.indexOf(u8, msg, "NameAlreadyExists") != null) return ExitCode.name_exists;
-    return ExitCode.generic;
-}
 
 // ============================================================================
 // Client subcommands
@@ -398,22 +261,6 @@ fn runClientRun(alloc: Allocator, args: []const []const u8) !void {
     } else {
         try printLine(try std.fmt.allocPrint(alloc, "session {s} started", .{id_str[0..8]}));
     }
-}
-
-fn writeJsonString(writer: std.io.AnyWriter, s: []const u8) !void {
-    try writer.writeByte('"');
-    for (s) |b| {
-        switch (b) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            0...0x08, 0x0b, 0x0c, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{b}),
-            else => try writer.writeByte(b),
-        }
-    }
-    try writer.writeByte('"');
 }
 
 /// Try to read the server's live session list without auto-spawning
@@ -2454,11 +2301,6 @@ fn fileExistsAbsolute(path: []const u8) bool {
 // ============================================================================
 // Misc helpers
 // ============================================================================
-
-fn printUsageAndExit(msg: []const u8) noreturn {
-    printErr(msg) catch {};
-    std.process.exit(ExitCode.generic);
-}
 
 // ============================================================================
 // Help text
