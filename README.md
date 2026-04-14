@@ -28,11 +28,11 @@
 
 ## Why hty exists
 
-AI agents can run `bash -c "git commit -m 'fix'"`. They can't run `git add -p` and pick which hunks to stage. They can't answer the prompts in `create-next-app`. They can't log in with `gh auth login`.
+AI agents can write, test, and ship a feature end-to-end. They freeze the moment a CLI asks a question.
 
-Every interactive program is a wall. Agents either bail out and ask a human, or maintain brittle `--flag` workarounds that break the moment a tool adds a new prompt.
+Every real terminal workflow has prompts in it — `git add -p`, `gh auth login`, `create-next-app`, `psql`, `vim`. When an agent hits one, you have two bad options: bail out and wait for a human, or bolt on brittle `--flag` workarounds that break the next time the tool adds a prompt.
 
-`hty` wraps any program in a persistent PTY session. Your agent reads the rendered screen, decides what to type, and sends keystrokes — the same loop a human uses, automated. No flags to memorize. No expect scripts. If `create-next-app` adds a new question next month, the same loop still handles it.
+`hty` gives you a third. It wraps any program in a persistent PTY session so your agent can read the rendered screen, decide what to type, and send keystrokes — the same loop a human uses, automated. No flags to memorize. No expect scripts. If `create-next-app` ships a new prompt next month, the same loop still handles it.
 
 ## Quickstart
 
