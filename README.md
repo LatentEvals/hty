@@ -30,7 +30,7 @@
 
 Unlock a world of TUI and CLI software for your AI agent.
 
-If you've used agents, you've seen them struggle with things like `create-next-app`, or cram a sprawling diff into a single commit because logical ones are out of reach. If only they could use `git add -p`. Well, now they can.
+If you've used agents, you've seen them struggle with things like `create-next-app`, or watched them try to stage a sprawling diff by shuffling files into `/tmp`, `rm`-ing changes, and getting hopelessly confused. If only they could use `git add -p`. Well, now they can.
 
 `hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would — no SDK, no wrapper, no cooperation from upstream. Every program with a TTY just works.
 
