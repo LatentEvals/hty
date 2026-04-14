@@ -34,19 +34,37 @@ If you've used agents, you've seen them struggle with things like `create-next-a
 
 `hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would.
 
-## Quickstart
+## Install
 
 ```sh
-hty run --name app -- create-next-app my-app
-hty wait app --text "TypeScript" --timeout 5000
-hty send app --text "y\n"
-hty wait app --exit --timeout 60000
-hty delete app
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
-That's the whole loop: **start → wait → send → repeat → delete**. Open a second terminal and run `hty watch app` to see the session rendered live while the agent drives it.
+Auto-detects OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target. Or grab a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
 
-### Full example: driving `git add -p`
+<details>
+<summary>Other install methods</summary>
+
+**Homebrew**
+
+```sh
+brew install LatentEvals/tap/hty
+```
+
+**From source** — requires [Zig](https://ziglang.org) 0.15+.
+
+```sh
+git clone https://github.com/LatentEvals/hty.git
+cd hty
+zig build -Doptimize=ReleaseFast
+sudo cp zig-out/bin/hty /usr/local/bin/
+```
+
+</details>
+
+## Quickstart
+
+Drive `git add -p` — the interactive git workflow agents can't handle today:
 
 ```sh
 hty run --name review -- git add -p
@@ -59,21 +77,7 @@ hty send review --text "q\n"
 hty wait review --exit --timeout 2000
 ```
 
-The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls and can be observed from other terminals with `hty watch`.
-
-### Try it live
-
-`scripts/demo-vim.sh` drives `vim` end-to-end through `hty` while you watch it from a second terminal.
-
-```sh
-# terminal A
-zig build && ./scripts/demo-vim.sh
-
-# terminal B (any time during the demo)
-./zig-out/bin/hty watch demo-vim
-```
-
-Terminal B shows vim opening, `watched by another terminal` typed character-by-character in insert mode, `:wq` at the status bar, and vim exiting — all unattended. Because every session is logged, you can re-watch the whole thing later with `hty replay demo-vim`.
+The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls. Open a second terminal and run `hty watch review` while the session is live to see exactly what the agent sees.
 
 ## Features
 
@@ -122,35 +126,6 @@ Terminal B shows vim opening, `watched by another terminal` typed character-by-c
   </tr>
 </table>
 
-## Install
-
-### Install script
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
-```
-
-Auto-detects your OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target.
-
-Or grab a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
-
-### Homebrew
-
-```sh
-brew install LatentEvals/tap/hty
-```
-
-### From source
-
-Requires [Zig](https://ziglang.org) 0.15+.
-
-```sh
-git clone https://github.com/LatentEvals/hty.git
-cd hty
-zig build -Doptimize=ReleaseFast
-sudo cp zig-out/bin/hty /usr/local/bin/
-```
-
 ## How it works
 
 ```
@@ -173,26 +148,7 @@ sudo cp zig-out/bin/hty /usr/local/bin/
 
 See [docs.hty.sh/concepts](https://hty.sh/concepts/sessions) for the full architecture.
 
-## Status
-
-hty is in **beta**. The core surface is shipped and stable in everyday use.
-
-|   | Feature                                                  | Status |
-| - | -------------------------------------------------------- | :----: |
-| 1 | Persistent background server + Unix socket protocol      |   ✅   |
-| 2 | Named sessions with UUIDv7 and prefix resolution         |   ✅   |
-| 3 | Live observers (`hty watch`) — read-only rendering       |   ✅   |
-| 4 | Interactive multi-writer `hty attach`                    |   ✅   |
-| 5 | Append-only JSONL event logs + `hty logs` / `hty replay` |   ✅   |
-| 6 | Wait primitives (`--text`, `--idle`, `--exit`)           |   ✅   |
-| 7 | Explicit session lifecycle (`hty kill` / `hty delete`)   |   ✅   |
-| 8 | Remote observation via `$HTY_SOCKET` + SSH               |   ✅   |
-| 9 | Post-beta polish — stabilized protocol, more platforms   |   🚧   |
-
 ## Commands
-
-<details>
-<summary><code>hty --help</code></summary>
 
 ```
 Usage:
@@ -219,8 +175,6 @@ Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
 human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
 ```
-
-</details>
 
 Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
 
