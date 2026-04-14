@@ -161,6 +161,23 @@ pub fn printUsageAndExit(msg: []const u8) noreturn {
     std.process.exit(ExitCode.generic);
 }
 
+/// Parse a duration like "500ms", "5s", "2m", "1h", or a bare integer
+/// (interpreted as seconds). Returns the value in milliseconds.
+pub fn parseDurationMs(text: []const u8) !u64 {
+    if (text.len == 0) return error.InvalidDuration;
+    var digit_end: usize = 0;
+    while (digit_end < text.len and text[digit_end] >= '0' and text[digit_end] <= '9') digit_end += 1;
+    if (digit_end == 0) return error.InvalidDuration;
+    const n = try std.fmt.parseInt(u64, text[0..digit_end], 10);
+    const suffix = text[digit_end..];
+    if (suffix.len == 0) return n * 1000; // bare integer = seconds
+    if (std.mem.eql(u8, suffix, "ms")) return n;
+    if (std.mem.eql(u8, suffix, "s")) return n * 1000;
+    if (std.mem.eql(u8, suffix, "m")) return n * 60 * 1000;
+    if (std.mem.eql(u8, suffix, "h")) return n * 60 * 60 * 1000;
+    return error.InvalidDuration;
+}
+
 /// Serialize a Zig string as a JSON string, writing to the given writer.
 /// Handles the standard escapes plus \uXXXX for other control bytes.
 pub fn writeJsonString(writer: std.io.AnyWriter, s: []const u8) !void {

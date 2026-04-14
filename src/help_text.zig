@@ -13,7 +13,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "run")) return @import("commands/run.zig").helpText();
     if (std.mem.eql(u8, topic, "list")) return @import("commands/list.zig").helpText();
     if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
-    if (std.mem.eql(u8, topic, "send")) return sendHelpText();
+    if (std.mem.eql(u8, topic, "send")) return @import("commands/send.zig").helpText();
     if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
     if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
@@ -73,34 +73,6 @@ pub fn watchHelpText() []const u8 {
     \\
     \\SESSION may be a UUID prefix or the session's --name. If omitted and
     \\exactly one session is running, that one is used.
-    \\
-    ;
-}
-
-pub fn sendHelpText() []const u8 {
-    return
-    \\hty send [SESSION] --text "..." | --key NAME | --seq "..." | --bytes-hex HEX
-    \\
-    \\Send input to a session. Exactly one of --text, --key, --seq,
-    \\--bytes-hex is required.
-    \\
-    \\Flags:
-    \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
-    \\  --key NAME           Named key with optional modifiers.
-    \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
-    \\                       function keys (f1-f12), and combinations like
-    \\                       ctrl-alt-f or shift-up. Run `hty keys` for details.
-    \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
-    \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
-    \\                       are pauses, and bare words are key names.
-    \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
-    \\  --bytes-hex HEX      Raw bytes encoded as hex.
-    \\
-    \\Delay flags (optional, combine with any mode above):
-    \\  --delay-before DUR   Sleep before sending (e.g. 200ms, 1s).
-    \\  --delay-after DUR    Sleep after sending.
-    \\  --delay-char DUR     Send text character-by-character with a delay
-    \\                       between each. Only works with --text or --seq.
     \\
     ;
 }
