@@ -555,6 +555,17 @@ fn logKilledEvent(arena: Allocator, sess: *Session) void {
     writeLogEvent(sess, line);
 }
 
+fn logResizeEvent(arena: Allocator, sess: *Session, rows: u16, cols: u16) void {
+    if (sess.log_file == null) return;
+    const line = std.json.Stringify.valueAlloc(arena, .{
+        .t = std.time.milliTimestamp(),
+        .kind = "resize",
+        .rows = rows,
+        .cols = cols,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
 // ============================================================================
 // Attach broadcast
 // ============================================================================
@@ -872,6 +883,7 @@ fn handleAttachConnection(
                 const rows: u16 = @intCast(@max(1, rv.integer));
                 const cols: u16 = @intCast(@max(1, cv.integer));
                 sess.terminal.resize(rows, cols) catch {};
+                logResizeEvent(arena, sess, rows, cols);
             }
         }
     }
@@ -1009,6 +1021,7 @@ fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         const rows: u16 = @intCast(@max(1, rows_val.integer));
         const cols: u16 = @intCast(@max(1, cols_val.integer));
         client.session.terminal.resize(rows, cols) catch {};
+        logResizeEvent(arena, client.session, rows, cols);
         return;
     }
 
@@ -1089,7 +1102,7 @@ fn dispatchRequest(
     if (std.mem.eql(u8, op, "send_text")) return handleSendText(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_key")) return handleSendKey(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_bytes_hex")) return handleSendBytesHex(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "resize")) return handleResize(sess, object, id);
+    if (std.mem.eql(u8, op, "resize")) return handleResize(arena, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_text")) return handleWaitForText(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_idle")) return handleWaitForIdle(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_exit")) return handleWaitForExit(arena, registry, sess, object, id);
@@ -1229,10 +1242,11 @@ fn handleSendBytesHex(arena: Allocator, sess: *Session, object: std.json.ObjectM
     return .{ .id = id, .ok = true };
 }
 
-fn handleResize(sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
+fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     const rows = try readRequiredU16(object, "rows");
     const cols = try readRequiredU16(object, "cols");
     try sess.terminal.resize(rows, cols);
+    logResizeEvent(arena, sess, rows, cols);
     return .{ .id = id, .ok = true };
 }
 
@@ -3288,6 +3302,97 @@ fn runClientReplay(alloc: Allocator, args: []const []const u8) !void {
     };
 }
 
+/// Pure-VT replay result. Owns the terminal — caller must `deinit`.
+/// `rows`/`cols` reflect the final resize state (initial if none occurred).
+pub const ReplayResult = struct {
+    terminal: hty.ghostty_vt.Terminal,
+    rows: u16,
+    cols: u16,
+
+    pub fn deinit(self: *ReplayResult, alloc: Allocator) void {
+        self.terminal.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Apply one parsed JSONL log event to a VT terminal. Returns true iff the
+/// event was "visible" (output or resize) — i.e. the grid may have changed.
+/// Other kinds (title, bell, input, killed, failure, exited) are ignored.
+///
+/// Shared between `replayLoop` (the CLI viewer) and `replayToTerminal` (the
+/// headless helper) so both agree on what a log event does to the grid.
+fn applyLogEvent(
+    alloc: Allocator,
+    obj: std.json.ObjectMap,
+    terminal: *hty.ghostty_vt.Terminal,
+    stream: *hty.ghostty_vt.TerminalStream,
+    cur_rows: *u16,
+    cur_cols: *u16,
+) !bool {
+    const kind_val = obj.get("kind") orelse return false;
+    if (kind_val != .string) return false;
+    const kind = kind_val.string;
+
+    if (std.mem.eql(u8, kind, "output")) {
+        const hex = getString(obj, "bytes_hex") orelse return false;
+        const decoded = decodeHex(alloc, hex) catch return false;
+        defer alloc.free(decoded);
+        stream.nextSlice(decoded);
+        return true;
+    } else if (std.mem.eql(u8, kind, "resize")) {
+        const nr = getInteger(obj, "rows") orelse return false;
+        const nc = getInteger(obj, "cols") orelse return false;
+        cur_rows.* = @intCast(nr);
+        cur_cols.* = @intCast(nc);
+        try terminal.resize(alloc, cur_cols.*, cur_rows.*);
+        return true;
+    }
+    return false;
+}
+
+/// Feed a session log into a fresh VT engine and return the resulting state.
+/// Pure: no sleeps, no stdout, no stdin. The first line (spawn event) is
+/// skipped — its `rows`/`cols` should be parsed by the caller and passed as
+/// `initial_rows` / `initial_cols`. Malformed lines are tolerated (skipped).
+///
+/// Intended for tests that assert replay produces the same grid as the live
+/// session that recorded the log.
+pub fn replayToTerminal(
+    alloc: Allocator,
+    bytes: []const u8,
+    initial_rows: u16,
+    initial_cols: u16,
+) !ReplayResult {
+    var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+        .cols = initial_cols,
+        .rows = initial_rows,
+        .max_scrollback = 10_000,
+    });
+    errdefer terminal.deinit(alloc);
+
+    const handler = terminal.vtHandler();
+    var stream = hty.ghostty_vt.TerminalStream.initAlloc(alloc, handler);
+    defer stream.deinit();
+
+    var cur_rows: u16 = initial_rows;
+    var cur_cols: u16 = initial_cols;
+
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    _ = it.next(); // skip spawn line (dimensions are passed in explicitly)
+
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        _ = applyLogEvent(alloc, parsed.value.object, &terminal, &stream, &cur_rows, &cur_cols) catch continue;
+    }
+
+    return .{ .terminal = terminal, .rows = cur_rows, .cols = cur_cols };
+}
+
 fn replayLoop(
     alloc: Allocator,
     bytes: []const u8,
@@ -3339,7 +3444,6 @@ fn replayLoop(
 
             const kind_val = obj.get("kind") orelse continue;
             if (kind_val != .string) continue;
-            const kind = kind_val.string;
 
             const past_at = t >= at_threshold;
 
@@ -3355,22 +3459,8 @@ fn replayLoop(
             }
             prev_t = t;
 
-            if (std.mem.eql(u8, kind, "output")) {
-                const hex = getString(obj, "bytes_hex") orelse continue;
-                const decoded = decodeHex(alloc, hex) catch continue;
-                defer alloc.free(decoded);
-                stream.nextSlice(decoded);
-                if (past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
-            } else if (std.mem.eql(u8, kind, "resize")) {
-                const nr = getInteger(obj, "rows") orelse continue;
-                const nc = getInteger(obj, "cols") orelse continue;
-                cur_rows = @intCast(nr);
-                cur_cols = @intCast(nc);
-                try terminal.resize(alloc, cur_cols, cur_rows);
-                if (past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
-            } else {
-                // title, bell, input, killed, failure, exited: not visual.
-            }
+            const visible = try applyLogEvent(alloc, obj, &terminal, &stream, &cur_rows, &cur_cols);
+            if (visible and past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
         }
 
         // End-of-log: without --loop, hold on the final frame until the
@@ -5711,4 +5801,274 @@ test "headless protocol can use emacs to write an org file" {
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "* Hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "** TODO Write tests") != null);
+}
+
+// ===========================================================================
+// Replay parity tests
+// ===========================================================================
+//
+// These prove that `replayToTerminal` produces the same grid as the live
+// session that recorded the log. If this ever breaks, `hty replay` is lying —
+// which would defeat the entire point of per-session logging. Also exercises
+// the `resize` event path in `applyLogEvent`, which isn't reachable from any
+// of the golden-frame tests.
+
+/// Shared helper: set up a self-contained log dir under /tmp and return it
+/// along with the `by-name` subdir path. Caller owns neither (the returned
+/// paths live in the provided buffers / allocator).
+fn setupReplayLogDir(
+    alloc: std.mem.Allocator,
+    tag: []const u8,
+    log_dir_buf: []u8,
+) !struct { log_dir: []const u8, by_name: []const u8 } {
+    const log_dir = try std.fmt.bufPrint(
+        log_dir_buf,
+        "/tmp/hty-replay-{s}-{d}",
+        .{ tag, std.time.nanoTimestamp() },
+    );
+    try std.fs.cwd().makePath(log_dir);
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    try std.fs.cwd().makePath(by_name);
+    return .{ .log_dir = log_dir, .by_name = by_name };
+}
+
+/// Read `<by_name>/<name>.jsonl` in full. Caller frees.
+fn readSessionLog(alloc: std.mem.Allocator, by_name: []const u8, name: []const u8) ![]u8 {
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ by_name, name });
+    defer alloc.free(link_path);
+    const file = try std.fs.openFileAbsolute(link_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+}
+
+test "replay reproduces the live grid for a colored cat session" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "cat", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = dirs.log_dir;
+
+    const rows: u16 = 12;
+    const cols: u16 = 50;
+
+    // 1. Spawn cat.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "pcat",
+            .program = "/bin/cat",
+            .rows = rows,
+            .cols = cols,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 2. Send something non-trivial: colors + cursor positioning. The grid
+    //    should have fg changes on a prefix and cursor pokes elsewhere.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "pcat",
+            .text = "\x1b[31mred\x1b[32mgreen\x1b[0mplain line one\n\x1b[3;10Hpoke\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 3. Wait for the text to land, then idle to ensure no more output is
+    //    racing us. Without the idle we occasionally snapshot mid-flush and
+    //    replay sees *more* bytes than the live snapshot.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "pcat",
+            .text = "plain line one",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "pcat",
+            .idle_ms = 150,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 4. Capture the live screen_ansi via a dedicated snapshot op so we're
+    //    not tied to the waiter's return payload.
+    const live_ansi = blk: {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "pcat" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
+        if (ansi_val != .string) return error.InvalidResponse;
+        break :blk try alloc.dupe(u8, ansi_val.string);
+    };
+    defer alloc.free(live_ansi);
+
+    // 5. Kill and read the log.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "pcat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const log_bytes = try readSessionLog(alloc, dirs.by_name, "pcat");
+    defer alloc.free(log_bytes);
+
+    // 6. Replay into a fresh VT.
+    var result = try replayToTerminal(alloc, log_bytes, rows, cols);
+    defer result.deinit(alloc);
+
+    // 7. Render with the same dims and compare byte-for-byte.
+    const replayed_ansi = try hty.renderScreenAnsi(alloc, &result.terminal, result.rows, result.cols);
+    defer alloc.free(replayed_ansi);
+
+    try std.testing.expectEqualStrings(live_ansi, replayed_ansi);
+}
+
+test "replay reproduces the live grid across a mid-session resize" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "resize", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = dirs.log_dir;
+
+    const start_rows: u16 = 10;
+    const start_cols: u16 = 40;
+    const new_rows: u16 = 14;
+    const new_cols: u16 = 60;
+
+    // 1. Spawn at the smaller size.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "rcat",
+            .program = "/bin/cat",
+            .rows = start_rows,
+            .cols = start_cols,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 2. Some content before the resize.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rcat",
+            .text = "first round\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "first round",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 3. Resize — this is the event we specifically want `replayToTerminal`
+    //    to replay correctly.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "resize",
+            .session = "rcat",
+            .rows = new_rows,
+            .cols = new_cols,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 4. More content post-resize.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rcat",
+            .text = "second round at the wider size\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "second round",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "rcat",
+            .idle_ms = 150,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const live_ansi = blk: {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "rcat" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
+        if (ansi_val != .string) return error.InvalidResponse;
+        break :blk try alloc.dupe(u8, ansi_val.string);
+    };
+    defer alloc.free(live_ansi);
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "rcat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const log_bytes = try readSessionLog(alloc, dirs.by_name, "rcat");
+    defer alloc.free(log_bytes);
+
+    // 5. Sanity check: the log must contain a resize event, otherwise this
+    //    test isn't actually exercising the path it claims to.
+    try std.testing.expect(std.mem.indexOf(u8, log_bytes, "\"kind\":\"resize\"") != null);
+
+    // 6. Replay and compare. `result.rows`/`.cols` should reflect the new
+    //    (post-resize) dimensions, proving the resize applied.
+    var result = try replayToTerminal(alloc, log_bytes, start_rows, start_cols);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(new_rows, result.rows);
+    try std.testing.expectEqual(new_cols, result.cols);
+
+    const replayed_ansi = try hty.renderScreenAnsi(alloc, &result.terminal, result.rows, result.cols);
+    defer alloc.free(replayed_ansi);
+
+    try std.testing.expectEqualStrings(live_ansi, replayed_ansi);
 }
