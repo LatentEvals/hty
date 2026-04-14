@@ -81,15 +81,50 @@ The server auto-starts on first use and persists across invocations, so sessions
 
 ## Features
 
-- **Any interactive program** — `vim`, `psql`, `btop`, `git add -p`, `gh auth login`, `create-next-app`. If a human can use it, an agent can too.
-- **Sessions persist** — the server keeps sessions alive across invocations. Multiple tools can drive the same session.
-- **Watch live** — run `hty watch` from another terminal to see exactly what the agent sees, in real time. Read-only, no interference.
-- **Full replay** — every session is recorded to an append-only JSONL log. `hty replay` plays it back through a fresh VT engine.
-- **Wait primitives** — `--text` for substring match, `--idle` for output settling, `--exit` for process completion. All with timeouts. No `sleep 2` and hope.
-- **Remote observation** — point `$HTY_SOCKET` at a remote server over an SSH tunnel. `watch` or `attach` sessions running there with no protocol changes.
-- **Single binary** — one `curl | sh` and you're running. Zero runtime dependencies.
-- **Production VT engine** — powered by [Ghostty](https://ghostty.org). Accurate color, cursor, wide characters, and every escape sequence real TUIs emit.
-- **AI-readable docs** — the [docs site](https://hty.sh) serves [llms.txt](https://hty.sh/llms.txt) and a `.md` version of every page, so agents can ingest hty's own docs cleanly.
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>Any interactive program</h4>
+      <code>vim</code>, <code>psql</code>, <code>btop</code>, <code>git add -p</code>, <code>gh auth login</code>, <code>create-next-app</code>. If a human can use it, an agent can.
+    </td>
+    <td width="33%" valign="top">
+      <h4>Sessions persist</h4>
+      The server auto-starts and keeps sessions alive across invocations. Multiple tools can drive one session concurrently.
+    </td>
+    <td width="33%" valign="top">
+      <h4>Watch live</h4>
+      Run <code>hty watch</code> from another terminal to see exactly what the agent sees, in real time. Read-only, no interference.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>Full replay</h4>
+      Every session is recorded to an append-only JSONL log. <code>hty replay</code> plays it back through a fresh VT engine.
+    </td>
+    <td width="33%" valign="top">
+      <h4>Wait primitives</h4>
+      <code>--text</code> for substring, <code>--idle</code> for output settling, <code>--exit</code> for process end. All with timeouts.
+    </td>
+    <td width="33%" valign="top">
+      <h4>Remote observation</h4>
+      Point <code>$HTY_SOCKET</code> at an SSH-tunneled remote server. <code>watch</code> or <code>attach</code> with zero protocol changes.
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <h4>Single binary</h4>
+      One <code>curl | sh</code> and you're running. Zero runtime dependencies. Fast startup, easy distribution.
+    </td>
+    <td width="33%" valign="top">
+      <h4>Production VT engine</h4>
+      Powered by <a href="https://ghostty.org">Ghostty</a>. Accurate color, cursor, wide characters, and every escape sequence.
+    </td>
+    <td width="33%" valign="top">
+      <h4>AI-readable docs</h4>
+      The <a href="https://hty.sh">docs site</a> serves <a href="https://hty.sh/llms.txt">llms.txt</a> and a <code>.md</code> of every page for agent ingestion.
+    </td>
+  </tr>
+</table>
 
 ## How it works
 
