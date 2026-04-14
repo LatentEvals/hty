@@ -3,6 +3,44 @@ const hty = @import("hty");
 
 const Allocator = std.mem.Allocator;
 
+const resolveSocketPath = @import("paths.zig").resolveSocketPath;
+const resolveLogDir = @import("paths.zig").resolveLogDir;
+const ensureOwnedDir = @import("paths.zig").ensureOwnedDir;
+
+const encodeHex = @import("hex.zig").encodeHex;
+const decodeHex = @import("hex.zig").decodeHex;
+
+const generateUuidV7 = @import("uuid.zig").generateUuidV7;
+const shortestUniquePrefixLen = @import("uuid.zig").shortestUniquePrefixLen;
+
+const readOptionalId = @import("json_helpers.zig").readOptionalId;
+const readRequiredString = @import("json_helpers.zig").readRequiredString;
+const readOptionalString = @import("json_helpers.zig").readOptionalString;
+const readOptionalBool = @import("json_helpers.zig").readOptionalBool;
+const readOptionalU64 = @import("json_helpers.zig").readOptionalU64;
+const readOptionalUsize = @import("json_helpers.zig").readOptionalUsize;
+const readRequiredU16 = @import("json_helpers.zig").readRequiredU16;
+const readOptionalU16 = @import("json_helpers.zig").readOptionalU16;
+const readStringArray = @import("json_helpers.zig").readStringArray;
+const readEnvArray = @import("json_helpers.zig").readEnvArray;
+const getString = @import("json_helpers.zig").getString;
+const getInteger = @import("json_helpers.zig").getInteger;
+
+const keyToBytes = @import("keys.zig").keyToBytes;
+
+const help_text = @import("help_text.zig");
+const helpForTopic = help_text.helpForTopic;
+const generalHelpText = help_text.generalHelpText;
+const supportedKeysText = help_text.supportedKeysText;
+
+// Force Zig's test discovery to walk the extracted modules even when the root
+// file only references specific decls from them.
+comptime {
+    _ = @import("help_text.zig");
+    _ = @import("keys.zig");
+    _ = @import("uuid.zig");
+}
+
 const c = @cImport({
     @cInclude("poll.h");
     @cInclude("unistd.h");
@@ -46,111 +84,6 @@ const ExitCode = struct {
     const name_exists: u8 = 5;
 };
 
-// ============================================================================
-// XDG paths: socket in $XDG_RUNTIME_DIR/hty, logs in $XDG_STATE_HOME/hty/logs
-// ============================================================================
-
-fn resolveSocketPath(alloc: Allocator) ![]u8 {
-    // Explicit override wins — used for SSH-tunneled sockets, tests, or any
-    // other time you want the client to talk to a non-default socket.
-    // Does NOT ensureOwnedDir, because the override path may live in a
-    // directory the caller doesn't own (e.g. a tunnel endpoint).
-    if (std.posix.getenv("HTY_SOCKET")) |override| {
-        if (override.len > 0) return alloc.dupe(u8, override);
-    }
-
-    const dir = try resolveRuntimeDir(alloc);
-    defer alloc.free(dir);
-    try ensureOwnedDir(alloc, dir);
-    return std.fmt.allocPrint(alloc, "{s}/sock", .{dir});
-}
-
-fn resolveRuntimeDir(alloc: Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |runtime| {
-        if (runtime.len > 0) {
-            return std.fmt.allocPrint(alloc, "{s}/hty", .{runtime});
-        }
-    }
-    // No XDG_RUNTIME_DIR (typical on macOS). Fall back to ~/.local/state/hty
-    // alongside the log directory — keeps everything in one place and avoids
-    // world-listable /tmp.
-    if (std.posix.getenv("XDG_STATE_HOME")) |state| {
-        if (state.len > 0) {
-            return std.fmt.allocPrint(alloc, "{s}/hty", .{state});
-        }
-    }
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
-    return std.fmt.allocPrint(alloc, "{s}/.local/state/hty", .{home});
-}
-
-fn resolveLogDir(alloc: Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_STATE_HOME")) |state| {
-        if (state.len > 0) {
-            const dir = try std.fmt.allocPrint(alloc, "{s}/hty/logs", .{state});
-            errdefer alloc.free(dir);
-            try ensureOwnedDir(alloc, dir);
-            return dir;
-        }
-    }
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
-    const dir = try std.fmt.allocPrint(alloc, "{s}/.local/state/hty/logs", .{home});
-    errdefer alloc.free(dir);
-    try ensureOwnedDir(alloc, dir);
-    return dir;
-}
-
-/// Ensure `path` exists as a directory owned by the current user with mode 0700.
-/// Recursively creates missing parents. Bails out if the resulting directory is
-/// owned by a different uid (symlink-attack defense).
-fn ensureOwnedDir(alloc: Allocator, path: []const u8) !void {
-    std.fs.cwd().makePath(path) catch |err| return err;
-
-    const path_z = try alloc.dupeZ(u8, path);
-    defer alloc.free(path_z);
-
-    var st: c.struct_stat = undefined;
-    if (c.stat(path_z.ptr, &st) != 0) return error.CannotStatDir;
-    const uid = c.getuid();
-    if (st.st_uid != uid) return error.DirectoryStolen;
-    _ = c.chmod(path_z.ptr, 0o700);
-}
-
-// ============================================================================
-// UUID v7 generation + prefix resolution
-// ============================================================================
-
-/// Generate a UUIDv7 into `out` as a 36-char hex-with-dashes string.
-/// Layout: 48 bits unix-ms timestamp | 4 bits version=7 | 12 bits rand |
-///         2 bits variant=10 | 62 bits rand.
-fn generateUuidV7(out: *[36]u8) void {
-    var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
-
-    const ms: u64 = @intCast(std.time.milliTimestamp());
-    bytes[0] = @intCast((ms >> 40) & 0xff);
-    bytes[1] = @intCast((ms >> 32) & 0xff);
-    bytes[2] = @intCast((ms >> 24) & 0xff);
-    bytes[3] = @intCast((ms >> 16) & 0xff);
-    bytes[4] = @intCast((ms >> 8) & 0xff);
-    bytes[5] = @intCast(ms & 0xff);
-
-    // Version 7 in the high nibble of byte 6
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    // Variant 10 in the top 2 bits of byte 8
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-    const hex = "0123456789abcdef";
-    var idx: usize = 0;
-    for (bytes, 0..) |b, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            out[idx] = '-';
-            idx += 1;
-        }
-        out[idx] = hex[b >> 4];
-        out[idx + 1] = hex[b & 0x0f];
-        idx += 2;
-    }
-}
 
 // ============================================================================
 // Session + SessionRegistry
@@ -2046,27 +1979,6 @@ fn parseLogFileForListing(arena: Allocator, stem: []const u8, bytes: []const u8)
     };
 }
 
-/// Return the smallest prefix length at which every string in `ids` is unique,
-/// clamped to [min_len, 36]. Used to size the ID column in `hty list` so that
-/// UUIDv7 collisions within the same millisecond grow the display instead of
-/// showing visually-duplicate rows.
-fn shortestUniquePrefixLen(ids: []const []const u8, min_len: usize) usize {
-    var len = min_len;
-    while (len <= 36) : (len += 1) {
-        var collision = false;
-        for (ids, 0..) |a, i| {
-            for (ids[i + 1 ..]) |b| {
-                if (a.len >= len and b.len >= len and std.mem.eql(u8, a[0..len], b[0..len])) {
-                    collision = true;
-                    break;
-                }
-            }
-            if (collision) break;
-        }
-        if (!collision) return len;
-    }
-    return 36;
-}
 
 fn formatAge(alloc: Allocator, age_ms: i64) ![]u8 {
     if (age_ms < 1000) return alloc.dupe(u8, "just now");
@@ -2078,14 +1990,6 @@ fn formatAge(alloc: Allocator, age_ms: i64) ![]u8 {
     if (hours < 24) return std.fmt.allocPrint(alloc, "{d}h ago", .{hours});
     const days = @divFloor(hours, 24);
     return std.fmt.allocPrint(alloc, "{d}d ago", .{days});
-}
-
-fn getString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .string => |s| s,
-        else => null,
-    };
 }
 
 fn runClientKill(alloc: Allocator, args: []const []const u8) !void {
@@ -3756,14 +3660,6 @@ fn quoteForDisplay(alloc: Allocator, bytes: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-fn getInteger(obj: std.json.ObjectMap, key: []const u8) ?i64 {
-    const v = obj.get(key) orelse return null;
-    return switch (v) {
-        .integer => |i| i,
-        else => null,
-    };
-}
-
 fn lastTimestampInJsonl(bytes: []const u8) ?i64 {
     // Walk backwards to find the last non-empty line, parse its `t`.
     var end = bytes.len;
@@ -3910,139 +3806,6 @@ fn requestErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-// ============================================================================
-// JSON field helpers (kept from pre-refactor)
-// ============================================================================
-
-fn readOptionalId(object: std.json.ObjectMap) ?i64 {
-    const value = object.get("id") orelse return null;
-    return switch (value) {
-        .integer => |integer| integer,
-        else => null,
-    };
-}
-
-fn readRequiredString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
-    const value = object.get(key) orelse return error.MissingField;
-    return switch (value) {
-        .string => |string| string,
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readOptionalString(object: std.json.ObjectMap, key: []const u8) !?[]const u8 {
-    const value = object.get(key) orelse return null;
-    return switch (value) {
-        .null => null,
-        .string => |string| string,
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readOptionalBool(object: std.json.ObjectMap, key: []const u8, default: bool) !bool {
-    const value = object.get(key) orelse return default;
-    return switch (value) {
-        .bool => |boolean| boolean,
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readOptionalU64(object: std.json.ObjectMap, key: []const u8, default: u64) !u64 {
-    const value = object.get(key) orelse return default;
-    return switch (value) {
-        .integer => |integer| {
-            if (integer < 0) return error.InvalidFieldValue;
-            return @intCast(integer);
-        },
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readOptionalUsize(object: std.json.ObjectMap, key: []const u8, default: usize) !usize {
-    const value = object.get(key) orelse return default;
-    return switch (value) {
-        .integer => |integer| {
-            if (integer < 0) return error.InvalidFieldValue;
-            return @intCast(integer);
-        },
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readRequiredU16(object: std.json.ObjectMap, key: []const u8) !u16 {
-    const value = object.get(key) orelse return error.MissingField;
-    return toU16(value);
-}
-
-fn readOptionalU16(object: std.json.ObjectMap, key: []const u8, default: u16) !u16 {
-    const value = object.get(key) orelse return default;
-    return toU16(value);
-}
-
-fn toU16(value: std.json.Value) !u16 {
-    return switch (value) {
-        .integer => |integer| {
-            if (integer < 0 or integer > std.math.maxInt(u16)) return error.InvalidFieldValue;
-            return @intCast(integer);
-        },
-        else => error.InvalidFieldType,
-    };
-}
-
-fn readStringArray(arena: Allocator, object: std.json.ObjectMap, key: []const u8) ![]const []const u8 {
-    const value = object.get(key) orelse return &.{};
-    const array = switch (value) {
-        .array => |array| array,
-        else => return error.InvalidFieldType,
-    };
-
-    const items = try arena.alloc([]const u8, array.items.len);
-    for (array.items, 0..) |item, index| {
-        items[index] = switch (item) {
-            .string => |string| string,
-            else => return error.InvalidFieldType,
-        };
-    }
-    return items;
-}
-
-fn readEnvArray(arena: Allocator, object: std.json.ObjectMap, key: []const u8) ![]const hty.EnvVar {
-    const value = object.get(key) orelse return &.{};
-
-    return switch (value) {
-        .object => |env_object| blk: {
-            const items = try arena.alloc(hty.EnvVar, env_object.count());
-            var iterator = env_object.iterator();
-            var index: usize = 0;
-            while (iterator.next()) |entry| : (index += 1) {
-                items[index] = .{
-                    .key = entry.key_ptr.*,
-                    .value = switch (entry.value_ptr.*) {
-                        .string => |string| string,
-                        else => return error.InvalidFieldType,
-                    },
-                };
-            }
-            break :blk items;
-        },
-        .array => |env_array| blk: {
-            const items = try arena.alloc(hty.EnvVar, env_array.items.len);
-            for (env_array.items, 0..) |item, index| {
-                const env_object = switch (item) {
-                    .object => |env_object| env_object,
-                    else => return error.InvalidFieldType,
-                };
-                items[index] = .{
-                    .key = try readRequiredString(env_object, "key"),
-                    .value = try readRequiredString(env_object, "value"),
-                };
-            }
-            break :blk items;
-        },
-        else => error.InvalidFieldType,
-    };
-}
-
 fn eventToPayload(arena: Allocator, event: hty.OutputEvent) !EventPayload {
     return switch (event) {
         .started => .{ .kind = "started" },
@@ -4061,285 +3824,6 @@ fn eventToPayload(arena: Allocator, event: hty.OutputEvent) !EventPayload {
             .kind = "raw_bytes",
             .bytes_hex = try encodeHex(arena, bytes),
         },
-    };
-}
-
-const Modifiers = struct {
-    ctrl: bool = false,
-    alt: bool = false,
-    shift: bool = false,
-
-    fn param(self: Modifiers) u8 {
-        var bits: u8 = 0;
-        if (self.shift) bits |= 1;
-        if (self.alt) bits |= 2;
-        if (self.ctrl) bits |= 4;
-        return bits + 1;
-    }
-
-    fn any(self: Modifiers) bool {
-        return self.ctrl or self.alt or self.shift;
-    }
-};
-
-const BaseKeyKind = enum { arrow, tilde, function_ss3, function_tilde, simple, printable };
-
-const BaseKey = struct {
-    kind: BaseKeyKind,
-    // For arrow: the final letter (A/B/C/D/H/F).
-    // For tilde/function_tilde: the numeric code.
-    // For function_ss3: the final letter (P/Q/R/S).
-    // For simple: the byte value.
-    // For printable: the character.
-    code: u8,
-};
-
-fn parseModifiers(input: []const u8) !struct { mods: Modifiers, rest: []const u8 } {
-    var mods: Modifiers = .{};
-    var remaining = input;
-
-    while (remaining.len > 0) {
-        const prefix_result = matchModifierPrefix(remaining);
-        if (prefix_result.kind == .none) break;
-
-        switch (prefix_result.kind) {
-            .ctrl => {
-                if (mods.ctrl) return error.InvalidKey;
-                mods.ctrl = true;
-            },
-            .alt => {
-                if (mods.alt) return error.InvalidKey;
-                mods.alt = true;
-            },
-            .shift => {
-                if (mods.shift) return error.InvalidKey;
-                mods.shift = true;
-            },
-            .none => unreachable,
-        }
-        remaining = remaining[prefix_result.len..];
-    }
-
-    return .{ .mods = mods, .rest = remaining };
-}
-
-const ModifierKind = enum { ctrl, alt, shift, none };
-
-fn matchModifierPrefix(input: []const u8) struct { kind: ModifierKind, len: usize } {
-    const prefixes = [_]struct { text: []const u8, kind: ModifierKind }{
-        .{ .text = "ctrl-", .kind = .ctrl },
-        .{ .text = "ctrl+", .kind = .ctrl },
-        .{ .text = "c-", .kind = .ctrl },
-        .{ .text = "alt-", .kind = .alt },
-        .{ .text = "meta-", .kind = .alt },
-        .{ .text = "m-", .kind = .alt },
-        .{ .text = "shift-", .kind = .shift },
-        .{ .text = "s-", .kind = .shift },
-    };
-
-    for (prefixes) |p| {
-        if (startsWithIgnoreCase(input, p.text)) {
-            // Disambiguate: if the remainder after this prefix is empty, this
-            // isn't a modifier — it's the base key (e.g. "s-" with nothing
-            // after is invalid, but we shouldn't match "s" as shift prefix
-            // when input is exactly "s-"). However, "s-" alone would leave
-            // an empty remainder which resolveBaseKey will reject. The real
-            // ambiguity is single-char prefixes like "c-" or "m-" or "s-"
-            // where the hyphen could be part of a longer base key name.
-            // Since we check longest prefixes first (ctrl- before c-), and
-            // the parser always tries the longest match, this is fine.
-            return .{ .kind = p.kind, .len = p.text.len };
-        }
-    }
-    return .{ .kind = .none, .len = 0 };
-}
-
-fn resolveBaseKey(name: []const u8) ?BaseKey {
-    // Arrow keys
-    if (std.ascii.eqlIgnoreCase(name, "up")) return .{ .kind = .arrow, .code = 'A' };
-    if (std.ascii.eqlIgnoreCase(name, "down")) return .{ .kind = .arrow, .code = 'B' };
-    if (std.ascii.eqlIgnoreCase(name, "right")) return .{ .kind = .arrow, .code = 'C' };
-    if (std.ascii.eqlIgnoreCase(name, "left")) return .{ .kind = .arrow, .code = 'D' };
-    if (std.ascii.eqlIgnoreCase(name, "home")) return .{ .kind = .arrow, .code = 'H' };
-    if (std.ascii.eqlIgnoreCase(name, "end")) return .{ .kind = .arrow, .code = 'F' };
-
-    // Tilde keys
-    if (std.ascii.eqlIgnoreCase(name, "insert")) return .{ .kind = .tilde, .code = 2 };
-    if (std.ascii.eqlIgnoreCase(name, "delete")) return .{ .kind = .tilde, .code = 3 };
-    if (std.ascii.eqlIgnoreCase(name, "pageup")) return .{ .kind = .tilde, .code = 5 };
-    if (std.ascii.eqlIgnoreCase(name, "pagedown")) return .{ .kind = .tilde, .code = 6 };
-
-    // Simple keys
-    if (std.ascii.eqlIgnoreCase(name, "enter") or std.ascii.eqlIgnoreCase(name, "return")) return .{ .kind = .simple, .code = '\r' };
-    if (std.ascii.eqlIgnoreCase(name, "tab")) return .{ .kind = .simple, .code = '\t' };
-    if (std.ascii.eqlIgnoreCase(name, "esc") or std.ascii.eqlIgnoreCase(name, "escape")) return .{ .kind = .simple, .code = '\x1b' };
-    if (std.ascii.eqlIgnoreCase(name, "space")) return .{ .kind = .simple, .code = ' ' };
-    if (std.ascii.eqlIgnoreCase(name, "backspace")) return .{ .kind = .simple, .code = '\x7f' };
-
-    // Function keys F1-F4 (SS3 encoding)
-    if (std.ascii.eqlIgnoreCase(name, "f1")) return .{ .kind = .function_ss3, .code = 'P' };
-    if (std.ascii.eqlIgnoreCase(name, "f2")) return .{ .kind = .function_ss3, .code = 'Q' };
-    if (std.ascii.eqlIgnoreCase(name, "f3")) return .{ .kind = .function_ss3, .code = 'R' };
-    if (std.ascii.eqlIgnoreCase(name, "f4")) return .{ .kind = .function_ss3, .code = 'S' };
-
-    // Function keys F5-F12 (tilde encoding)
-    if (std.ascii.eqlIgnoreCase(name, "f5")) return .{ .kind = .function_tilde, .code = 15 };
-    if (std.ascii.eqlIgnoreCase(name, "f6")) return .{ .kind = .function_tilde, .code = 17 };
-    if (std.ascii.eqlIgnoreCase(name, "f7")) return .{ .kind = .function_tilde, .code = 18 };
-    if (std.ascii.eqlIgnoreCase(name, "f8")) return .{ .kind = .function_tilde, .code = 19 };
-    if (std.ascii.eqlIgnoreCase(name, "f9")) return .{ .kind = .function_tilde, .code = 20 };
-    if (std.ascii.eqlIgnoreCase(name, "f10")) return .{ .kind = .function_tilde, .code = 21 };
-    if (std.ascii.eqlIgnoreCase(name, "f11")) return .{ .kind = .function_tilde, .code = 23 };
-    if (std.ascii.eqlIgnoreCase(name, "f12")) return .{ .kind = .function_tilde, .code = 24 };
-
-    // Single printable character
-    if (name.len == 1) return .{ .kind = .printable, .code = name[0] };
-
-    return null;
-}
-
-fn keyToBytes(arena: Allocator, key: []const u8) ![]const u8 {
-    const parsed = try parseModifiers(key);
-    const mods = parsed.mods;
-    const base = resolveBaseKey(parsed.rest) orelse return error.InvalidKey;
-    const param = mods.param();
-
-    switch (base.kind) {
-        .printable => {
-            const char = std.ascii.toLower(base.code);
-
-            if (mods.shift) {
-                // shift on a printable char is meaningless — just type the uppercase letter
-                return error.InvalidKey;
-            }
-
-            if (mods.ctrl and mods.alt) {
-                // ESC + ctrl-char
-                const bytes = try arena.alloc(u8, 2);
-                bytes[0] = '\x1b';
-                if (std.ascii.isAlphanumeric(char) or char == '[' or char == '\\' or char == ']' or char == '^' or char == '_') {
-                    bytes[1] = char & 0x1f;
-                } else {
-                    return error.InvalidKey;
-                }
-                return bytes;
-            }
-
-            if (mods.ctrl) {
-                if (!std.ascii.isAlphanumeric(char) and char != '[' and char != '\\' and char != ']' and char != '^' and char != '_') {
-                    return error.InvalidKey;
-                }
-                const bytes = try arena.alloc(u8, 1);
-                bytes[0] = char & 0x1f;
-                return bytes;
-            }
-
-            if (mods.alt) {
-                // ESC + char (preserve original case)
-                const bytes = try arena.alloc(u8, 2);
-                bytes[0] = '\x1b';
-                bytes[1] = base.code;
-                return bytes;
-            }
-
-            // No modifiers — return the character as-is
-            const bytes = try arena.alloc(u8, 1);
-            bytes[0] = base.code;
-            return bytes;
-        },
-
-        .simple => {
-            // Special case: shift-tab = backtab
-            if (base.code == '\t' and mods.shift and !mods.ctrl and !mods.alt) {
-                return "\x1b[Z";
-            }
-
-            if (!mods.any()) return try arena.dupe(u8, &[_]u8{base.code});
-
-            // For other simple keys with modifiers, only alt makes sense
-            // (e.g. alt-enter = ESC + \r, alt-space = ESC + space)
-            if (mods.alt and !mods.ctrl and !mods.shift) {
-                const bytes = try arena.alloc(u8, 2);
-                bytes[0] = '\x1b';
-                bytes[1] = base.code;
-                return bytes;
-            }
-
-            // Other modifier combos on simple keys aren't standard
-            return error.InvalidKey;
-        },
-
-        .arrow => {
-            if (!mods.any()) {
-                // \x1b[A
-                return try std.fmt.allocPrint(arena, "\x1b[{c}", .{base.code});
-            }
-            // \x1b[1;{param}{letter}
-            return try std.fmt.allocPrint(arena, "\x1b[1;{d}{c}", .{ param, base.code });
-        },
-
-        .tilde => {
-            if (!mods.any()) {
-                // \x1b[{code}~
-                return try std.fmt.allocPrint(arena, "\x1b[{d}~", .{base.code});
-            }
-            // \x1b[{code};{param}~
-            return try std.fmt.allocPrint(arena, "\x1b[{d};{d}~", .{ base.code, param });
-        },
-
-        .function_ss3 => {
-            if (!mods.any()) {
-                // \x1bO{letter}
-                return try std.fmt.allocPrint(arena, "\x1bO{c}", .{base.code});
-            }
-            // With modifiers: \x1b[1;{param}{letter}
-            return try std.fmt.allocPrint(arena, "\x1b[1;{d}{c}", .{ param, base.code });
-        },
-
-        .function_tilde => {
-            if (!mods.any()) {
-                // \x1b[{code}~
-                return try std.fmt.allocPrint(arena, "\x1b[{d}~", .{base.code});
-            }
-            // \x1b[{code};{param}~
-            return try std.fmt.allocPrint(arena, "\x1b[{d};{d}~", .{ base.code, param });
-        },
-    }
-}
-
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
-}
-
-fn encodeHex(arena: Allocator, bytes: []const u8) ![]const u8 {
-    const out = try arena.alloc(u8, bytes.len * 2);
-    const chars = "0123456789abcdef";
-    for (bytes, 0..) |byte, index| {
-        out[index * 2] = chars[byte >> 4];
-        out[index * 2 + 1] = chars[byte & 0x0f];
-    }
-    return out;
-}
-
-fn decodeHex(arena: Allocator, text: []const u8) ![]const u8 {
-    if (text.len % 2 != 0) return error.InvalidHex;
-
-    const bytes = try arena.alloc(u8, text.len / 2);
-    for (bytes, 0..) |*byte, index| {
-        const hi = try fromHexNibble(text[index * 2]);
-        const lo = try fromHexNibble(text[index * 2 + 1]);
-        byte.* = (hi << 4) | lo;
-    }
-    return bytes;
-}
-
-fn fromHexNibble(ch: u8) !u8 {
-    return switch (ch) {
-        '0'...'9' => ch - '0',
-        'a'...'f' => ch - 'a' + 10,
-        'A'...'F' => ch - 'A' + 10,
-        else => error.InvalidHex,
     };
 }
 
@@ -4414,318 +3898,7 @@ fn writeUsageError(arg: []const u8) !void {
     _ = try stderr.writeAll(message);
 }
 
-fn helpForTopic(topic: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, topic, "run")) return runHelpText();
-    if (std.mem.eql(u8, topic, "list")) return listHelpText();
-    if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
-    if (std.mem.eql(u8, topic, "send")) return sendHelpText();
-    if (std.mem.eql(u8, topic, "snapshot")) return snapshotHelpText();
-    if (std.mem.eql(u8, topic, "wait")) return waitHelpText();
-    if (std.mem.eql(u8, topic, "kill")) return killHelpText();
-    if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
-    if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
-    if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
-    if (std.mem.eql(u8, topic, "attach")) return attachHelpText();
-    if (std.mem.eql(u8, topic, "keys")) return supportedKeysText();
-    if (std.mem.eql(u8, topic, "info")) return infoHelpText();
-    return null;
-}
 
-fn generalHelpText() []const u8 {
-    return
-    \\Usage:
-    \\  hty <command> [args...]
-    \\
-    \\Commands:
-    \\  run       Start a new detached session in a fresh PTY
-    \\  list      List running sessions
-    \\  watch     Observe a session's rendered screen in real time (read-only)
-    \\  send      Send text, a named key, or raw hex bytes to a session
-    \\  snapshot  Read the current rendered screen of a session
-    \\  wait      Block until the session matches a condition (text/idle/exit)
-    \\  kill      Terminate a session's process (the record stays for replay)
-    \\  delete    Permanently remove a session record and its log file
-    \\  logs      Show the event log for a session (works after it has exited)
-    \\  replay    Replay a recorded session by feeding its logged output back
-    \\            through a fresh in-memory VT engine. No side effects.
-    \\  attach    Interactively attach to a running session (bidirectional)
-    \\  keys      Print supported symbolic key names for `hty send --key`
-    \\  info      Show resolved paths and server status
-    \\  help      Print help. Pass a subcommand for details.
-    \\
-    \\Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
-    \\human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
-    \\If only one session is running, the session argument can be omitted.
-    \\
-    \\Examples:
-    \\  hty run --name debug-vim -- vim /tmp/foo.txt
-    \\  hty list
-    \\  hty watch debug-vim
-    \\  hty send debug-vim --text "ihello"
-    \\  hty send debug-vim --key esc
-    \\  hty wait debug-vim --idle 300 --timeout 2000
-    \\  hty kill debug-vim
-    \\
-    ;
-}
-
-fn runHelpText() []const u8 {
-    return
-    \\hty run [--name NAME] [--rows N] [--cols N] [--cwd PATH] [--scrollback N] -- program [args...]
-    \\
-    \\Create a new session and start `program` inside a fresh PTY. The session
-    \\is detached from your terminal; observe it with `hty watch` and drive it
-    \\with `hty send`/`hty snapshot`/`hty wait`.
-    \\
-    \\Flags:
-    \\  --name NAME       Human-friendly alias for the session. Must be unique.
-    \\  --rows N          Initial row count (default 24)
-    \\  --cols N          Initial column count (default 80)
-    \\  --cwd PATH        Child's working directory
-    \\  --scrollback N    Scrollback buffer size (default 10000)
-    \\
-    \\`-d` / `--detach` is accepted as a no-op — every `hty run` session is
-    \\detached by default. Use `hty attach` for an interactive view.
-    \\
-    \\Example:
-    \\  hty run --name debug-vim -- vim /tmp/foo.txt
-    \\
-    ;
-}
-
-fn listHelpText() []const u8 {
-    return
-    \\hty list [--json]
-    \\
-    \\List currently running sessions. Empty output if none.
-    \\
-    \\Flags:
-    \\  --json   Emit the full structured response as JSON.
-    \\
-    ;
-}
-
-fn watchHelpText() []const u8 {
-    return
-    \\hty watch [SESSION]
-    \\
-    \\Attach to a session read-only and paint its rendered screen live to
-    \\your terminal. Ctrl-C or Ctrl-Q to detach.
-    \\
-    \\SESSION may be a UUID prefix or the session's --name. If omitted and
-    \\exactly one session is running, that one is used.
-    \\
-    ;
-}
-
-fn sendHelpText() []const u8 {
-    return
-    \\hty send [SESSION] --text "..." | --key NAME | --seq "..." | --bytes-hex HEX
-    \\
-    \\Send input to a session. Exactly one of --text, --key, --seq,
-    \\--bytes-hex is required.
-    \\
-    \\Flags:
-    \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
-    \\  --key NAME           Named key with optional modifiers.
-    \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
-    \\                       function keys (f1-f12), and combinations like
-    \\                       ctrl-alt-f or shift-up. Run `hty keys` for details.
-    \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
-    \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
-    \\                       are pauses, and bare words are key names.
-    \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
-    \\  --bytes-hex HEX      Raw bytes encoded as hex.
-    \\
-    \\Delay flags (optional, combine with any mode above):
-    \\  --delay-before DUR   Sleep before sending (e.g. 200ms, 1s).
-    \\  --delay-after DUR    Sleep after sending.
-    \\  --delay-char DUR     Send text character-by-character with a delay
-    \\                       between each. Only works with --text or --seq.
-    \\
-    ;
-}
-
-fn snapshotHelpText() []const u8 {
-    return
-    \\hty snapshot [SESSION] [--ansi] [--json]
-    \\
-    \\Read the session's current rendered screen. Default output is plain
-    \\text. Use --ansi to get the styled ANSI rendering, --json for the full
-    \\structured response.
-    \\
-    ;
-}
-
-fn waitHelpText() []const u8 {
-    return
-    \\hty wait [SESSION] --text "..." | --regex "..." | --idle MS | --exit [--timeout MS]
-    \\
-    \\Block until the session matches a condition. Exactly one mode flag is
-    \\required. Exit 0 on match, 3 on timeout.
-    \\
-    \\Modes:
-    \\  --text STRING    Wait until the rendered screen contains STRING.
-    \\  --regex PATTERN  Wait until the rendered screen matches PATTERN
-    \\                   (POSIX extended regex).
-    \\  --idle MS        Wait until the screen has been unchanged for MS
-    \\                   milliseconds.
-    \\  --exit           Wait until the child process exits.
-    \\
-    \\  --timeout MS     Max time to wait in milliseconds (default 10000).
-    \\
-    ;
-}
-
-fn killHelpText() []const u8 {
-    return
-    \\hty kill [SESSION]
-    \\
-    \\Terminate a session's underlying process. The session RECORD stays in
-    \\place (same id, same name) so `hty list`, `hty logs` and `hty replay`
-    \\keep working on it — use `hty delete` to free the name and remove the
-    \\log file permanently.
-    \\
-    \\If SESSION is omitted and exactly one session is running, that one
-    \\is killed.
-    \\
-    ;
-}
-
-fn deleteHelpText() []const u8 {
-    return
-    \\hty delete [SESSION]
-    \\
-    \\Permanently remove a session. If the child process is still running
-    \\it's terminated first; the session's log file and by-name symlink
-    \\are then unlinked from disk. After delete, the session's name is
-    \\free to reuse.
-    \\
-    \\If SESSION is omitted and exactly one session is live, that one
-    \\is deleted.
-    \\
-    ;
-}
-
-fn attachHelpText() []const u8 {
-    return
-    \\hty attach [SESSION]
-    \\
-    \\Interactively attach to a running session. Your terminal's keystrokes
-    \\are forwarded into the PTY and the session's rendered output streams
-    \\back — the same session an agent is driving can be taken over by a
-    \\human (or multiple humans) at any time.
-    \\
-    \\Detach keybinds (tmux-style, Ctrl-A is the prefix):
-    \\  Ctrl-A d      Detach cleanly.
-    \\  Ctrl-A Ctrl-A Send a literal Ctrl-A to the session.
-    \\
-    \\The observer's terminal size is sent on attach and on SIGWINCH, so
-    \\the child program sees the right LINES/COLUMNS.
-    \\
-    \\Multiple clients can attach to the same session simultaneously —
-    \\writes are atomic per input frame, reads are broadcast to everyone.
-    \\
-    ;
-}
-
-fn replayHelpText() []const u8 {
-    return
-    \\hty replay [SESSION] [--speed Nx] [--at T] [--to T] [--loop]
-    \\
-    \\Replay a session by reading its log file and feeding the recorded
-    \\output bytes back through a fresh in-memory VT engine. The program
-    \\is NOT re-executed and no input is re-sent — replay is a pure
-    \\visualization with zero side effects.
-    \\
-    \\Flags:
-    \\  --speed Nx   Playback speed multiplier (default 1x). 0 = no sleep.
-    \\  --at T       Fast-forward silently to T into the session before
-    \\               painting (same duration syntax as --since).
-    \\  --to T       Stop painting once the timeline reaches T.
-    \\  --loop       Restart playback from the beginning when the log ends.
-    \\
-    \\Press Ctrl-C or Ctrl-Q to exit.
-    \\
-    ;
-}
-
-fn logsHelpText() []const u8 {
-    return
-    \\hty logs [SESSION] [--follow|-f] [--since DURATION] [--json]
-    \\
-    \\Print the JSONL event log for a session. Logs are read directly from
-    \\disk, so this works for sessions that have already exited and even
-    \\across server restarts.
-    \\
-    \\SESSION may be a --name, a full UUID, or any unambiguous prefix. If
-    \\omitted and exactly one log file exists, that one is used.
-    \\
-    \\Flags:
-    \\  --follow, -f     Tail the log as new events arrive.
-    \\  --since DURATION Only show events within the last DURATION of logged
-    \\                   activity. Accepts: 500ms, 5s, 1m, 2h, or a bare
-    \\                   integer (seconds).
-    \\  --json           Emit raw JSONL lines (one per event) instead of the
-    \\                   human-readable table.
-    \\
-    \\Logs live at \$XDG_STATE_HOME/hty/logs (fallback ~/.local/state/hty/logs).
-    \\
-    ;
-}
-
-fn infoHelpText() []const u8 {
-    return
-    \\hty info
-    \\
-    \\Show resolved paths and server status. Useful for finding the socket
-    \\path when setting up SSH tunnels for remote observation.
-    \\
-    \\Output includes:
-    \\  socket    Path to the Unix domain socket
-    \\  logs      Directory where session logs are stored
-    \\  server    Whether the server is currently running
-    \\
-    \\Environment variables that affect paths ($HTY_SOCKET, $XDG_RUNTIME_DIR,
-    \\$XDG_STATE_HOME) are shown if set.
-    \\
-    ;
-}
-
-fn supportedKeysText() []const u8 {
-    return
-    \\Supported send_key names
-    \\
-    \\Navigation:
-    \\  up, down, left, right, home, end, pageup, pagedown, insert, delete
-    \\
-    \\Editing and control:
-    \\  enter, return, tab, esc, escape, space, backspace
-    \\
-    \\Function keys:
-    \\  f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12
-    \\
-    \\Modifier prefixes (combinable, any order):
-    \\  ctrl- (or c-)        Ctrl modifier
-    \\  alt- (or meta-, m-)  Alt/Meta modifier
-    \\  shift- (or s-)       Shift modifier
-    \\
-    \\Single printable characters are also accepted directly:
-    \\  "i", ":", "/", "q"
-    \\
-    \\Examples:
-    \\  ctrl-x            Ctrl+X
-    \\  c-a               Ctrl+A (short form)
-    \\  alt-f             Alt+F (Meta+F in emacs)
-    \\  shift-tab         Backtab
-    \\  shift-up          Shift+Up arrow
-    \\  ctrl-alt-f        Ctrl+Alt+F
-    \\  ctrl-shift-end    Ctrl+Shift+End
-    \\  f5                Function key F5
-    \\  alt-f3            Alt+F3
-    \\
-    ;
-}
 
 // ============================================================================
 // Entry point
@@ -4786,111 +3959,6 @@ pub fn main() !void {
 // ============================================================================
 // Tests
 // ============================================================================
-
-test "key encoding covers arrows and control chords" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Existing behavior (regression)
-    try std.testing.expectEqualStrings("\x1b[B", try keyToBytes(arena, "down"));
-    try std.testing.expectEqualStrings("\x1b[A", try keyToBytes(arena, "up"));
-    try std.testing.expectEqualStrings("\r", try keyToBytes(arena, "enter"));
-    try std.testing.expectEqualStrings("\r", try keyToBytes(arena, "return"));
-    try std.testing.expectEqualStrings("\t", try keyToBytes(arena, "tab"));
-    try std.testing.expectEqualStrings("\x1b", try keyToBytes(arena, "esc"));
-    try std.testing.expectEqualStrings(" ", try keyToBytes(arena, "space"));
-    try std.testing.expectEqualStrings("\x7f", try keyToBytes(arena, "backspace"));
-    try std.testing.expectEqualStrings("\x1b[H", try keyToBytes(arena, "home"));
-    try std.testing.expectEqualStrings("\x1b[F", try keyToBytes(arena, "end"));
-    try std.testing.expectEqualStrings("\x1b[5~", try keyToBytes(arena, "pageup"));
-    try std.testing.expectEqualStrings("\x1b[6~", try keyToBytes(arena, "pagedown"));
-    try std.testing.expectEqualStrings("\x1b[2~", try keyToBytes(arena, "insert"));
-    try std.testing.expectEqualStrings("\x1b[3~", try keyToBytes(arena, "delete"));
-    try std.testing.expectEqualStrings("\x18", try keyToBytes(arena, "ctrl-x"));
-    try std.testing.expectEqualStrings("\x01", try keyToBytes(arena, "c-a"));
-    try std.testing.expectEqualStrings("i", try keyToBytes(arena, "i"));
-}
-
-test "key encoding: function keys" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings("\x1bOP", try keyToBytes(arena, "f1"));
-    try std.testing.expectEqualStrings("\x1bOQ", try keyToBytes(arena, "f2"));
-    try std.testing.expectEqualStrings("\x1bOR", try keyToBytes(arena, "f3"));
-    try std.testing.expectEqualStrings("\x1bOS", try keyToBytes(arena, "f4"));
-    try std.testing.expectEqualStrings("\x1b[15~", try keyToBytes(arena, "f5"));
-    try std.testing.expectEqualStrings("\x1b[17~", try keyToBytes(arena, "f6"));
-    try std.testing.expectEqualStrings("\x1b[18~", try keyToBytes(arena, "f7"));
-    try std.testing.expectEqualStrings("\x1b[19~", try keyToBytes(arena, "f8"));
-    try std.testing.expectEqualStrings("\x1b[20~", try keyToBytes(arena, "f9"));
-    try std.testing.expectEqualStrings("\x1b[21~", try keyToBytes(arena, "f10"));
-    try std.testing.expectEqualStrings("\x1b[23~", try keyToBytes(arena, "f11"));
-    try std.testing.expectEqualStrings("\x1b[24~", try keyToBytes(arena, "f12"));
-    // Case insensitive
-    try std.testing.expectEqualStrings("\x1bOP", try keyToBytes(arena, "F1"));
-}
-
-test "key encoding: alt/meta modifier" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    try std.testing.expectEqualStrings("\x1bx", try keyToBytes(arena, "alt-x"));
-    try std.testing.expectEqualStrings("\x1bf", try keyToBytes(arena, "meta-f"));
-    try std.testing.expectEqualStrings("\x1bb", try keyToBytes(arena, "m-b"));
-    // Alt + arrow
-    try std.testing.expectEqualStrings("\x1b[1;3C", try keyToBytes(arena, "alt-right"));
-    // Alt + function key
-    try std.testing.expectEqualStrings("\x1b[1;3R", try keyToBytes(arena, "alt-f3"));
-    // Alt + tilde key
-    try std.testing.expectEqualStrings("\x1b[5;3~", try keyToBytes(arena, "alt-pageup"));
-    // Alt + enter
-    try std.testing.expectEqualStrings("\x1b\r", try keyToBytes(arena, "alt-enter"));
-}
-
-test "key encoding: shift modifier" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // Backtab
-    try std.testing.expectEqualStrings("\x1b[Z", try keyToBytes(arena, "shift-tab"));
-    try std.testing.expectEqualStrings("\x1b[Z", try keyToBytes(arena, "s-tab"));
-    // Shift + arrows
-    try std.testing.expectEqualStrings("\x1b[1;2A", try keyToBytes(arena, "shift-up"));
-    try std.testing.expectEqualStrings("\x1b[1;2D", try keyToBytes(arena, "s-left"));
-    // Shift + home/end
-    try std.testing.expectEqualStrings("\x1b[1;2H", try keyToBytes(arena, "shift-home"));
-    try std.testing.expectEqualStrings("\x1b[1;2F", try keyToBytes(arena, "shift-end"));
-    // Shift + function key
-    try std.testing.expectEqualStrings("\x1b[1;2P", try keyToBytes(arena, "shift-f1"));
-    // Shift on printable is an error
-    try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "shift-a"));
-}
-
-test "key encoding: multi-modifier combos" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    // ctrl-alt on printable: ESC + ctrl-char
-    try std.testing.expectEqualStrings("\x1b\x06", try keyToBytes(arena, "ctrl-alt-f"));
-    // ctrl-shift on arrow (param = 1 + 4 + 1 = 6)
-    try std.testing.expectEqualStrings("\x1b[1;6A", try keyToBytes(arena, "ctrl-shift-up"));
-    // alt-shift on arrow (param = 1 + 2 + 1 = 4)
-    try std.testing.expectEqualStrings("\x1b[1;4B", try keyToBytes(arena, "alt-shift-down"));
-    // ctrl-alt on arrow (param = 1 + 4 + 2 = 7)
-    try std.testing.expectEqualStrings("\x1b[1;7C", try keyToBytes(arena, "ctrl-alt-right"));
-    // All three on arrow (param = 1 + 4 + 2 + 1 = 8)
-    try std.testing.expectEqualStrings("\x1b[1;8D", try keyToBytes(arena, "ctrl-alt-shift-left"));
-    // Order shouldn't matter
-    try std.testing.expectEqualStrings("\x1b[1;7C", try keyToBytes(arena, "alt-ctrl-right"));
-    // Duplicate modifier is an error
-    try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "ctrl-ctrl-x"));
-}
 
 test "parseSeqTokens: keys only" {
     const result = try parseSeqTokens("ctrl-c ctrl-t");
@@ -5015,20 +4083,6 @@ test "unescapeText: multiple escapes in one string" {
     try std.testing.expectEqualStrings("line1\nline2\ttab\\backslash", result);
 }
 
-test "help text lists all subcommands" {
-    const general = generalHelpText();
-    try std.testing.expect(std.mem.indexOf(u8, general, "run") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "list") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "watch") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "send") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "snapshot") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "wait") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "kill") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "logs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "replay") != null);
-    try std.testing.expect(std.mem.indexOf(u8, general, "attach") != null);
-}
-
 test "detectAttachOp recognizes attach requests" {
     const alloc = std.testing.allocator;
     try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\",\"session\":\"foo\"}"));
@@ -5089,52 +4143,6 @@ test "trimSpeedSuffix strips trailing x" {
     try std.testing.expectEqualStrings("2", trimSpeedSuffix("2x"));
     try std.testing.expectEqualStrings("0.5", trimSpeedSuffix("0.5X"));
     try std.testing.expectEqualStrings("1", trimSpeedSuffix("1"));
-}
-
-test "uuidv7 is well-formed" {
-    var id: [36]u8 = undefined;
-    generateUuidV7(&id);
-
-    try std.testing.expectEqual(@as(u8, '-'), id[8]);
-    try std.testing.expectEqual(@as(u8, '-'), id[13]);
-    try std.testing.expectEqual(@as(u8, '-'), id[18]);
-    try std.testing.expectEqual(@as(u8, '-'), id[23]);
-    try std.testing.expectEqual(@as(u8, '7'), id[14]); // version
-
-    // Variant nibble (high nibble of byte 8 in string form = id[19]).
-    const variant = id[19];
-    try std.testing.expect(variant == '8' or variant == '9' or variant == 'a' or variant == 'b');
-}
-
-test "uuidv7 is unique across calls" {
-    var a: [36]u8 = undefined;
-    var b: [36]u8 = undefined;
-    generateUuidV7(&a);
-    generateUuidV7(&b);
-    try std.testing.expect(!std.mem.eql(u8, &a, &b));
-}
-
-test "shortestUniquePrefixLen grows past collisions" {
-    // All unique at 8.
-    {
-        const ids = [_][]const u8{ "aaaaaaaaxxxx", "bbbbbbbbyyyy" };
-        try std.testing.expectEqual(@as(usize, 8), shortestUniquePrefixLen(&ids, 8));
-    }
-    // Share 8 but differ at 9.
-    {
-        const ids = [_][]const u8{ "01860f08a000", "01860f08b000" };
-        try std.testing.expectEqual(@as(usize, 9), shortestUniquePrefixLen(&ids, 8));
-    }
-    // Share first 11 chars (01860f08aa0), differ at index 11.
-    {
-        const ids = [_][]const u8{ "01860f08aa01", "01860f08aa02" };
-        try std.testing.expectEqual(@as(usize, 12), shortestUniquePrefixLen(&ids, 8));
-    }
-    // Single session: min_len wins.
-    {
-        const ids = [_][]const u8{"01860f08abcdefgh"};
-        try std.testing.expectEqual(@as(usize, 8), shortestUniquePrefixLen(&ids, 8));
-    }
 }
 
 test "joinArgs handles empty, single, multi" {
