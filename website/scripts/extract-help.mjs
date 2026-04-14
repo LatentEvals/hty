@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Extract help-text strings from src/help_text.zig and write one _help.txt
+// Extract help-text strings from src/commands/*.zig and write one _help.txt
 // per command into website/app/commands/<cmd>/. The goal is to make the Zig
 // source the single source of truth for CLI synopsis + flags so the docs
 // can't drift from the binary.
@@ -7,44 +7,41 @@
 // Invoked automatically from `npm run dev` and `npm run build`. Generated
 // files are gitignored — always produced fresh from source.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { dirname, join, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const websiteRoot = join(__dirname, '..')
 const repoRoot = join(websiteRoot, '..')
-const sourcePath = join(repoRoot, 'src', 'help_text.zig')
+const commandsDir = join(repoRoot, 'src', 'commands')
 
-// Map website directory name → Zig function name.
-// Most commands use `<cmd>HelpText`; `keys` uses `supportedKeysText`.
-const commandToFn = {
-  run: 'runHelpText',
-  list: 'listHelpText',
-  watch: 'watchHelpText',
-  send: 'sendHelpText',
-  snapshot: 'snapshotHelpText',
-  wait: 'waitHelpText',
-  kill: 'killHelpText',
-  delete: 'deleteHelpText',
-  logs: 'logsHelpText',
-  replay: 'replayHelpText',
-  attach: 'attachHelpText',
-  keys: 'supportedKeysText'
-}
+// Commands that should get rendered on the website. This excludes `common`
+// (shared helpers, no user-facing help) and `help` (overview, not a command
+// page). Add new commands here to include them.
+const websiteCommands = new Set([
+  'run',
+  'list',
+  'watch',
+  'send',
+  'snapshot',
+  'wait',
+  'kill',
+  'delete',
+  'logs',
+  'replay',
+  'attach',
+  'keys',
+  'info',
+])
 
-const source = readFileSync(sourcePath, 'utf8')
-
-function extractHelp(fnName) {
-  // Match: fn <name>() []const u8 { ... }
+function extractHelp(source) {
+  // Match: pub fn helpText() []const u8 { ... }
   // The function body contains `return` followed by a Zig multiline string:
   //   \\line 1
   //   \\line 2
   //   ;
-  const fnRe = new RegExp(
-    `fn\\s+${fnName}\\s*\\(\\s*\\)\\s*\\[\\]const u8\\s*\\{([\\s\\S]*?)^\\}`,
-    'm'
-  )
+  const fnRe = /pub\s+fn\s+helpText\s*\(\s*\)\s*\[\]const u8\s*\{([\s\S]*?)^\}/m
   const match = source.match(fnRe)
   if (!match) return null
 
@@ -62,10 +59,16 @@ function extractHelp(fnName) {
 }
 
 let errors = 0
-for (const [cmd, fnName] of Object.entries(commandToFn)) {
-  const text = extractHelp(fnName)
+const files = readdirSync(commandsDir).filter((f) => f.endsWith('.zig'))
+
+for (const file of files) {
+  const cmd = basename(file, '.zig')
+  if (!websiteCommands.has(cmd)) continue
+
+  const source = readFileSync(join(commandsDir, file), 'utf8')
+  const text = extractHelp(source)
   if (text === null) {
-    console.error(`✗ ${cmd}: could not find ${fnName}() in ${sourcePath}`)
+    console.error(`✗ ${cmd}: could not find pub fn helpText() in src/commands/${file}`)
     errors++
     continue
   }
