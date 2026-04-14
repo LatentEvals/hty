@@ -12,20 +12,25 @@ Every interactive program is a wall. Agents either bail out and ask the human, o
 
 ## The fix
 
-`hty` wraps any program in a persistent PTY session. Your agent reads the rendered screen, sends keystrokes, and waits for the output to settle — the same loop a human uses, automated.
+`hty` wraps any program in a persistent PTY session. Your agent reads the rendered screen, decides what to type, and sends keystrokes — the same loop a human uses, automated.
 
 ```sh
-hty run --name setup -- create-next-app my-app
-hty wait setup --text "Would you like to use TypeScript?" --timeout 5000
-hty send setup --text "y\n"
-hty wait setup --text "Would you like to use ESLint?" --timeout 5000
-hty send setup --text "y\n"
-hty wait setup --text "Would you like to use Tailwind CSS?" --timeout 5000
-hty send setup --text "y\n"
-hty wait setup --exit --timeout 30000
+# agent decides to use hty to create its terminal
+hty run --name create-next-app -- create-next-app my-app
+
+# agent looks at the terminal to see what to do
+hty snapshot create-next-app
+
+# agent sees: "Would you like to use TypeScript? (Y/n)"
+hty send create-next-app --text "y\n"
+
+# ...repeat for each remaining prompt...
+
+# delete the terminal session
+hty delete create-next-app
 ```
 
-No flags to memorize. No brittle expect scripts. The agent reads the question and answers it.
+The agent doesn't know the questions in advance — it reads whatever is on screen and responds. If `create-next-app` adds a new prompt next month, the same loop handles it. No flags to memorize. No brittle expect scripts.
 
 ## What you get
 

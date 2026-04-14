@@ -3,8 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "dev": "node scripts/extract-help.mjs && next dev",
-    "build": "node scripts/extract-help.mjs && next build && pagefind --site out --output-path out/_pagefind",
+    "dev": "node scripts/extract-help.mjs && node scripts/generate-llms.mjs && next dev",
+    "build": "node scripts/extract-help.mjs && next build && node scripts/generate-llms.mjs && pagefind --site out --output-path out/_pagefind",
     "start": "next start"
   },
   "dependencies": {
@@ -17,6 +17,9 @@
   "devDependencies": {
     "@types/node": "25.6.0",
     "@types/react": "19.2.14",
-    "pagefind": "^1.5.2"
+    "jsdom": "^29.0.2",
+    "pagefind": "^1.5.2",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
   }
 }
