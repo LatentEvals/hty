@@ -15,7 +15,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
     if (std.mem.eql(u8, topic, "send")) return sendHelpText();
     if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
-    if (std.mem.eql(u8, topic, "wait")) return waitHelpText();
+    if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
     if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
@@ -137,26 +137,6 @@ pub fn sendHelpText() []const u8 {
     \\  --delay-after DUR    Sleep after sending.
     \\  --delay-char DUR     Send text character-by-character with a delay
     \\                       between each. Only works with --text or --seq.
-    \\
-    ;
-}
-
-pub fn waitHelpText() []const u8 {
-    return
-    \\hty wait [SESSION] --text "..." | --regex "..." | --idle MS | --exit [--timeout MS]
-    \\
-    \\Block until the session matches a condition. Exactly one mode flag is
-    \\required. Exit 0 on match, 3 on timeout.
-    \\
-    \\Modes:
-    \\  --text STRING    Wait until the rendered screen contains STRING.
-    \\  --regex PATTERN  Wait until the rendered screen matches PATTERN
-    \\                   (POSIX extended regex).
-    \\  --idle MS        Wait until the screen has been unchanged for MS
-    \\                   milliseconds.
-    \\  --exit           Wait until the child process exits.
-    \\
-    \\  --timeout MS     Max time to wait in milliseconds (default 10000).
     \\
     ;
 }
