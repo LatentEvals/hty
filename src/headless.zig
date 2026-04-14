@@ -911,56 +911,8 @@ fn unescapeText(alloc: Allocator, input: []const u8) ![]const u8 {
     return buf.toOwnedSlice();
 }
 
-fn runClientSnapshot(alloc: Allocator, args: []const []const u8) !void {
-    var session_ref: ?[]const u8 = null;
-    var json_output = false;
-    var ansi_output = false;
-
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--json")) {
-            json_output = true;
-        } else if (std.mem.eql(u8, arg, "--ansi")) {
-            ansi_output = true;
-        } else if (std.mem.startsWith(u8, arg, "--")) {
-            try printErrFmt("unknown flag: {s}", .{arg});
-            std.process.exit(ExitCode.generic);
-        } else if (session_ref == null) {
-            session_ref = arg;
-        }
-    }
-
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
-    defer payload_buf.deinit();
-    try payload_buf.appendSlice("{\"op\":\"snapshot\"");
-    if (session_ref) |s| {
-        try payload_buf.appendSlice(",\"session\":");
-        try writeJsonString(payload_buf.writer().any(), s);
-    }
-    try payload_buf.appendSlice("}");
-
-    const response_line = try sendRawRequest(alloc, payload_buf.items);
-    defer alloc.free(response_line);
-
-    if (json_output) {
-        try printRaw(response_line);
-        try printRaw("\n");
-        return;
-    }
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
-    defer parsed.deinit();
-    const object = try expectOkOrExit(parsed);
-
-    const snap_val = object.get("snapshot") orelse return;
-    const snap_obj = switch (snap_val) {
-        .object => |o| o,
-        else => return,
-    };
-    const field = if (ansi_output) "screen_ansi" else "buffer";
-    const text = getString(snap_obj, field) orelse "";
-    try printRaw(text);
-    try printRaw("\n");
-}
+const snapshot_cmd = @import("commands/snapshot.zig");
+const runClientSnapshot = snapshot_cmd.run;
 
 fn runClientWait(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;

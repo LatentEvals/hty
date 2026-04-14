@@ -14,7 +14,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "list")) return listHelpText();
     if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
     if (std.mem.eql(u8, topic, "send")) return sendHelpText();
-    if (std.mem.eql(u8, topic, "snapshot")) return snapshotHelpText();
+    if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
     if (std.mem.eql(u8, topic, "wait")) return waitHelpText();
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
@@ -137,17 +137,6 @@ pub fn sendHelpText() []const u8 {
     \\  --delay-after DUR    Sleep after sending.
     \\  --delay-char DUR     Send text character-by-character with a delay
     \\                       between each. Only works with --text or --seq.
-    \\
-    ;
-}
-
-pub fn snapshotHelpText() []const u8 {
-    return
-    \\hty snapshot [SESSION] [--ansi] [--json]
-    \\
-    \\Read the session's current rendered screen. Default output is plain
-    \\text. Use --ansi to get the styled ANSI rendering, --json for the full
-    \\structured response.
     \\
     ;
 }
