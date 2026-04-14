@@ -13,18 +13,18 @@ const decodeHex = @import("hex.zig").decodeHex;
 const generateUuidV7 = @import("uuid.zig").generateUuidV7;
 const shortestUniquePrefixLen = @import("uuid.zig").shortestUniquePrefixLen;
 
-const readOptionalId = @import("json_helpers.zig").readOptionalId;
-const readRequiredString = @import("json_helpers.zig").readRequiredString;
-const readOptionalString = @import("json_helpers.zig").readOptionalString;
-const readOptionalBool = @import("json_helpers.zig").readOptionalBool;
-const readOptionalU64 = @import("json_helpers.zig").readOptionalU64;
-const readOptionalUsize = @import("json_helpers.zig").readOptionalUsize;
-const readRequiredU16 = @import("json_helpers.zig").readRequiredU16;
-const readOptionalU16 = @import("json_helpers.zig").readOptionalU16;
-const readStringArray = @import("json_helpers.zig").readStringArray;
-const readEnvArray = @import("json_helpers.zig").readEnvArray;
-const getString = @import("json_helpers.zig").getString;
-const getInteger = @import("json_helpers.zig").getInteger;
+const readOptionalId = @import("json.zig").readOptionalId;
+const readRequiredString = @import("json.zig").readRequiredString;
+const readOptionalString = @import("json.zig").readOptionalString;
+const readOptionalBool = @import("json.zig").readOptionalBool;
+const readOptionalU64 = @import("json.zig").readOptionalU64;
+const readOptionalUsize = @import("json.zig").readOptionalUsize;
+const readRequiredU16 = @import("json.zig").readRequiredU16;
+const readOptionalU16 = @import("json.zig").readOptionalU16;
+const readStringArray = @import("json.zig").readStringArray;
+const readEnvArray = @import("json.zig").readEnvArray;
+const getString = @import("json.zig").getString;
+const getInteger = @import("json.zig").getInteger;
 
 const keyToBytes = @import("keys.zig").keyToBytes;
 
@@ -56,10 +56,10 @@ const logInputEvent = log_mod.logInputEvent;
 const logKilledEvent = log_mod.logKilledEvent;
 const logResizeEvent = log_mod.logResizeEvent;
 
-const attach_broadcast = @import("attach_broadcast.zig");
-const broadcastRawBytesToAttach = attach_broadcast.broadcastRawBytesToAttach;
-const broadcastExitedToAttach = attach_broadcast.broadcastExitedToAttach;
-const reapClosedAttachClients = attach_broadcast.reapClosedAttachClients;
+const attach = @import("attach.zig");
+const broadcastRawBytesToAttach = attach.broadcastRawBytesToAttach;
+const broadcastExitedToAttach = attach.broadcastExitedToAttach;
+const reapClosedAttachClients = attach.reapClosedAttachClients;
 
 const SessionRegistry = @import("registry.zig").SessionRegistry;
 

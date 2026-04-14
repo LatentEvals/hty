@@ -13,7 +13,7 @@ const hty = @import("hty");
 const session_mod = @import("session.zig");
 const uuid_mod = @import("uuid.zig");
 const log_mod = @import("log.zig");
-const attach_broadcast = @import("attach_broadcast.zig");
+const attach = @import("attach.zig");
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
@@ -137,7 +137,7 @@ pub const SessionRegistry = struct {
                             sess.status = .exited;
                             sess.exit_code = code;
                             log_mod.logDrainedEvent(sess, now, event);
-                            attach_broadcast.broadcastExitedToAttach(sess, code);
+                            attach.broadcastExitedToAttach(sess, code);
                             log_mod.closeLogFile(sess);
                             // Name stays reserved until `hty delete` so
                             // `hty replay NAME` still finds the session.
@@ -152,7 +152,7 @@ pub const SessionRegistry = struct {
                     },
                     .raw_bytes => |bytes| {
                         log_mod.logDrainedEvent(sess, now, event);
-                        attach_broadcast.broadcastRawBytesToAttach(sess, bytes);
+                        attach.broadcastRawBytesToAttach(sess, bytes);
                     },
                     .title_changed, .bell => log_mod.logDrainedEvent(sess, now, event),
                     else => {},
@@ -161,7 +161,7 @@ pub const SessionRegistry = struct {
                 owned.deinit(sess.alloc);
             }
             // Reap any attach clients whose reader thread has exited.
-            attach_broadcast.reapClosedAttachClients(sess);
+            attach.reapClosedAttachClients(sess);
         }
     }
 
