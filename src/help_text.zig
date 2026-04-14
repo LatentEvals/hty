@@ -18,7 +18,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
-    if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
+    if (std.mem.eql(u8, topic, "logs")) return @import("commands/logs.zig").helpText();
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
     if (std.mem.eql(u8, topic, "attach")) return @import("commands/attach.zig").helpText();
     if (std.mem.eql(u8, topic, "keys")) return @import("commands/keys.zig").helpText();
@@ -96,30 +96,6 @@ pub fn replayHelpText() []const u8 {
     \\  --loop       Restart playback from the beginning when the log ends.
     \\
     \\Press Ctrl-C or Ctrl-Q to exit.
-    \\
-    ;
-}
-
-pub fn logsHelpText() []const u8 {
-    return
-    \\hty logs [SESSION] [--follow|-f] [--since DURATION] [--json]
-    \\
-    \\Print the JSONL event log for a session. Logs are read directly from
-    \\disk, so this works for sessions that have already exited and even
-    \\across server restarts.
-    \\
-    \\SESSION may be a --name, a full UUID, or any unambiguous prefix. If
-    \\omitted and exactly one log file exists, that one is used.
-    \\
-    \\Flags:
-    \\  --follow, -f     Tail the log as new events arrive.
-    \\  --since DURATION Only show events within the last DURATION of logged
-    \\                   activity. Accepts: 500ms, 5s, 1m, 2h, or a bare
-    \\                   integer (seconds).
-    \\  --json           Emit raw JSONL lines (one per event) instead of the
-    \\                   human-readable table.
-    \\
-    \\Logs live at \$XDG_STATE_HOME/hty/logs (fallback ~/.local/state/hty/logs).
     \\
     ;
 }
