@@ -12,7 +12,7 @@ const std = @import("std");
 pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "run")) return @import("commands/run.zig").helpText();
     if (std.mem.eql(u8, topic, "list")) return @import("commands/list.zig").helpText();
-    if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
+    if (std.mem.eql(u8, topic, "watch")) return @import("commands/watch.zig").helpText();
     if (std.mem.eql(u8, topic, "send")) return @import("commands/send.zig").helpText();
     if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
     if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
@@ -60,19 +60,6 @@ pub fn generalHelpText() []const u8 {
     \\  hty send debug-vim --key esc
     \\  hty wait debug-vim --idle 300 --timeout 2000
     \\  hty kill debug-vim
-    \\
-    ;
-}
-
-pub fn watchHelpText() []const u8 {
-    return
-    \\hty watch [SESSION]
-    \\
-    \\Attach to a session read-only and paint its rendered screen live to
-    \\your terminal. Ctrl-C or Ctrl-Q to detach.
-    \\
-    \\SESSION may be a UUID prefix or the session's --name. If omitted and
-    \\exactly one session is running, that one is used.
     \\
     ;
 }
