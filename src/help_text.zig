@@ -20,7 +20,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
     if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
-    if (std.mem.eql(u8, topic, "attach")) return attachHelpText();
+    if (std.mem.eql(u8, topic, "attach")) return @import("commands/attach.zig").helpText();
     if (std.mem.eql(u8, topic, "keys")) return @import("commands/keys.zig").helpText();
     if (std.mem.eql(u8, topic, "info")) return @import("commands/info.zig").helpText();
     return null;
@@ -75,28 +75,6 @@ pub fn deleteHelpText() []const u8 {
     \\
     \\If SESSION is omitted and exactly one session is live, that one
     \\is deleted.
-    \\
-    ;
-}
-
-pub fn attachHelpText() []const u8 {
-    return
-    \\hty attach [SESSION]
-    \\
-    \\Interactively attach to a running session. Your terminal's keystrokes
-    \\are forwarded into the PTY and the session's rendered output streams
-    \\back — the same session an agent is driving can be taken over by a
-    \\human (or multiple humans) at any time.
-    \\
-    \\Detach keybinds (tmux-style, Ctrl-A is the prefix):
-    \\  Ctrl-A d      Detach cleanly.
-    \\  Ctrl-A Ctrl-A Send a literal Ctrl-A to the session.
-    \\
-    \\The observer's terminal size is sent on attach and on SIGWINCH, so
-    \\the child program sees the right LINES/COLUMNS.
-    \\
-    \\Multiple clients can attach to the same session simultaneously —
-    \\writes are atomic per input frame, reads are broadcast to everyone.
     \\
     ;
 }
