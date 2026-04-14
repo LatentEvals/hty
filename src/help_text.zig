@@ -11,7 +11,7 @@ const std = @import("std");
 
 pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "run")) return @import("commands/run.zig").helpText();
-    if (std.mem.eql(u8, topic, "list")) return listHelpText();
+    if (std.mem.eql(u8, topic, "list")) return @import("commands/list.zig").helpText();
     if (std.mem.eql(u8, topic, "watch")) return watchHelpText();
     if (std.mem.eql(u8, topic, "send")) return sendHelpText();
     if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
@@ -60,18 +60,6 @@ pub fn generalHelpText() []const u8 {
     \\  hty send debug-vim --key esc
     \\  hty wait debug-vim --idle 300 --timeout 2000
     \\  hty kill debug-vim
-    \\
-    ;
-}
-
-pub fn listHelpText() []const u8 {
-    return
-    \\hty list [--json]
-    \\
-    \\List currently running sessions. Empty output if none.
-    \\
-    \\Flags:
-    \\  --json   Emit the full structured response as JSON.
     \\
     ;
 }
