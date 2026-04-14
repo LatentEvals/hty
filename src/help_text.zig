@@ -17,7 +17,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
     if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
-    if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
+    if (std.mem.eql(u8, topic, "delete")) return @import("commands/delete.zig").helpText();
     if (std.mem.eql(u8, topic, "logs")) return @import("commands/logs.zig").helpText();
     if (std.mem.eql(u8, topic, "replay")) return @import("commands/replay.zig").helpText();
     if (std.mem.eql(u8, topic, "attach")) return @import("commands/attach.zig").helpText();
@@ -60,21 +60,6 @@ pub fn generalHelpText() []const u8 {
     \\  hty send debug-vim --key esc
     \\  hty wait debug-vim --idle 300 --timeout 2000
     \\  hty kill debug-vim
-    \\
-    ;
-}
-
-pub fn deleteHelpText() []const u8 {
-    return
-    \\hty delete [SESSION]
-    \\
-    \\Permanently remove a session. If the child process is still running
-    \\it's terminated first; the session's log file and by-name symlink
-    \\are then unlinked from disk. After delete, the session's name is
-    \\free to reuse.
-    \\
-    \\If SESSION is omitted and exactly one session is live, that one
-    \\is deleted.
     \\
     ;
 }

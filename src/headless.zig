@@ -159,79 +159,8 @@ const runClientList = list_cmd.run;
 const kill_cmd = @import("commands/kill.zig");
 const runClientKill = kill_cmd.run;
 
-fn runClientDelete(alloc: Allocator, args: []const []const u8) !void {
-    const session_ref = if (args.len > 0) args[0] else null;
-
-    // First try the server — it owns any live or zombie sessions in the
-    // current registry and will cleanly kill + unlink them.
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
-    defer payload_buf.deinit();
-    try payload_buf.appendSlice("{\"op\":\"delete\"");
-    if (session_ref) |s| {
-        try payload_buf.appendSlice(",\"session\":");
-        try writeJsonString(payload_buf.writer().any(), s);
-    }
-    try payload_buf.appendSlice("}");
-
-    var server_ok = false;
-    if (sendRawRequest(alloc, payload_buf.items)) |response_line| {
-        defer alloc.free(response_line);
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_line, .{}) catch null;
-        defer if (parsed) |*p| p.deinit();
-        if (parsed) |*p| {
-            if (p.value == .object) {
-                if (p.value.object.get("ok")) |ok_val| {
-                    if (ok_val == .bool and ok_val.bool) server_ok = true;
-                }
-            }
-        }
-    } else |_| {}
-
-    if (server_ok) {
-        const display = session_ref orelse "session";
-        const msg = try std.fmt.allocPrint(alloc, "deleted {s}", .{display});
-        defer alloc.free(msg);
-        try printLine(msg);
-        return;
-    }
-
-    // Server didn't know about it (orphan from a prior server instance,
-    // or server unreachable). Unlink the log file and symlink directly.
-    const ref = session_ref orelse {
-        try printErr("hty delete: session not found");
-        std.process.exit(ExitCode.not_found);
-    };
-
-    const path = resolveLogPath(alloc, ref) catch |err| {
-        switch (err) {
-            error.SessionNotFound => try printErr("hty delete: session not found"),
-            error.AmbiguousPrefix => try printErr("hty delete: ambiguous session prefix"),
-            error.AmbiguousSole => try printErr("hty delete: more than one session exists — name one explicitly"),
-            else => try printErrFmt("hty delete: {s}", .{@errorName(err)}),
-        }
-        std.process.exit(ExitCode.not_found);
-    };
-    defer alloc.free(path);
-
-    // `path` may be the by-name symlink or a direct UUID file. Resolve
-    // it to the canonical UUID file so we can delete both it and the
-    // symlink (if any) cleanly.
-    const real_path = std.fs.realpathAlloc(alloc, path) catch try alloc.dupe(u8, path);
-    defer alloc.free(real_path);
-
-    std.fs.deleteFileAbsolute(real_path) catch |err| {
-        try printErrFmt("hty delete: failed to unlink {s}: {s}", .{ real_path, @errorName(err) });
-        std.process.exit(ExitCode.generic);
-    };
-    // Also remove the name symlink if the reference was a name.
-    if (!std.mem.eql(u8, path, real_path)) {
-        std.fs.deleteFileAbsolute(path) catch {};
-    }
-
-    const msg = try std.fmt.allocPrint(alloc, "deleted {s} (log file unlinked)", .{ref});
-    defer alloc.free(msg);
-    try printLine(msg);
-}
+const delete_cmd = @import("commands/delete.zig");
+const runClientDelete = delete_cmd.run;
 
 const send_cmd = @import("commands/send.zig");
 const runClientSend = send_cmd.run;
