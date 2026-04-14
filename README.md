@@ -126,27 +126,11 @@ The server auto-starts on first use and persists across invocations, so sessions
   </tr>
 </table>
 
-## How it works
+## Concepts
 
-```
-┌─────────────┐   unix       ┌──────────────┐   PTY    ┌────────────┐
-│ hty <cmd>   │  ──socket──▶ │  hty server  │ ──fork─▶ │  program   │
-│ (client)    │              │ (persistent) │          │ (vim, etc) │
-└─────────────┘              └──────┬───────┘          └────────────┘
-                                    │
-                                    ▼
-                             append-only
-                            JSONL event log
-                             (hty logs /
-                              hty replay)
-```
-
-- **Clients** — every `hty` command you run is a short-lived client that serializes a JSON request, sends it over a Unix socket, and exits.
-- **Server** — a persistent background process owns all session state. It auto-starts on first use and runs unattended.
-- **PTY sessions** — each session is a real pseudoterminal running your program. The server reads the program's output through a VT engine (Ghostty's) and exposes the rendered screen to clients.
-- **JSONL logs** — every input and output byte is written to a per-session append-only log. `hty logs` streams raw events; `hty replay` feeds them back through a fresh VT engine long after the session has ended.
-
-See [docs.hty.sh/concepts](https://hty.sh/concepts/sessions) for the full architecture.
+- **[Sessions](https://hty.sh/concepts/sessions)** — a session is a real PTY running your program, identified by a UUID or a human-friendly `--name`. Sessions are isolated from each other and from your terminal.
+- **[Background server](https://hty.sh/concepts/server)** — a persistent process that owns all session state. It auto-starts on first use, talks to clients over a Unix socket, and keeps sessions alive across individual `hty` commands.
+- **[Session logs](https://hty.sh/concepts/session-logs)** — every input and output byte is written to a per-session append-only JSONL log. `hty logs` streams raw events; `hty replay` feeds them back through a fresh VT engine long after the session has ended.
 
 ## Commands
 
