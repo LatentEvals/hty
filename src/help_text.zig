@@ -21,7 +21,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "logs")) return logsHelpText();
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
     if (std.mem.eql(u8, topic, "attach")) return attachHelpText();
-    if (std.mem.eql(u8, topic, "keys")) return supportedKeysText();
+    if (std.mem.eql(u8, topic, "keys")) return @import("commands/keys.zig").helpText();
     if (std.mem.eql(u8, topic, "info")) return @import("commands/info.zig").helpText();
     return null;
 }
@@ -155,41 +155,6 @@ pub fn logsHelpText() []const u8 {
     \\                   human-readable table.
     \\
     \\Logs live at \$XDG_STATE_HOME/hty/logs (fallback ~/.local/state/hty/logs).
-    \\
-    ;
-}
-
-pub fn supportedKeysText() []const u8 {
-    return
-    \\Supported send_key names
-    \\
-    \\Navigation:
-    \\  up, down, left, right, home, end, pageup, pagedown, insert, delete
-    \\
-    \\Editing and control:
-    \\  enter, return, tab, esc, escape, space, backspace
-    \\
-    \\Function keys:
-    \\  f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12
-    \\
-    \\Modifier prefixes (combinable, any order):
-    \\  ctrl- (or c-)        Ctrl modifier
-    \\  alt- (or meta-, m-)  Alt/Meta modifier
-    \\  shift- (or s-)       Shift modifier
-    \\
-    \\Single printable characters are also accepted directly:
-    \\  "i", ":", "/", "q"
-    \\
-    \\Examples:
-    \\  ctrl-x            Ctrl+X
-    \\  c-a               Ctrl+A (short form)
-    \\  alt-f             Alt+F (Meta+F in emacs)
-    \\  shift-tab         Backtab
-    \\  shift-up          Shift+Up arrow
-    \\  ctrl-alt-f        Ctrl+Alt+F
-    \\  ctrl-shift-end    Ctrl+Shift+End
-    \\  f5                Function key F5
-    \\  alt-f3            Alt+F3
     \\
     ;
 }

@@ -31,7 +31,6 @@ const keyToBytes = @import("keys.zig").keyToBytes;
 const help_text = @import("help_text.zig");
 const helpForTopic = help_text.helpForTopic;
 const generalHelpText = help_text.generalHelpText;
-const supportedKeysText = help_text.supportedKeysText;
 
 const protocol = @import("protocol.zig");
 const Response = protocol.Response;
@@ -1484,8 +1483,9 @@ fn writeHelp(args: []const []const u8) !void {
     try printRaw(message);
 }
 
+const keys_cmd = @import("commands/keys.zig");
 fn writeSupportedKeys() !void {
-    try printRaw(supportedKeysText());
+    try keys_cmd.run(std.heap.c_allocator, &.{});
 }
 
 const info_cmd = @import("commands/info.zig");
