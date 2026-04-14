@@ -6072,3 +6072,532 @@ test "replay reproduces the live grid across a mid-session resize" {
 
     try std.testing.expectEqualStrings(live_ansi, replayed_ansi);
 }
+
+// ===========================================================================
+// Protocol error shape
+// ===========================================================================
+//
+// These pin down the dispatcher's contract: every failed request returns a
+// well-formed `{ok: false, error: "..."}` envelope. If a future refactor
+// accidentally lets an error escape the response wrapper — say, by forgetting
+// a `catch` at a new file boundary — these tests fail loudly. The happy-path
+// tests assume the envelope shape; these tests prove it.
+
+/// Send a raw (pre-stringified) request line straight to processRequestLine.
+/// Used for malformed-input tests where we need bytes stringify wouldn't
+/// produce (e.g. not-JSON, non-object root).
+fn testRequestRaw(registry: *SessionRegistry, request_line: []const u8) !std.json.Parsed(std.json.Value) {
+    const alloc = std.testing.allocator;
+    const response_line = try processRequestLine(alloc, registry, request_line);
+    defer alloc.free(response_line);
+    const newline = std.mem.indexOfScalar(u8, response_line, '\n') orelse response_line.len;
+    return std.json.parseFromSlice(std.json.Value, alloc, response_line[0..newline], .{});
+}
+
+/// Assert the response envelope is `{ok: false, error: "..."}` and that the
+/// error string contains `needle`. Prints the actual message on mismatch so
+/// test output is useful. Pass an empty needle to accept any error.
+fn expectTestError(parsed: std.json.Parsed(std.json.Value), needle: []const u8) !void {
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidResponse,
+    };
+    const ok = obj.get("ok") orelse return error.InvalidResponse;
+    if (ok != .bool or ok.bool) {
+        std.debug.print("\nexpected ok:false, got ok:{any}\n", .{ok});
+        return error.ExpectedError;
+    }
+    const err_val = obj.get("error") orelse return error.InvalidResponse;
+    if (err_val != .string) return error.InvalidResponse;
+    if (needle.len > 0 and std.mem.indexOf(u8, err_val.string, needle) == null) {
+        std.debug.print("\nexpected error to contain '{s}', got: '{s}'\n", .{ needle, err_val.string });
+        return error.ErrorMessageMismatch;
+    }
+}
+
+test "invalid JSON returns a structured error" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var parsed = try testRequestRaw(&registry, "not valid json {{{");
+    defer parsed.deinit();
+    try expectTestError(parsed, "");
+}
+
+test "non-object JSON root returns a structured error" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var parsed = try testRequestRaw(&registry, "[1,2,3]");
+    defer parsed.deinit();
+    try expectTestError(parsed, "JSON object");
+}
+
+test "request missing the op field returns a structured error" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var parsed = try testRequestRaw(&registry, "{}");
+    defer parsed.deinit();
+    // Error comes through as the raw error name because the op-dispatch path
+    // reports @errorName directly rather than going through requestErrorMessage.
+    try expectTestError(parsed, "MissingField");
+}
+
+test "op with missing required subfield returns a structured error" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    // spawn without `program` — handleSpawn calls readRequiredString("program").
+    var parsed = try testRequest(&registry, .{ .op = "spawn" });
+    defer parsed.deinit();
+    try expectTestError(parsed, "missing required field");
+}
+
+test "op with wrong-type field returns a structured error" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    // `program` should be a string; send an integer.
+    var parsed = try testRequest(&registry, .{ .op = "spawn", .program = 42 });
+    defer parsed.deinit();
+    try expectTestError(parsed, "invalid field type");
+}
+
+// ===========================================================================
+// Session resolution
+// ===========================================================================
+//
+// The dispatcher accepts a `session` reference as a full UUID, a unique
+// prefix, or a human-readable name — and picks the sole session implicitly
+// when omitted. This is the single most error-prone part of the protocol
+// because it silently resolves; a refactor that breaks resolution would
+// surface as "wrong session got the op" rather than a hard error. Pin down
+// every resolution path.
+
+/// Spawn a single cat session and return its UUID (duped with
+/// `std.testing.allocator`). Caller must free.
+fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
+    const alloc = std.testing.allocator;
+    var parsed = if (name) |n|
+        try testRequest(registry, .{
+            .op = "spawn",
+            .name = n,
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        })
+    else
+        try testRequest(registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+    defer parsed.deinit();
+    const obj = try expectTestOk(parsed);
+    const session = obj.get("session") orelse return error.InvalidResponse;
+    const session_obj = switch (session) { .object => |o| o, else => return error.InvalidResponse };
+    const id_val = session_obj.get("id") orelse return error.InvalidResponse;
+    if (id_val != .string) return error.InvalidResponse;
+    return try alloc.dupe(u8, id_val.string);
+}
+
+test "resolve session by full UUID" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, null);
+    defer alloc.free(uuid);
+
+    var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = uuid });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = uuid });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "resolve session by short UUID prefix" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, null);
+    defer alloc.free(uuid);
+
+    // UUIDs are 36 chars; the first 8 are plenty unique with one session.
+    const prefix = uuid[0..8];
+    var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = prefix });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = uuid });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "ambiguous prefix is rejected" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid_a = try spawnCatSession(&registry, "a");
+    defer alloc.free(uuid_a);
+    const uuid_b = try spawnCatSession(&registry, "b");
+    defer alloc.free(uuid_b);
+
+    // UUIDv7 encodes a millisecond timestamp in the high bits, so two sessions
+    // created back-to-back always share at least the first few hex chars.
+    var shared_len: usize = 0;
+    while (shared_len < uuid_a.len and shared_len < uuid_b.len and uuid_a[shared_len] == uuid_b[shared_len]) shared_len += 1;
+    try std.testing.expect(shared_len > 0);
+    const shared = uuid_a[0..shared_len];
+
+    var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = shared });
+    defer parsed.deinit();
+    try expectTestError(parsed, "ambiguous");
+
+    var ka = try testRequest(&registry, .{ .op = "kill", .session = uuid_a });
+    defer ka.deinit();
+    _ = try expectTestOk(ka);
+    var kb = try testRequest(&registry, .{ .op = "kill", .session = uuid_b });
+    defer kb.deinit();
+    _ = try expectTestOk(kb);
+}
+
+test "sole-session implicit resolution" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "solo");
+    defer alloc.free(uuid);
+
+    // No session field — should resolve to the only session.
+    var parsed = try testRequest(&registry, .{ .op = "snapshot" });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "solo" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "sole-session implicit errors when multiple sessions exist" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid_a = try spawnCatSession(&registry, "aa");
+    defer alloc.free(uuid_a);
+    const uuid_b = try spawnCatSession(&registry, "bb");
+    defer alloc.free(uuid_b);
+
+    var parsed = try testRequest(&registry, .{ .op = "snapshot" });
+    defer parsed.deinit();
+    try expectTestError(parsed, "ambiguous");
+
+    var ka = try testRequest(&registry, .{ .op = "kill", .session = "aa" });
+    defer ka.deinit();
+    _ = try expectTestOk(ka);
+    var kb = try testRequest(&registry, .{ .op = "kill", .session = "bb" });
+    defer kb.deinit();
+    _ = try expectTestOk(kb);
+}
+
+test "session-not-found returns a structured error" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    // Spawn one session so the "no sessions at all" branch doesn't shadow
+    // the named-resolve path we actually want to exercise.
+    const uuid = try spawnCatSession(&registry, "real");
+    defer alloc.free(uuid);
+
+    var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "does-not-exist" });
+    defer parsed.deinit();
+    try expectTestError(parsed, "session not found");
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "real" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+// ===========================================================================
+// Untested op happy-paths
+// ===========================================================================
+//
+// Every RPC op gets at least one assertion beyond "didn't panic". These are
+// the behaviors a refactor could silently break by moving the wrong slice of
+// code between files.
+
+test "send_bytes_hex op sends decoded bytes to the pty" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "hexcat");
+    defer std.testing.allocator.free(uuid);
+
+    // "ping\n" = 70 69 6e 67 0a
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_bytes_hex",
+            .session = "hexcat",
+            .bytes_hex = "70696e670a",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "hexcat",
+            .text = "ping",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "hexcat" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "send_bytes_hex op rejects malformed hex" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "badhex");
+    defer std.testing.allocator.free(uuid);
+
+    var parsed = try testRequest(&registry, .{
+        .op = "send_bytes_hex",
+        .session = "badhex",
+        .bytes_hex = "not-hex-at-all",
+    });
+    defer parsed.deinit();
+    try expectTestError(parsed, "invalid hex");
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "badhex" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "send_key op accepts a symbolic key name" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "keycat");
+    defer std.testing.allocator.free(uuid);
+
+    // "enter" is one of the always-supported symbolic keys (used by the
+    // existing nano/emacs tests).
+    var parsed = try testRequest(&registry, .{
+        .op = "send_key",
+        .session = "keycat",
+        .key = "enter",
+    });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "keycat" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "send_key op rejects an unknown key name" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "badkey");
+    defer std.testing.allocator.free(uuid);
+
+    var parsed = try testRequest(&registry, .{
+        .op = "send_key",
+        .session = "badkey",
+        .key = "definitely-not-a-key",
+    });
+    defer parsed.deinit();
+    try expectTestError(parsed, "invalid key");
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "badkey" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "resize op changes dimensions visible in the next snapshot" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "rcat");
+    defer std.testing.allocator.free(uuid);
+
+    // spawnCatSession uses 8 rows / 24 cols. Resize and confirm via snapshot.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "resize",
+            .session = "rcat",
+            .rows = 20,
+            .cols = 90,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "rcat" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const rows_val = snap_obj.get("rows") orelse return error.InvalidResponse;
+        const cols_val = snap_obj.get("cols") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(@as(i64, 20), rows_val.integer);
+        try std.testing.expectEqual(@as(i64, 90), cols_val.integer);
+    }
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "rcat" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "wait_for_exit returns after the child terminates" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    // /usr/bin/true exits immediately — perfect for wait_for_exit.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "quickexit",
+            .program = "/usr/bin/true",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    var parsed = try testRequest(&registry, .{
+        .op = "wait_for_exit",
+        .session = "quickexit",
+        .timeout_ms = 3_000,
+    });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+}
+
+test "list op returns one entry per session" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid_one = try spawnCatSession(&registry, "one");
+    defer alloc.free(uuid_one);
+    const uuid_two = try spawnCatSession(&registry, "two");
+    defer alloc.free(uuid_two);
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "list" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const sessions = obj.get("sessions") orelse return error.InvalidResponse;
+        if (sessions != .array) return error.InvalidResponse;
+        try std.testing.expectEqual(@as(usize, 2), sessions.array.items.len);
+
+        // Each entry must carry id, name, program, status — the shape the CLI
+        // and any external consumer relies on.
+        for (sessions.array.items) |entry| {
+            if (entry != .object) return error.InvalidResponse;
+            const e = entry.object;
+            try std.testing.expect(e.get("id") != null);
+            try std.testing.expect(e.get("name") != null);
+            try std.testing.expect(e.get("program") != null);
+            try std.testing.expect(e.get("status") != null);
+        }
+    }
+
+    var k1 = try testRequest(&registry, .{ .op = "kill", .session = "one" });
+    defer k1.deinit();
+    _ = try expectTestOk(k1);
+    var k2 = try testRequest(&registry, .{ .op = "kill", .session = "two" });
+    defer k2.deinit();
+    _ = try expectTestOk(k2);
+}
+
+test "delete op removes the session record and its log files" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-delete-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    const uuid = try spawnCatSession(&registry, "todelete");
+    defer alloc.free(uuid);
+
+    // Send something so the log file is non-trivially on disk.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "todelete",
+            .text = "hi\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const uuid_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ log_dir, uuid });
+    defer alloc.free(uuid_path);
+    const name_path = try std.fmt.allocPrint(alloc, "{s}/todelete.jsonl", .{by_name});
+    defer alloc.free(name_path);
+
+    // Files must exist before delete.
+    try std.fs.accessAbsolute(uuid_path, .{});
+    try std.fs.accessAbsolute(name_path, .{});
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "delete", .session = "todelete" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Log files are gone.
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(uuid_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(name_path, .{}));
+
+    // Session is gone from the registry — list returns empty.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "list" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const sessions = obj.get("sessions") orelse return error.InvalidResponse;
+        if (sessions != .array) return error.InvalidResponse;
+        try std.testing.expectEqual(@as(usize, 0), sessions.array.items.len);
+    }
+
+    // Resolving the deleted name errors — proves the registry actually
+    // unhooked it, not just removed the log.
+    var find_parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "todelete" });
+    defer find_parsed.deinit();
+    try expectTestError(find_parsed, "session not found");
+}
