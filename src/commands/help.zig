@@ -1,29 +1,17 @@
-//! All `hty <subcommand> --help` text lives here. Pure string constants with
-//! a small topic dispatcher (`helpForTopic`) so the CLI entry point can route
-//! `hty help <topic>` to the right block.
+//! `hty help` — print the overview or a single subcommand's help text.
 //!
-//! Kept as one module (rather than co-located per-command) because help text
-//! is cross-referential: `generalHelpText` lists every subcommand, and
-//! changes often touch several help strings at once. Centralizing them makes
-//! the table easier to keep in sync.
+//! This module also owns `generalHelpText` and `helpForTopic`. Putting them
+//! here (rather than in a separate `help_text.zig`) means each subcommand's
+//! help string lives with its own implementation, and only the overview +
+//! dispatcher remain centralized.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
-pub fn helpForTopic(topic: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, topic, "run")) return @import("commands/run.zig").helpText();
-    if (std.mem.eql(u8, topic, "list")) return @import("commands/list.zig").helpText();
-    if (std.mem.eql(u8, topic, "watch")) return @import("commands/watch.zig").helpText();
-    if (std.mem.eql(u8, topic, "send")) return @import("commands/send.zig").helpText();
-    if (std.mem.eql(u8, topic, "snapshot")) return @import("commands/snapshot.zig").helpText();
-    if (std.mem.eql(u8, topic, "wait")) return @import("commands/wait.zig").helpText();
-    if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
-    if (std.mem.eql(u8, topic, "delete")) return @import("commands/delete.zig").helpText();
-    if (std.mem.eql(u8, topic, "logs")) return @import("commands/logs.zig").helpText();
-    if (std.mem.eql(u8, topic, "replay")) return @import("commands/replay.zig").helpText();
-    if (std.mem.eql(u8, topic, "attach")) return @import("commands/attach.zig").helpText();
-    if (std.mem.eql(u8, topic, "keys")) return @import("commands/keys.zig").helpText();
-    if (std.mem.eql(u8, topic, "info")) return @import("commands/info.zig").helpText();
-    return null;
+const common = @import("common.zig");
+
+pub fn helpText() []const u8 {
+    return generalHelpText();
 }
 
 pub fn generalHelpText() []const u8 {
@@ -62,6 +50,39 @@ pub fn generalHelpText() []const u8 {
     \\  hty kill debug-vim
     \\
     ;
+}
+
+pub fn helpForTopic(topic: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, topic, "run")) return @import("run.zig").helpText();
+    if (std.mem.eql(u8, topic, "list")) return @import("list.zig").helpText();
+    if (std.mem.eql(u8, topic, "watch")) return @import("watch.zig").helpText();
+    if (std.mem.eql(u8, topic, "send")) return @import("send.zig").helpText();
+    if (std.mem.eql(u8, topic, "snapshot")) return @import("snapshot.zig").helpText();
+    if (std.mem.eql(u8, topic, "wait")) return @import("wait.zig").helpText();
+    if (std.mem.eql(u8, topic, "kill")) return @import("kill.zig").helpText();
+    if (std.mem.eql(u8, topic, "delete")) return @import("delete.zig").helpText();
+    if (std.mem.eql(u8, topic, "logs")) return @import("logs.zig").helpText();
+    if (std.mem.eql(u8, topic, "replay")) return @import("replay.zig").helpText();
+    if (std.mem.eql(u8, topic, "attach")) return @import("attach.zig").helpText();
+    if (std.mem.eql(u8, topic, "keys")) return @import("keys.zig").helpText();
+    if (std.mem.eql(u8, topic, "info")) return @import("info.zig").helpText();
+    return null;
+}
+
+pub fn run(alloc: Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        try common.printRaw(generalHelpText());
+        return;
+    }
+
+    if (helpForTopic(args[0])) |help| {
+        try common.printRaw(help);
+        return;
+    }
+
+    const message = try std.fmt.allocPrint(alloc, "unknown help topic: {s}\n\n{s}", .{ args[0], generalHelpText() });
+    defer alloc.free(message);
+    try common.printRaw(message);
 }
 
 test "help text lists all subcommands" {

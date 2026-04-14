@@ -28,9 +28,10 @@ const getInteger = @import("json.zig").getInteger;
 
 const keyToBytes = @import("keys.zig").keyToBytes;
 
-const help_text = @import("help_text.zig");
-const helpForTopic = help_text.helpForTopic;
-const generalHelpText = help_text.generalHelpText;
+const help_cmd = @import("commands/help.zig");
+const helpForTopic = help_cmd.helpForTopic;
+const generalHelpText = help_cmd.generalHelpText;
+const writeHelp = help_cmd.run;
 
 const protocol = @import("protocol.zig");
 const Response = protocol.Response;
@@ -117,9 +118,9 @@ const ExitCode = common.ExitCode;
 // Force Zig's test discovery to walk the extracted modules even when the root
 // file only references specific decls from them.
 comptime {
-    _ = @import("help_text.zig");
     _ = @import("keys.zig");
     _ = @import("uuid.zig");
+    _ = @import("commands/help.zig");
     _ = @import("commands/send.zig");
     _ = @import("commands/logs.zig");
     _ = @import("commands/replay.zig");
@@ -196,23 +197,6 @@ const parseDurationMs = common.parseDurationMs;
 // Help text
 // ============================================================================
 
-fn writeHelp(args: []const []const u8) !void {
-    if (args.len == 0) {
-        try printRaw(generalHelpText());
-        return;
-    }
-
-    if (helpForTopic(args[0])) |help| {
-        try printRaw(help);
-        return;
-    }
-
-    const alloc = std.heap.c_allocator;
-    const message = try std.fmt.allocPrint(alloc, "unknown help topic: {s}\n\n{s}", .{ args[0], generalHelpText() });
-    defer alloc.free(message);
-    try printRaw(message);
-}
-
 const keys_cmd = @import("commands/keys.zig");
 fn writeSupportedKeys() !void {
     try keys_cmd.run(std.heap.c_allocator, &.{});
@@ -258,7 +242,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "help")) {
-        try writeHelp(args[2..]);
+        try writeHelp(alloc, args[2..]);
         return;
     }
     if (std.mem.eql(u8, verb, "keys")) {
