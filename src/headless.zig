@@ -555,6 +555,17 @@ fn logKilledEvent(arena: Allocator, sess: *Session) void {
     writeLogEvent(sess, line);
 }
 
+fn logResizeEvent(arena: Allocator, sess: *Session, rows: u16, cols: u16) void {
+    if (sess.log_file == null) return;
+    const line = std.json.Stringify.valueAlloc(arena, .{
+        .t = std.time.milliTimestamp(),
+        .kind = "resize",
+        .rows = rows,
+        .cols = cols,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
 // ============================================================================
 // Attach broadcast
 // ============================================================================
@@ -872,6 +883,7 @@ fn handleAttachConnection(
                 const rows: u16 = @intCast(@max(1, rv.integer));
                 const cols: u16 = @intCast(@max(1, cv.integer));
                 sess.terminal.resize(rows, cols) catch {};
+                logResizeEvent(arena, sess, rows, cols);
             }
         }
     }
@@ -1009,6 +1021,7 @@ fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         const rows: u16 = @intCast(@max(1, rows_val.integer));
         const cols: u16 = @intCast(@max(1, cols_val.integer));
         client.session.terminal.resize(rows, cols) catch {};
+        logResizeEvent(arena, client.session, rows, cols);
         return;
     }
 
@@ -1089,7 +1102,7 @@ fn dispatchRequest(
     if (std.mem.eql(u8, op, "send_text")) return handleSendText(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_key")) return handleSendKey(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_bytes_hex")) return handleSendBytesHex(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "resize")) return handleResize(sess, object, id);
+    if (std.mem.eql(u8, op, "resize")) return handleResize(arena, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_text")) return handleWaitForText(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_idle")) return handleWaitForIdle(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_exit")) return handleWaitForExit(arena, registry, sess, object, id);
@@ -1229,10 +1242,11 @@ fn handleSendBytesHex(arena: Allocator, sess: *Session, object: std.json.ObjectM
     return .{ .id = id, .ok = true };
 }
 
-fn handleResize(sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
+fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     const rows = try readRequiredU16(object, "rows");
     const cols = try readRequiredU16(object, "cols");
     try sess.terminal.resize(rows, cols);
+    logResizeEvent(arena, sess, rows, cols);
     return .{ .id = id, .ok = true };
 }
 
