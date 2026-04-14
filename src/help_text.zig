@@ -19,7 +19,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "kill")) return @import("commands/kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return deleteHelpText();
     if (std.mem.eql(u8, topic, "logs")) return @import("commands/logs.zig").helpText();
-    if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
+    if (std.mem.eql(u8, topic, "replay")) return @import("commands/replay.zig").helpText();
     if (std.mem.eql(u8, topic, "attach")) return @import("commands/attach.zig").helpText();
     if (std.mem.eql(u8, topic, "keys")) return @import("commands/keys.zig").helpText();
     if (std.mem.eql(u8, topic, "info")) return @import("commands/info.zig").helpText();
@@ -75,27 +75,6 @@ pub fn deleteHelpText() []const u8 {
     \\
     \\If SESSION is omitted and exactly one session is live, that one
     \\is deleted.
-    \\
-    ;
-}
-
-pub fn replayHelpText() []const u8 {
-    return
-    \\hty replay [SESSION] [--speed Nx] [--at T] [--to T] [--loop]
-    \\
-    \\Replay a session by reading its log file and feeding the recorded
-    \\output bytes back through a fresh in-memory VT engine. The program
-    \\is NOT re-executed and no input is re-sent — replay is a pure
-    \\visualization with zero side effects.
-    \\
-    \\Flags:
-    \\  --speed Nx   Playback speed multiplier (default 1x). 0 = no sleep.
-    \\  --at T       Fast-forward silently to T into the session before
-    \\               painting (same duration syntax as --since).
-    \\  --to T       Stop painting once the timeline reaches T.
-    \\  --loop       Restart playback from the beginning when the log ends.
-    \\
-    \\Press Ctrl-C or Ctrl-Q to exit.
     \\
     ;
 }
