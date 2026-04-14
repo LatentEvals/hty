@@ -1488,43 +1488,8 @@ fn writeSupportedKeys() !void {
     try printRaw(supportedKeysText());
 }
 
-fn runInfo(alloc: Allocator) !void {
-    const socket_path = try resolveSocketPath(alloc);
-    defer alloc.free(socket_path);
-    const log_dir = try resolveLogDir(alloc);
-    defer alloc.free(log_dir);
-
-    // Check server status by trying to connect.
-    const server_status: []const u8 = blk: {
-        if (tryConnect(socket_path)) |stream| {
-            stream.close();
-            break :blk "running";
-        } else |_| {
-            break :blk "not running";
-        }
-    };
-
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(alloc);
-    const w = buf.writer(alloc);
-
-    try w.print("socket:  {s}\n", .{socket_path});
-    try w.print("logs:    {s}\n", .{log_dir});
-    try w.print("server:  {s}\n", .{server_status});
-
-    // Show relevant env vars if set.
-    if (std.posix.getenv("HTY_SOCKET")) |v| {
-        if (v.len > 0) try w.print("\n$HTY_SOCKET={s}\n", .{v});
-    }
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |v| {
-        if (v.len > 0) try w.print("$XDG_RUNTIME_DIR={s}\n", .{v});
-    }
-    if (std.posix.getenv("XDG_STATE_HOME")) |v| {
-        if (v.len > 0) try w.print("$XDG_STATE_HOME={s}\n", .{v});
-    }
-
-    try printRaw(buf.items);
-}
+const info_cmd = @import("commands/info.zig");
+const runInfo = info_cmd.run;
 
 fn writeUsageError(arg: []const u8) !void {
     const alloc = std.heap.c_allocator;

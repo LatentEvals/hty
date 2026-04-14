@@ -22,7 +22,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "replay")) return replayHelpText();
     if (std.mem.eql(u8, topic, "attach")) return attachHelpText();
     if (std.mem.eql(u8, topic, "keys")) return supportedKeysText();
-    if (std.mem.eql(u8, topic, "info")) return infoHelpText();
+    if (std.mem.eql(u8, topic, "info")) return @import("commands/info.zig").helpText();
     return null;
 }
 
@@ -155,24 +155,6 @@ pub fn logsHelpText() []const u8 {
     \\                   human-readable table.
     \\
     \\Logs live at \$XDG_STATE_HOME/hty/logs (fallback ~/.local/state/hty/logs).
-    \\
-    ;
-}
-
-pub fn infoHelpText() []const u8 {
-    return
-    \\hty info
-    \\
-    \\Show resolved paths and server status. Useful for finding the socket
-    \\path when setting up SSH tunnels for remote observation.
-    \\
-    \\Output includes:
-    \\  socket    Path to the Unix domain socket
-    \\  logs      Directory where session logs are stored
-    \\  server    Whether the server is currently running
-    \\
-    \\Environment variables that affect paths ($HTY_SOCKET, $XDG_RUNTIME_DIR,
-    \\$XDG_STATE_HOME) are shown if set.
     \\
     ;
 }
