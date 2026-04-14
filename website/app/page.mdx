@@ -42,14 +42,15 @@ No flags to memorize. No brittle expect scripts. The agent reads the question an
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 hty run --name demo -- top
-hty wait demo --idle 1000 --timeout 5000
+hty wait demo --text "PID" --timeout 5000
 hty snapshot demo
 hty kill demo
-hty delete demo
+hty logs demo    # still works — the recording is preserved
+hty delete demo  # permanently remove the session and its log
 ```
 
-[Install hty →](/installation)
+[Install hty →](/get-started/installation)
 
-[Quick Start →](/quickstart)
+[Quick Start →](/get-started/quickstart)
 
 [GitHub →](https://github.com/LatentEvals/hty)

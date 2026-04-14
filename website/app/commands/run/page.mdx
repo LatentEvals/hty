@@ -2,22 +2,9 @@
 
 Start a program in a new detached PTY session. The session runs in the background — use `watch`, `snapshot`, or `attach` to interact with it.
 
-## Synopsis
+## Reference
 
-```sh
-hty run [flags] -- <program> [args...]
-```
-
-## Flags
-
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--name` | string | | A human-friendly name for the session. Must be unique across all live sessions. |
-| `--rows` | number | `24` | Terminal height in rows. |
-| `--cols` | number | `80` | Terminal width in columns. |
-| `--scrollback` | number | `10000` | Number of lines to retain in the scrollback buffer. |
-| `--cwd` | string | | Working directory for the spawned program. |
-| `-d`, `--detach` | boolean | | Accepted as a no-op for familiarity (sessions are always detached). |
+<HelpBlock cmd="run" />
 
 ## Examples
 

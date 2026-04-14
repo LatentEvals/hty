@@ -2,17 +2,11 @@
 
 Bidirectional live connection to a running session: renders the session's screen live **and** forwards every keystroke you type into the session. From the program's perspective, your input is indistinguishable from any other client's.
 
-## Synopsis
-
-```sh
-hty attach <session>
-```
-
-When you attach, hty automatically resizes the PTY to match your terminal dimensions.
-
-Press **Ctrl+A d** to detach (tmux-style). This disconnects your client but does not kill the session. **Ctrl+A Ctrl+A** sends a literal Ctrl+A to the program.
-
 Multiple attach clients can be connected to the same session at the same time. All clients see the same screen and all clients can type.
+
+## Reference
+
+<HelpBlock cmd="attach" />
 
 ## Example
 
