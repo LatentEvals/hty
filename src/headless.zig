@@ -3288,6 +3288,97 @@ fn runClientReplay(alloc: Allocator, args: []const []const u8) !void {
     };
 }
 
+/// Pure-VT replay result. Owns the terminal — caller must `deinit`.
+/// `rows`/`cols` reflect the final resize state (initial if none occurred).
+pub const ReplayResult = struct {
+    terminal: hty.ghostty_vt.Terminal,
+    rows: u16,
+    cols: u16,
+
+    pub fn deinit(self: *ReplayResult, alloc: Allocator) void {
+        self.terminal.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+/// Apply one parsed JSONL log event to a VT terminal. Returns true iff the
+/// event was "visible" (output or resize) — i.e. the grid may have changed.
+/// Other kinds (title, bell, input, killed, failure, exited) are ignored.
+///
+/// Shared between `replayLoop` (the CLI viewer) and `replayToTerminal` (the
+/// headless helper) so both agree on what a log event does to the grid.
+fn applyLogEvent(
+    alloc: Allocator,
+    obj: std.json.ObjectMap,
+    terminal: *hty.ghostty_vt.Terminal,
+    stream: *hty.ghostty_vt.TerminalStream,
+    cur_rows: *u16,
+    cur_cols: *u16,
+) !bool {
+    const kind_val = obj.get("kind") orelse return false;
+    if (kind_val != .string) return false;
+    const kind = kind_val.string;
+
+    if (std.mem.eql(u8, kind, "output")) {
+        const hex = getString(obj, "bytes_hex") orelse return false;
+        const decoded = decodeHex(alloc, hex) catch return false;
+        defer alloc.free(decoded);
+        stream.nextSlice(decoded);
+        return true;
+    } else if (std.mem.eql(u8, kind, "resize")) {
+        const nr = getInteger(obj, "rows") orelse return false;
+        const nc = getInteger(obj, "cols") orelse return false;
+        cur_rows.* = @intCast(nr);
+        cur_cols.* = @intCast(nc);
+        try terminal.resize(alloc, cur_cols.*, cur_rows.*);
+        return true;
+    }
+    return false;
+}
+
+/// Feed a session log into a fresh VT engine and return the resulting state.
+/// Pure: no sleeps, no stdout, no stdin. The first line (spawn event) is
+/// skipped — its `rows`/`cols` should be parsed by the caller and passed as
+/// `initial_rows` / `initial_cols`. Malformed lines are tolerated (skipped).
+///
+/// Intended for tests that assert replay produces the same grid as the live
+/// session that recorded the log.
+pub fn replayToTerminal(
+    alloc: Allocator,
+    bytes: []const u8,
+    initial_rows: u16,
+    initial_cols: u16,
+) !ReplayResult {
+    var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+        .cols = initial_cols,
+        .rows = initial_rows,
+        .max_scrollback = 10_000,
+    });
+    errdefer terminal.deinit(alloc);
+
+    const handler = terminal.vtHandler();
+    var stream = hty.ghostty_vt.TerminalStream.initAlloc(alloc, handler);
+    defer stream.deinit();
+
+    var cur_rows: u16 = initial_rows;
+    var cur_cols: u16 = initial_cols;
+
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    _ = it.next(); // skip spawn line (dimensions are passed in explicitly)
+
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        _ = applyLogEvent(alloc, parsed.value.object, &terminal, &stream, &cur_rows, &cur_cols) catch continue;
+    }
+
+    return .{ .terminal = terminal, .rows = cur_rows, .cols = cur_cols };
+}
+
 fn replayLoop(
     alloc: Allocator,
     bytes: []const u8,
@@ -3339,7 +3430,6 @@ fn replayLoop(
 
             const kind_val = obj.get("kind") orelse continue;
             if (kind_val != .string) continue;
-            const kind = kind_val.string;
 
             const past_at = t >= at_threshold;
 
@@ -3355,22 +3445,8 @@ fn replayLoop(
             }
             prev_t = t;
 
-            if (std.mem.eql(u8, kind, "output")) {
-                const hex = getString(obj, "bytes_hex") orelse continue;
-                const decoded = decodeHex(alloc, hex) catch continue;
-                defer alloc.free(decoded);
-                stream.nextSlice(decoded);
-                if (past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
-            } else if (std.mem.eql(u8, kind, "resize")) {
-                const nr = getInteger(obj, "rows") orelse continue;
-                const nc = getInteger(obj, "cols") orelse continue;
-                cur_rows = @intCast(nr);
-                cur_cols = @intCast(nc);
-                try terminal.resize(alloc, cur_cols, cur_rows);
-                if (past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
-            } else {
-                // title, bell, input, killed, failure, exited: not visual.
-            }
+            const visible = try applyLogEvent(alloc, obj, &terminal, &stream, &cur_rows, &cur_cols);
+            if (visible and past_at) try paintFrame(alloc, &terminal, cur_rows, cur_cols);
         }
 
         // End-of-log: without --loop, hold on the final frame until the
