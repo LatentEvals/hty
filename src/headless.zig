@@ -5802,3 +5802,273 @@ test "headless protocol can use emacs to write an org file" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "* Hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "** TODO Write tests") != null);
 }
+
+// ===========================================================================
+// Replay parity tests
+// ===========================================================================
+//
+// These prove that `replayToTerminal` produces the same grid as the live
+// session that recorded the log. If this ever breaks, `hty replay` is lying —
+// which would defeat the entire point of per-session logging. Also exercises
+// the `resize` event path in `applyLogEvent`, which isn't reachable from any
+// of the golden-frame tests.
+
+/// Shared helper: set up a self-contained log dir under /tmp and return it
+/// along with the `by-name` subdir path. Caller owns neither (the returned
+/// paths live in the provided buffers / allocator).
+fn setupReplayLogDir(
+    alloc: std.mem.Allocator,
+    tag: []const u8,
+    log_dir_buf: []u8,
+) !struct { log_dir: []const u8, by_name: []const u8 } {
+    const log_dir = try std.fmt.bufPrint(
+        log_dir_buf,
+        "/tmp/hty-replay-{s}-{d}",
+        .{ tag, std.time.nanoTimestamp() },
+    );
+    try std.fs.cwd().makePath(log_dir);
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    try std.fs.cwd().makePath(by_name);
+    return .{ .log_dir = log_dir, .by_name = by_name };
+}
+
+/// Read `<by_name>/<name>.jsonl` in full. Caller frees.
+fn readSessionLog(alloc: std.mem.Allocator, by_name: []const u8, name: []const u8) ![]u8 {
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ by_name, name });
+    defer alloc.free(link_path);
+    const file = try std.fs.openFileAbsolute(link_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+}
+
+test "replay reproduces the live grid for a colored cat session" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "cat", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = dirs.log_dir;
+
+    const rows: u16 = 12;
+    const cols: u16 = 50;
+
+    // 1. Spawn cat.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "pcat",
+            .program = "/bin/cat",
+            .rows = rows,
+            .cols = cols,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 2. Send something non-trivial: colors + cursor positioning. The grid
+    //    should have fg changes on a prefix and cursor pokes elsewhere.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "pcat",
+            .text = "\x1b[31mred\x1b[32mgreen\x1b[0mplain line one\n\x1b[3;10Hpoke\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 3. Wait for the text to land, then idle to ensure no more output is
+    //    racing us. Without the idle we occasionally snapshot mid-flush and
+    //    replay sees *more* bytes than the live snapshot.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "pcat",
+            .text = "plain line one",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "pcat",
+            .idle_ms = 150,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 4. Capture the live screen_ansi via a dedicated snapshot op so we're
+    //    not tied to the waiter's return payload.
+    const live_ansi = blk: {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "pcat" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
+        if (ansi_val != .string) return error.InvalidResponse;
+        break :blk try alloc.dupe(u8, ansi_val.string);
+    };
+    defer alloc.free(live_ansi);
+
+    // 5. Kill and read the log.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "pcat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const log_bytes = try readSessionLog(alloc, dirs.by_name, "pcat");
+    defer alloc.free(log_bytes);
+
+    // 6. Replay into a fresh VT.
+    var result = try replayToTerminal(alloc, log_bytes, rows, cols);
+    defer result.deinit(alloc);
+
+    // 7. Render with the same dims and compare byte-for-byte.
+    const replayed_ansi = try hty.renderScreenAnsi(alloc, &result.terminal, result.rows, result.cols);
+    defer alloc.free(replayed_ansi);
+
+    try std.testing.expectEqualStrings(live_ansi, replayed_ansi);
+}
+
+test "replay reproduces the live grid across a mid-session resize" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "resize", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = dirs.log_dir;
+
+    const start_rows: u16 = 10;
+    const start_cols: u16 = 40;
+    const new_rows: u16 = 14;
+    const new_cols: u16 = 60;
+
+    // 1. Spawn at the smaller size.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "rcat",
+            .program = "/bin/cat",
+            .rows = start_rows,
+            .cols = start_cols,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 2. Some content before the resize.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rcat",
+            .text = "first round\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "first round",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 3. Resize — this is the event we specifically want `replayToTerminal`
+    //    to replay correctly.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "resize",
+            .session = "rcat",
+            .rows = new_rows,
+            .cols = new_cols,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 4. More content post-resize.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rcat",
+            .text = "second round at the wider size\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rcat",
+            .text = "second round",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "rcat",
+            .idle_ms = 150,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const live_ansi = blk: {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "rcat" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
+        if (ansi_val != .string) return error.InvalidResponse;
+        break :blk try alloc.dupe(u8, ansi_val.string);
+    };
+    defer alloc.free(live_ansi);
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "rcat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const log_bytes = try readSessionLog(alloc, dirs.by_name, "rcat");
+    defer alloc.free(log_bytes);
+
+    // 5. Sanity check: the log must contain a resize event, otherwise this
+    //    test isn't actually exercising the path it claims to.
+    try std.testing.expect(std.mem.indexOf(u8, log_bytes, "\"kind\":\"resize\"") != null);
+
+    // 6. Replay and compare. `result.rows`/`.cols` should reflect the new
+    //    (post-resize) dimensions, proving the resize applied.
+    var result = try replayToTerminal(alloc, log_bytes, start_rows, start_cols);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(new_rows, result.rows);
+    try std.testing.expectEqual(new_cols, result.cols);
+
+    const replayed_ansi = try hty.renderScreenAnsi(alloc, &result.terminal, result.rows, result.cols);
+    defer alloc.free(replayed_ansi);
+
+    try std.testing.expectEqualStrings(live_ansi, replayed_ansi);
+}

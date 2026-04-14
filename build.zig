@@ -88,4 +88,22 @@ pub fn build(b: *std.Build) void {
     headless_tests.root_module.addCSourceFile(.{ .file = b.path("src/regex_helper.c") });
     const run_headless_tests = b.addRunArtifact(headless_tests);
     test_step.dependOn(&run_headless_tests.step);
+
+    // Golden-frame VT tests. cwd is pinned to the build root so the test can
+    // read/write `testdata/vt/*.golden` regardless of where `zig build` was
+    // invoked from.
+    const golden_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vt_golden_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "hty", .module = lib_mod },
+            },
+        }),
+    });
+    const run_golden_tests = b.addRunArtifact(golden_tests);
+    run_golden_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_golden_tests.step);
 }
