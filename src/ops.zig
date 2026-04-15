@@ -24,6 +24,9 @@ const protocol = @import("protocol.zig");
 const Response = protocol.Response;
 const SessionSummary = protocol.SessionSummary;
 const EventPayload = protocol.EventPayload;
+const WaitPayload = protocol.WaitPayload;
+const WaitTextMatch = protocol.WaitTextMatch;
+const WaitExitInfo = protocol.WaitExitInfo;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
@@ -45,6 +48,7 @@ const HtyRegex = opaque {};
 extern fn hty_regex_compile(pattern: [*:0]const u8) ?*HtyRegex;
 extern fn hty_regex_is_valid(re: *const HtyRegex) bool;
 extern fn hty_regex_match(re: *const HtyRegex, haystack: [*:0]const u8) bool;
+extern fn hty_regex_find(re: *const HtyRegex, haystack: [*:0]const u8) c_long;
 extern fn hty_regex_free(re: *HtyRegex) void;
 
 pub fn handleSpawn(
@@ -103,6 +107,41 @@ pub fn handleSpawn(
         .ok = true,
         .session = try buildSessionSummary(arena, sess),
     };
+}
+
+/// Server-side `info` op. Returns the pid and uptime (milliseconds since
+/// the registry was constructed, which is the earliest observable moment
+/// of server life). Clients call this when they want `hty info --json` to
+/// include live server stats. All the "local" fields (`version`,
+/// `socket_path`, `state_dir`, `log_dir`) are empty here because the
+/// client knows its own paths; the server just fills in what only it
+/// can know (pid, uptime).
+pub fn handleInfo(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Response {
+    _ = arena;
+    const now = std.time.milliTimestamp();
+    const uptime_ms = now - registry.started_at_ms;
+    const server_pid: i64 = @intCast(posix_getpid());
+    return .{
+        .id = id,
+        .ok = true,
+        .info = .{
+            .version = "",
+            .socket_path = "",
+            .state_dir = "",
+            .log_dir = "",
+            .server = .{
+                .running = true,
+                .pid = server_pid,
+                .uptime_ms = uptime_ms,
+            },
+        },
+    };
+}
+
+extern "c" fn getpid() c_int;
+
+fn posix_getpid() c_int {
+    return getpid();
 }
 
 pub fn handleList(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Response {
@@ -218,7 +257,8 @@ pub fn handleWaitForText(
     const needle = try readRequiredString(object, "text");
     const use_regex = try readOptionalBool(object, "regex", false);
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    const start_ms = std.time.milliTimestamp();
+    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
     // If regex mode, compile the pattern once up front.
     var compiled_regex: ?*HtyRegex = null;
@@ -245,16 +285,44 @@ pub fn handleWaitForText(
         var snapshot = try sess.terminal.snapshot();
         defer snapshot.deinit(sess.alloc);
 
-        const matched = if (compiled_regex) |re|
-            try regexMatchHaystack(sess.alloc, re, snapshot.buffer)
-        else
-            std.mem.indexOf(u8, snapshot.buffer, needle) != null;
-        if (matched) {
-            return try snapshotResponse(arena, id, snapshot, sess);
+        // Capture the byte offset of the match during the first (and only)
+        // scan so regex callers get a uniform `text.offset` field. The
+        // regex helper returns the offset directly from `regexec`'s
+        // pmatch[0], so this doesn't cost a second pattern execution —
+        // it's the same call that decides match-vs-no-match.
+        const offset: ?i64 = if (compiled_regex) |re| blk: {
+            const pos = try regexFindHaystack(sess.alloc, re, snapshot.buffer);
+            break :blk pos;
+        } else blk: {
+            const idx = std.mem.indexOf(u8, snapshot.buffer, needle);
+            break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
+        };
+        if (offset) |off| {
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            const needle_owned = try arena.dupe(u8, needle);
+            const sid = try arena.dupe(u8, &sess.id);
+            return try snapshotResponseWithWait(arena, id, snapshot, sess, .{
+                .matched = "text",
+                .elapsed_ms = elapsed,
+                .session = sid,
+                .text = .{ .needle = needle_owned, .offset = off },
+            });
         }
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
-    return .{ .id = id, .ok = true, .timed_out = true };
+    const elapsed = std.time.milliTimestamp() - start_ms;
+    const sid = try arena.dupe(u8, &sess.id);
+    return .{
+        .id = id,
+        .ok = true,
+        .timed_out = true,
+        .wait = .{
+            .matched = null,
+            .elapsed_ms = elapsed,
+            .session = sid,
+            .timeout = true,
+        },
+    };
 }
 
 /// Match a regex against a terminal snapshot using bounded temporary memory.
@@ -269,6 +337,20 @@ pub fn regexMatchHaystack(alloc: Allocator, re: *const HtyRegex, haystack: []con
     return hty_regex_match(re, nul_haystack.ptr);
 }
 
+/// Like `regexMatchHaystack` but returns the byte offset of the first match
+/// (or null when the pattern doesn't match). Uses the same bounded-arena
+/// pattern so repeated polling doesn't accumulate haystack copies.
+pub fn regexFindHaystack(alloc: Allocator, re: *const HtyRegex, haystack: []const u8) !?i64 {
+    var haystack_arena = std.heap.ArenaAllocator.init(alloc);
+    defer haystack_arena.deinit();
+
+    const temp_alloc = haystack_arena.allocator();
+    const nul_haystack = try temp_alloc.dupeZ(u8, haystack);
+    const pos = hty_regex_find(re, nul_haystack.ptr);
+    if (pos < 0) return null;
+    return @intCast(pos);
+}
+
 pub fn handleWaitForIdle(
     arena: Allocator,
     registry: *SessionRegistry,
@@ -279,7 +361,8 @@ pub fn handleWaitForIdle(
     const idle_ms_field = try readOptionalU64(object, "idle_ms", 250);
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
     const idle_ms: i64 = @intCast(idle_ms_field);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    const start_ms = std.time.milliTimestamp();
+    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
@@ -288,11 +371,29 @@ pub fn handleWaitForIdle(
         if (since >= idle_ms) {
             var snapshot = try sess.terminal.snapshot();
             defer snapshot.deinit(sess.alloc);
-            return try snapshotResponse(arena, id, snapshot, sess);
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            const sid = try arena.dupe(u8, &sess.id);
+            return try snapshotResponseWithWait(arena, id, snapshot, sess, .{
+                .matched = "idle",
+                .elapsed_ms = elapsed,
+                .session = sid,
+            });
         }
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
-    return .{ .id = id, .ok = true, .timed_out = true };
+    const elapsed = std.time.milliTimestamp() - start_ms;
+    const sid = try arena.dupe(u8, &sess.id);
+    return .{
+        .id = id,
+        .ok = true,
+        .timed_out = true,
+        .wait = .{
+            .matched = null,
+            .elapsed_ms = elapsed,
+            .session = sid,
+            .timeout = true,
+        },
+    };
 }
 
 pub fn handleWaitForExit(
@@ -302,23 +403,45 @@ pub fn handleWaitForExit(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    _ = arena;
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    const start_ms = std.time.milliTimestamp();
+    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
 
         if (sess.getStatus() != .running) {
+            const elapsed = std.time.milliTimestamp() - start_ms;
+            const code_opt = sess.getExitCode();
+            const code: i32 = code_opt orelse 0;
+            const sid = try arena.dupe(u8, &sess.id);
             return .{
                 .id = id,
                 .ok = true,
-                .event = .{ .kind = "exited", .code = sess.getExitCode() },
+                .event = .{ .kind = "exited", .code = code },
+                .wait = .{
+                    .matched = "exit",
+                    .elapsed_ms = elapsed,
+                    .session = sid,
+                    .exit = .{ .code = code },
+                },
             };
         }
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
-    return .{ .id = id, .ok = true, .timed_out = true };
+    const elapsed = std.time.milliTimestamp() - start_ms;
+    const sid = try arena.dupe(u8, &sess.id);
+    return .{
+        .id = id,
+        .ok = true,
+        .timed_out = true,
+        .wait = .{
+            .matched = null,
+            .elapsed_ms = elapsed,
+            .session = sid,
+            .timeout = true,
+        },
+    };
 }
 
 pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, id: ?i64) !Response {
@@ -368,6 +491,18 @@ pub fn handleDelete(arena: Allocator, registry: *SessionRegistry, sess: *Session
 
     registry.remove(sess);
     return .{ .id = id, .ok = true };
+}
+
+pub fn snapshotResponseWithWait(
+    arena: Allocator,
+    id: ?i64,
+    snapshot: hty.ScreenSnapshot,
+    sess: *Session,
+    wait_payload: WaitPayload,
+) !Response {
+    var response = try snapshotResponse(arena, id, snapshot, sess);
+    response.wait = wait_payload;
+    return response;
 }
 
 pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot, sess: *Session) !Response {

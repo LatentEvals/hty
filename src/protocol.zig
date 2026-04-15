@@ -19,6 +19,8 @@ pub const Response = struct {
     event: ?EventPayload = null,
     session: ?SessionSummary = null,
     sessions: ?[]const SessionSummary = null,
+    info: ?InfoPayload = null,
+    wait: ?WaitPayload = null,
 };
 
 pub const SnapshotPayload = struct {
@@ -58,6 +60,49 @@ pub const SessionSummary = struct {
     args: []const u8,
     status: []const u8,
     created_at_ms: i64,
+};
+
+/// `hty info --json` payload. `server` is null when the local server can't
+/// be reached (the diagnostic still wants to show local paths, so we don't
+/// fail the whole command in that case — we just omit the server block).
+pub const InfoPayload = struct {
+    version: []const u8,
+    socket_path: []const u8,
+    state_dir: []const u8,
+    log_dir: []const u8,
+    server: ServerInfo,
+};
+
+pub const ServerInfo = struct {
+    running: bool,
+    pid: ?i64 = null,
+    uptime_ms: ?i64 = null,
+};
+
+/// `hty wait --json` payload. Exactly one of `text` / `exit` is set based
+/// on `matched`; both are null for `--idle` (the elapsed time is the only
+/// interesting field) and on timeout.
+pub const WaitPayload = struct {
+    matched: ?[]const u8,
+    elapsed_ms: i64,
+    session: ?[]const u8 = null,
+    timeout: bool = false,
+    text: ?WaitTextMatch = null,
+    exit: ?WaitExitInfo = null,
+};
+
+pub const WaitTextMatch = struct {
+    needle: []const u8,
+    /// Byte offset of the first matching byte in the rendered buffer, or
+    /// -1 if the offset couldn't be determined (e.g. regex match used a
+    /// different code path). Column/row are intentionally omitted for
+    /// now; the buffer is always line-split on `\n`, so the offset is
+    /// cheap to derive client-side when needed.
+    offset: i64,
+};
+
+pub const WaitExitInfo = struct {
+    code: i32,
 };
 
 /// Serialize a response and append a trailing newline for the JSONL stream.

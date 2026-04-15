@@ -7,7 +7,7 @@ const common = @import("common.zig");
 
 pub fn helpText() []const u8 {
     return
-    \\hty wait [SESSION] --text "..." | --regex "..." | --idle MS | --exit [--timeout MS]
+    \\hty wait [SESSION] --text "..." | --regex "..." | --idle MS | --exit [--timeout MS] [--json]
     \\
     \\Block until the session matches a condition. Exactly one mode flag is
     \\required. Exit 0 on match, 3 on timeout.
@@ -21,6 +21,8 @@ pub fn helpText() []const u8 {
     \\  --exit           Wait until the child process exits.
     \\
     \\  --timeout MS     Max time to wait in milliseconds (default 10000).
+    \\  --json           Emit a structured {matched, elapsed_ms, ...} object
+    \\                   describing the match (or the timeout) to stdout.
     \\
     ;
 }
@@ -32,6 +34,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var idle_ms: ?u64 = null;
     var wait_exit = false;
     var timeout_ms: u64 = 10_000;
+    var json_output = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -55,6 +58,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--timeout requires a value");
             timeout_ms = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
@@ -100,10 +105,47 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     defer parsed.deinit();
     const object = try common.expectOkOrExit(parsed);
 
-    if (object.get("timed_out")) |to_val| {
-        if (to_val == .bool and to_val.bool) {
-            try common.printErr("timed out");
-            std.process.exit(common.ExitCode.wait_timeout);
+    const timed_out = blk: {
+        if (object.get("timed_out")) |to_val| {
+            if (to_val == .bool and to_val.bool) break :blk true;
+        }
+        break :blk false;
+    };
+
+    if (json_output) {
+        try emitWaitJson(alloc, object, timed_out);
+        if (timed_out) std.process.exit(common.ExitCode.wait_timeout);
+        return;
+    }
+
+    if (timed_out) {
+        try common.printErr("timed out");
+        std.process.exit(common.ExitCode.wait_timeout);
+    }
+}
+
+/// Emit the `wait` sub-object from the server's response. If the server
+/// didn't include one (older build), synthesize a minimal payload so the
+/// client contract holds regardless.
+fn emitWaitJson(alloc: Allocator, object: std.json.ObjectMap, timed_out: bool) !void {
+    if (object.get("wait")) |wait_val| {
+        if (wait_val == .object) {
+            const inner = try std.json.Stringify.valueAlloc(alloc, wait_val, .{});
+            defer alloc.free(inner);
+            try common.printLine(inner);
+            return;
         }
     }
+
+    // Fallback: synthesize a minimal object so --json consumers aren't
+    // left parsing nothing. This path shouldn't trigger against a server
+    // built from this same tree.
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    if (timed_out) {
+        try buf.appendSlice("{\"matched\":null,\"timeout\":true,\"elapsed_ms\":0}");
+    } else {
+        try buf.appendSlice("{\"matched\":null,\"timeout\":false,\"elapsed_ms\":0}");
+    }
+    try common.printLine(buf.items);
 }
