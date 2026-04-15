@@ -8,6 +8,10 @@
             .url = "git+https://github.com/ghostty-org/ghostty.git#49a43bf560322eac0ba5d30c20a8b212106e3883",
             .hash = "ghostty-1.3.2-dev-5UdBC3LLBwX3Fjb52en-CuY_WwpS-5BwFaPjFM__Ym1L",
         },
+        .zg = .{
+            .url = "git+https://codeberg.org/atman/zg.git#6ee2b0719052040c979ecde02a74a0cee6253364",
+            .hash = "zg-0.15.3-oGqU3LdJtALmUrI8v7BWf3UcCmebVYZcF0L9aDHnlu7D",
+        },
     },
     .paths = .{
         "build.zig",

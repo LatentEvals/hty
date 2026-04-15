@@ -196,10 +196,91 @@ test "headless protocol can drive cat and snapshot echoed text" {
         try std.testing.expect(screen_ansi == .string);
         try std.testing.expect(std.mem.indexOf(u8, screen_ansi.string, "hello from headless") != null);
         try std.testing.expect(std.mem.indexOf(u8, screen_ansi.string, "\x1b[") != null);
+
+        // `cells` is a rows-length array of cols-length arrays. For a 12x50
+        // session with "hello from headless" echoed on row 0, we expect
+        // cells[0][0..19] to match the visible characters and every other
+        // cell to be a single-space string.
+        const cells = snapshot_object.get("cells") orelse return error.InvalidResponse;
+        try std.testing.expect(cells == .array);
+        try std.testing.expectEqual(@as(usize, 12), cells.array.items.len);
+        for (cells.array.items) |row| {
+            try std.testing.expect(row == .array);
+            try std.testing.expectEqual(@as(usize, 50), row.array.items.len);
+            for (row.array.items) |cell| try std.testing.expect(cell == .string);
+        }
+        const first_row = cells.array.items[0].array.items;
+        const expected = "hello from headless";
+        for (expected, 0..) |ch, i| {
+            try std.testing.expectEqual(@as(usize, 1), first_row[i].string.len);
+            try std.testing.expectEqual(ch, first_row[i].string[0]);
+        }
     }
 
     {
         var parsed = try testRequest(&registry, .{ .op = "kill", .session = "cat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+}
+
+test "snapshot cells field exposes wide-char spacer tails over the RPC" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wide",
+            .program = "/bin/cat",
+            .rows = 6,
+            .cols = 20,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "wide",
+            .text = "日本語\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "wide",
+            .text = "日本語",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const snapshot = object.get("snapshot") orelse return error.InvalidResponse;
+        const snapshot_object = switch (snapshot) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+        const cells = snapshot_object.get("cells") orelse return error.InvalidResponse;
+        try std.testing.expect(cells == .array);
+        try std.testing.expectEqual(@as(usize, 6), cells.array.items.len);
+        const row0 = cells.array.items[0].array.items;
+        try std.testing.expectEqual(@as(usize, 20), row0.len);
+        try std.testing.expectEqualStrings("日", row0[0].string);
+        try std.testing.expectEqualStrings("", row0[1].string);
+        try std.testing.expectEqualStrings("本", row0[2].string);
+        try std.testing.expectEqualStrings("", row0[3].string);
+        try std.testing.expectEqualStrings("語", row0[4].string);
+        try std.testing.expectEqualStrings("", row0[5].string);
+        for (6..20) |c| try std.testing.expectEqualStrings(" ", row0[c].string);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "wide" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }

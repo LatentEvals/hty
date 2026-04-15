@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const ghostty_vt = @import("ghostty-vt");
+pub const Normalize = @import("Normalize");
 
 // forkpty lives in <util.h> on macOS / BSD and <pty.h> on Linux.
 // Pick the right header at comptime based on the target OS.
@@ -81,9 +82,21 @@ pub const ScreenSnapshot = struct {
     buffer: []const u8,
     screen_ansi: []const u8,
     lines: [][]const u8,
+    /// Column-accurate grid. Always rectangular: `cells.len == rows` and
+    /// every `cells[r].len == cols`. Each entry is a heap-allocated UTF-8
+    /// grapheme string. Blank cells are `" "`, spacer tails of wide chars
+    /// are `""`. Grapheme strings are NFC-normalized so combining
+    /// sequences collapse to their precomposed form (e.g. `e + U+0301`
+    /// becomes `"é"`, 2 bytes).
+    cells: [][]const []const u8,
 
     pub fn deinit(self: *ScreenSnapshot, alloc: std.mem.Allocator) void {
         if (self.title) |title| alloc.free(title);
+        for (self.cells) |row| {
+            for (row) |cell| alloc.free(cell);
+            alloc.free(row);
+        }
+        alloc.free(self.cells);
         alloc.free(self.lines);
         alloc.free(self.screen_ansi);
         alloc.free(self.buffer);
@@ -250,6 +263,14 @@ pub const InteractiveTerminal = struct {
             lines[index] = line;
         }
 
+        const cells = try buildCells(
+            self.alloc,
+            &self.terminal,
+            self.config.rows,
+            self.config.cols,
+        );
+        errdefer freeCells(self.alloc, cells);
+
         return .{
             .rows = self.config.rows,
             .cols = self.config.cols,
@@ -259,6 +280,7 @@ pub const InteractiveTerminal = struct {
             .buffer = buffer,
             .screen_ansi = screen_ansi,
             .lines = lines,
+            .cells = cells,
         };
     }
 
@@ -467,6 +489,136 @@ fn hasEnvKey(env: []const EnvVar, needle: []const u8) bool {
         if (std.mem.eql(u8, entry.key, needle)) return true;
     }
     return false;
+}
+
+/// Build a column-accurate `rows x cols` grid of UTF-8 grapheme strings.
+///
+/// Mirrors the iteration used by `renderScreenAnsi` but emits plain strings
+/// instead of ANSI output. The caller owns every slice; free with
+/// `freeCells`.
+///
+/// Per-cell rules (see the `cells` field on `SnapshotPayload` / the issue
+/// acceptance criteria):
+/// - Blank cell: `" "` (single space, one byte).
+/// - Spacer tail/head of a wide character: `""` (empty string).
+/// - `codepoint_grapheme`: concat all codepoints (base + combining marks)
+///   and NFC-normalize the result, so `e + U+0301` folds into the
+///   precomposed `"é"` (2 bytes: 0xc3 0xa9).
+/// - Otherwise: the single codepoint encoded as UTF-8. Single-codepoint
+///   cells are already in NFC by definition, so they aren't re-normalized.
+///
+/// Always rectangular: `result.len == rows`, every `result[r].len == cols`.
+/// Rows that the engine doesn't have yet (beyond `render_rows.len`) and
+/// columns that the row's cell slice doesn't cover are filled with `" "`.
+pub fn buildCells(
+    alloc: std.mem.Allocator,
+    terminal: *ghostty_vt.Terminal,
+    rows: u16,
+    cols: u16,
+) ![][]const []const u8 {
+    var render_state: ghostty_vt.RenderState = .empty;
+    defer render_state.deinit(alloc);
+    try render_state.update(alloc, terminal);
+
+    // Init the Unicode NFC normalizer once per snapshot. Per-cell init
+    // would allocate the full Normalize tables on every grapheme, which
+    // is orders of magnitude more expensive than the normalization itself.
+    const normalize = try Normalize.init(alloc);
+    defer normalize.deinit(alloc);
+
+    const row_slice = render_state.row_data.slice();
+    const render_rows = row_slice.items(.cells);
+
+    var out = try alloc.alloc([]const []const u8, rows);
+    var rows_built: usize = 0;
+    errdefer {
+        for (out[0..rows_built]) |row| {
+            for (row) |cell| alloc.free(cell);
+            alloc.free(row);
+        }
+        alloc.free(out);
+    }
+
+    for (0..rows) |y_usize| {
+        var row = try alloc.alloc([]const u8, cols);
+        var cells_built: usize = 0;
+        errdefer {
+            for (row[0..cells_built]) |cell| alloc.free(cell);
+            alloc.free(row);
+        }
+
+        if (y_usize < render_rows.len) {
+            const cell_slice = render_rows[y_usize].slice();
+            const raw_cells = cell_slice.items(.raw);
+            const graphemes = cell_slice.items(.grapheme);
+
+            for (0..cols) |x_usize| {
+                row[cells_built] = try renderCellString(alloc, &normalize, raw_cells, graphemes, x_usize);
+                cells_built += 1;
+            }
+        } else {
+            while (cells_built < cols) : (cells_built += 1) {
+                row[cells_built] = try alloc.dupe(u8, " ");
+            }
+        }
+
+        out[rows_built] = row;
+        rows_built += 1;
+    }
+
+    return out;
+}
+
+fn renderCellString(
+    alloc: std.mem.Allocator,
+    normalize: *const Normalize,
+    raw_cells: anytype,
+    graphemes: anytype,
+    x: usize,
+) ![]u8 {
+    if (x >= raw_cells.len) {
+        return alloc.dupe(u8, " ");
+    }
+    const raw = raw_cells[x];
+    if (raw.wide == .spacer_tail or raw.wide == .spacer_head) {
+        return alloc.dupe(u8, "");
+    }
+    if (raw.content_tag == .codepoint_grapheme and graphemes[x].len > 0) {
+        // `codepoint_grapheme` means the base char plus one or more
+        // combining codepoints. Concat base + marks into the decomposed
+        // form, then NFC-normalize so "e + U+0301" round-trips as the
+        // precomposed "é" (2 bytes: 0xc3 0xa9) rather than 3 bytes of
+        // decomposed `e` + combining acute. Agents comparing cell
+        // contents to precomposed strings (the common case) need this.
+        var buf = std.array_list.Managed(u8).init(alloc);
+        defer buf.deinit();
+        var tmp: [4]u8 = undefined;
+        const base_cp = raw.codepoint();
+        if (base_cp != 0) {
+            const base_len = try std.unicode.utf8Encode(base_cp, &tmp);
+            try buf.appendSlice(tmp[0..base_len]);
+        }
+        for (graphemes[x]) |cp| {
+            const len = try std.unicode.utf8Encode(cp, &tmp);
+            try buf.appendSlice(tmp[0..len]);
+        }
+        var result = try normalize.nfc(alloc, buf.items);
+        defer result.deinit(alloc);
+        return alloc.dupe(u8, result.slice);
+    }
+    const cp = raw.codepoint();
+    if (cp == 0) return alloc.dupe(u8, " ");
+    var tmp: [4]u8 = undefined;
+    const len = try std.unicode.utf8Encode(cp, &tmp);
+    return alloc.dupe(u8, tmp[0..len]);
+}
+
+pub fn freeCells(alloc: std.mem.Allocator, cells: [][]const []const u8) void {
+    for (cells) |row| {
+        for (row) |cell| alloc.free(cell);
+        alloc.free(row);
+    }
+    alloc.free(cells);
 }
 
 pub fn renderScreenAnsi(
@@ -719,6 +871,119 @@ test "snapshot preserves ansi styling" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "38;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "48;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hi") != null);
+}
+
+// ---------------------------------------------------------------------------
+// `cells` tests (issue #25): column-accurate grid view in the snapshot.
+// These feed fixed bytes into a fresh Terminal and assert on the grid
+// directly, no PTY, no subprocess — deterministic across platforms.
+// ---------------------------------------------------------------------------
+
+const CellsHarness = struct {
+    alloc: std.mem.Allocator,
+    terminal: ghostty_vt.Terminal,
+    stream: ghostty_vt.TerminalStream,
+    cells: [][]const []const u8,
+
+    fn init(alloc: std.mem.Allocator, rows: u16, cols: u16, input: []const u8) !CellsHarness {
+        var terminal = try ghostty_vt.Terminal.init(alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .max_scrollback = 10_000,
+        });
+        errdefer terminal.deinit(alloc);
+        var stream = ghostty_vt.TerminalStream.initAlloc(alloc, terminal.vtHandler());
+        errdefer stream.deinit();
+        stream.nextSlice(input);
+        const cells = try buildCells(alloc, &terminal, rows, cols);
+        return .{
+            .alloc = alloc,
+            .terminal = terminal,
+            .stream = stream,
+            .cells = cells,
+        };
+    }
+
+    fn deinit(self: *CellsHarness) void {
+        freeCells(self.alloc, self.cells);
+        self.stream.deinit();
+        self.terminal.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+test "cells: CJK occupies leading-cell + empty spacer tail" {
+    const alloc = std.testing.allocator;
+    var h = try CellsHarness.init(alloc, 24, 80, "日本語");
+    defer h.deinit();
+
+    try std.testing.expectEqual(@as(usize, 24), h.cells.len);
+    try std.testing.expectEqual(@as(usize, 80), h.cells[0].len);
+
+    try std.testing.expectEqualStrings("日", h.cells[0][0]);
+    try std.testing.expectEqualStrings("", h.cells[0][1]);
+    try std.testing.expectEqualStrings("本", h.cells[0][2]);
+    try std.testing.expectEqualStrings("", h.cells[0][3]);
+    try std.testing.expectEqualStrings("語", h.cells[0][4]);
+    try std.testing.expectEqualStrings("", h.cells[0][5]);
+
+    // Everything after the 6 visual columns is blank space.
+    for (6..80) |col| try std.testing.expectEqualStrings(" ", h.cells[0][col]);
+}
+
+test "cells: combining marks fold into one cell" {
+    const alloc = std.testing.allocator;
+    // "e" + U+0301 (combining acute) — visually "é", a single grapheme.
+    // The cell string is NFC-normalized, so what was stored as a base +
+    // combining codepoint pair collapses to the 2-byte precomposed "é"
+    // (0xc3 0xa9). This is the form agents naturally write in their
+    // comparison strings.
+    var h = try CellsHarness.init(alloc, 24, 80, "e\xcc\x81");
+    defer h.deinit();
+
+    try std.testing.expectEqualStrings("é", h.cells[0][0]);
+    try std.testing.expectEqual(@as(usize, 2), h.cells[0][0].len);
+    try std.testing.expectEqualStrings(" ", h.cells[0][1]);
+}
+
+test "cells: blank terminal is fully rectangular rows x cols of single-space cells" {
+    const alloc = std.testing.allocator;
+    var h = try CellsHarness.init(alloc, 8, 12, "");
+    defer h.deinit();
+
+    try std.testing.expectEqual(@as(usize, 8), h.cells.len);
+    for (h.cells) |row| {
+        try std.testing.expectEqual(@as(usize, 12), row.len);
+        for (row) |cell| try std.testing.expectEqualStrings(" ", cell);
+    }
+}
+
+test "cells: mixed ASCII + wide + ASCII keeps trailing ASCII at true visual column" {
+    const alloc = std.testing.allocator;
+    // "ASCII 日本語 END" — 19 bytes, 16 visual columns.
+    // Visual layout (0-indexed):
+    //   0:A 1:S 2:C 3:I 4:I 5:space
+    //   6:日 7:"" 8:本 9:"" 10:語 11:""
+    //   12:space 13:E 14:N 15:D
+    var h = try CellsHarness.init(alloc, 24, 80, "ASCII 日本語 END");
+    defer h.deinit();
+
+    try std.testing.expectEqualStrings("A", h.cells[0][0]);
+    try std.testing.expectEqualStrings("S", h.cells[0][1]);
+    try std.testing.expectEqualStrings("C", h.cells[0][2]);
+    try std.testing.expectEqualStrings("I", h.cells[0][3]);
+    try std.testing.expectEqualStrings("I", h.cells[0][4]);
+    try std.testing.expectEqualStrings(" ", h.cells[0][5]);
+    try std.testing.expectEqualStrings("日", h.cells[0][6]);
+    try std.testing.expectEqualStrings("", h.cells[0][7]);
+    try std.testing.expectEqualStrings("本", h.cells[0][8]);
+    try std.testing.expectEqualStrings("", h.cells[0][9]);
+    try std.testing.expectEqualStrings("語", h.cells[0][10]);
+    try std.testing.expectEqualStrings("", h.cells[0][11]);
+    try std.testing.expectEqualStrings(" ", h.cells[0][12]);
+    try std.testing.expectEqualStrings("E", h.cells[0][13]);
+    try std.testing.expectEqualStrings("N", h.cells[0][14]);
+    try std.testing.expectEqualStrings("D", h.cells[0][15]);
 }
 
 fn waitForText(

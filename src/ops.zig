@@ -143,6 +143,7 @@ pub fn handleSnapshot(arena: Allocator, sess: *Session, id: ?i64) !Response {
     while (line_iter.next()) |line| : (idx += 1) {
         lines[idx] = line;
     }
+    const cells = try dupeCells(arena, snapshot.cells);
 
     return .{
         .id = id,
@@ -156,9 +157,24 @@ pub fn handleSnapshot(arena: Allocator, sess: *Session, id: ?i64) !Response {
             .buffer = buffer,
             .screen_ansi = screen_ansi,
             .lines = lines,
+            .cells = cells,
             .status = statusName(sess.getStatus()),
         },
     };
+}
+
+/// Deep-copy the `cells` grid from `ScreenSnapshot` (terminal-owned) into
+/// arena memory so it can safely outlive `snapshot.deinit`.
+fn dupeCells(arena: Allocator, src: [][]const []const u8) ![]const []const []const u8 {
+    const rows = try arena.alloc([]const []const u8, src.len);
+    for (src, 0..) |row, r| {
+        const row_copy = try arena.alloc([]const u8, row.len);
+        for (row, 0..) |cell, c| {
+            row_copy[c] = try arena.dupe(u8, cell);
+        }
+        rows[r] = row_copy;
+    }
+    return rows;
 }
 
 pub fn handleSendText(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
@@ -367,6 +383,7 @@ pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot
     while (line_iter.next()) |line| : (idx += 1) {
         lines[idx] = line;
     }
+    const cells = try dupeCells(arena, snapshot.cells);
 
     return .{
         .id = id,
@@ -380,6 +397,7 @@ pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot
             .buffer = buffer,
             .screen_ansi = screen_ansi,
             .lines = lines,
+            .cells = cells,
             .status = statusName(sess.getStatus()),
         },
     };
