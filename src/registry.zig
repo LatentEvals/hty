@@ -52,6 +52,7 @@ pub const SessionRegistry = struct {
     ) !*Session {
         if (name_owned) |n| {
             if (self.name_index.contains(n)) return error.NameAlreadyExists;
+            if (log_mod.nameInUse(self.alloc, self.log_dir, n)) return error.NameAlreadyExists;
         }
 
         const sess = try self.alloc.create(Session);
