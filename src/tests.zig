@@ -1463,4 +1463,66 @@ test "delete op removes the session record and its log files" {
     var find_parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "todelete" });
     defer find_parsed.deinit();
     try expectTestError(find_parsed, "session not found");
+
+    // The name is free again after delete.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "todelete",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+}
+
+test "named sessions stay reserved across registry restarts until delete" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-name-reservation-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    {
+        var registry = SessionRegistry.init(alloc);
+        defer registry.deinit();
+        registry.log_dir = log_dir;
+
+        const uuid = try spawnCatSession(&registry, "reserved");
+        defer alloc.free(uuid);
+
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "reserved",
+            .text = "hello\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var registry = SessionRegistry.init(alloc);
+        defer registry.deinit();
+        registry.log_dir = log_dir;
+
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "reserved",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        try expectTestError(parsed, "already exists");
+    }
 }

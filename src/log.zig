@@ -11,9 +11,11 @@ const std = @import("std");
 const hty = @import("hty");
 const session_mod = @import("session.zig");
 const hex_mod = @import("hex.zig");
+const json_mod = @import("json.zig");
 
 const Allocator = std.mem.Allocator;
 const Session = session_mod.Session;
+const getString = json_mod.getString;
 
 /// Append one JSONL line (no trailing newline on input) to the session's log
 /// file, followed by '\n'. Silent no-op if the session has no log file.
@@ -173,4 +175,66 @@ pub fn logResizeEvent(arena: Allocator, sess: *Session, rows: u16, cols: u16) vo
         .cols = cols,
     }, .{}) catch return;
     writeLogEvent(sess, line);
+}
+
+/// Best-effort check for whether `name` is already reserved by a session log
+/// or by-name symlink on disk. Used to keep named sessions reserved until the
+/// corresponding log is deleted.
+pub fn nameInUse(alloc: Allocator, log_dir: ?[]const u8, name: []const u8) bool {
+    const dir = log_dir orelse return false;
+
+    const link_path = std.fmt.allocPrint(alloc, "{s}/by-name/{s}.jsonl", .{ dir, name }) catch return false;
+    defer alloc.free(link_path);
+    if (fileExistsAbsolute(link_path)) return true;
+
+    var root = std.fs.openDirAbsolute(dir, .{ .iterate = true }) catch return false;
+    defer root.close();
+
+    var it = root.iterate();
+    while (it.next() catch return false) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+
+        const path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
+        defer alloc.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch continue;
+        defer file.close();
+
+        var line_buf = std.array_list.Managed(u8).init(alloc);
+        defer line_buf.deinit();
+
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = file.read(&chunk) catch break;
+            if (n == 0) break;
+            if (std.mem.indexOfScalar(u8, chunk[0..n], '\n')) |nl| {
+                line_buf.appendSlice(chunk[0..nl]) catch break;
+                break;
+            }
+            line_buf.appendSlice(chunk[0..n]) catch break;
+        }
+
+        const line = line_buf.items;
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => continue,
+        };
+        const kind = getString(obj, "kind") orelse continue;
+        if (!std.mem.eql(u8, kind, "spawn")) continue;
+        const existing_name = getString(obj, "name") orelse continue;
+        if (std.mem.eql(u8, existing_name, name)) return true;
+    }
+
+    return false;
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
