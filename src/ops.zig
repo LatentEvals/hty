@@ -212,21 +212,30 @@ pub fn handleWaitForText(
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
         var snapshot = try sess.terminal.snapshot();
-        const matched = if (compiled_regex) |re| blk: {
-            const nul_haystack = arena.dupeZ(u8, snapshot.buffer) catch {
-                snapshot.deinit(sess.alloc);
-                return error.OutOfMemory;
-            };
-            break :blk hty_regex_match(re, nul_haystack.ptr);
-        } else std.mem.indexOf(u8, snapshot.buffer, needle) != null;
+        defer snapshot.deinit(sess.alloc);
+
+        const matched = if (compiled_regex) |re|
+            try regexMatchHaystack(sess.alloc, re, snapshot.buffer)
+        else
+            std.mem.indexOf(u8, snapshot.buffer, needle) != null;
         if (matched) {
-            defer snapshot.deinit(sess.alloc);
             return try snapshotResponse(arena, id, snapshot, sess);
         }
-        snapshot.deinit(sess.alloc);
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
     return .{ .id = id, .ok = true, .timed_out = true };
+}
+
+/// Match a regex against a terminal snapshot using bounded temporary memory.
+/// The haystack copy lives only for the duration of this call, so repeated
+/// polling does not accumulate copies in the long-lived request arena.
+pub fn regexMatchHaystack(alloc: Allocator, re: *const HtyRegex, haystack: []const u8) !bool {
+    var haystack_arena = std.heap.ArenaAllocator.init(alloc);
+    defer haystack_arena.deinit();
+
+    const temp_alloc = haystack_arena.allocator();
+    const nul_haystack = try temp_alloc.dupeZ(u8, haystack);
+    return hty_regex_match(re, nul_haystack.ptr);
 }
 
 pub fn handleWaitForIdle(
@@ -420,4 +429,26 @@ test "joinArgs handles empty, single, multi" {
     const multi_result = try joinArgs(std.testing.allocator, &.{ "foo", "bar baz", "qux" });
     defer std.testing.allocator.free(multi_result);
     try std.testing.expectEqualStrings("foo bar baz qux", multi_result);
+}
+
+test "regexMatchHaystack does not retain haystack copies across calls" {
+    var gpa = std.heap.DebugAllocator(.{ .enable_memory_limit = true }){};
+    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
+    const alloc = gpa.allocator();
+
+    const pattern = try alloc.dupeZ(u8, "needle");
+    defer alloc.free(pattern);
+    const re = hty_regex_compile(pattern.ptr) orelse return error.OutOfMemory;
+    defer hty_regex_free(re);
+
+    const haystack = try alloc.alloc(u8, 16 * 1024);
+    defer alloc.free(haystack);
+    @memset(haystack, 'a');
+
+    const baseline = gpa.total_requested_bytes;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try std.testing.expect(!(try regexMatchHaystack(alloc, re, haystack)));
+        try std.testing.expectEqual(baseline, gpa.total_requested_bytes);
+    }
 }
