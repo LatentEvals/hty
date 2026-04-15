@@ -2,11 +2,11 @@
     .name = .hty,
     .version = "0.0.0",
     .fingerprint = 0xdb0f36e00d6a41f5,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty.git#7127abfe285014c62bc1f9b24d4e038af7f94afa",
-            .hash = "ghostty-1.3.2-dev-5UdBC7fJBgUFTOA6aTSDGVDV_hxFFYomh6I3xnNY5yuY",
+            .url = "git+https://github.com/ghostty-org/ghostty.git#49a43bf560322eac0ba5d30c20a8b212106e3883",
+            .hash = "ghostty-1.3.2-dev-5UdBC3LLBwX3Fjb52en-CuY_WwpS-5BwFaPjFM__Ym1L",
         },
     },
     .paths = .{
