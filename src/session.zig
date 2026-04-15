@@ -23,6 +23,13 @@ pub fn statusName(status: SessionStatus) []const u8 {
 }
 
 pub const Session = struct {
+    /// Sentinel for "exit code not set" inside the atomic storage. POSIX
+    /// exit codes are 0-255 and the session's own status atomic tells the
+    /// reader whether the code is meaningful at all, so using INT_MIN here
+    /// is only a defence-in-depth if someone reads exit_code directly
+    /// without checking status first.
+    pub const no_exit_code: i32 = std.math.minInt(i32);
+
     alloc: Allocator,
     id: [36]u8,
     name: ?[]u8,
@@ -30,14 +37,67 @@ pub const Session = struct {
     program: []u8,
     args_joined: []u8,
     created_at_ms: i64,
-    last_screen_change_at_ms: i64,
-    status: SessionStatus,
-    exit_code: ?i32 = null,
+
+    /// Lifecycle fields mutated by the server's drain loop (accept thread)
+    /// and read by worker threads running wait / snapshot handlers. Stored
+    /// as atomics so readers don't need to hold a lock while polling.
+    /// Writers use release ordering; readers use acquire. When `status`
+    /// transitions to a terminal state, `exit_code` must be written first
+    /// so the release-acquire pair publishes both together.
+    last_screen_change_at_ms_atomic: std.atomic.Value(i64),
+    status_atomic: std.atomic.Value(u8),
+    exit_code_atomic: std.atomic.Value(i32),
+
     log_file: ?std.fs.File = null,
+    /// Serializes writes to `log_file`. Held by every log helper in `log.zig`
+    /// since multiple threads (drain, attach reader, RPC workers) call into
+    /// the log writers concurrently once the server becomes multi-threaded.
+    log_mutex: std.Thread.Mutex = .{},
+
     /// Active `hty attach` clients subscribed to this session's output.
     attach_clients: std.ArrayListUnmanaged(*AttachClient) = .{},
     /// Protects attach_clients against concurrent broadcast and remove.
     attach_mutex: std.Thread.Mutex = .{},
+
+    pub fn initAtomics(now_ms: i64) struct {
+        last_screen_change_at_ms_atomic: std.atomic.Value(i64),
+        status_atomic: std.atomic.Value(u8),
+        exit_code_atomic: std.atomic.Value(i32),
+    } {
+        return .{
+            .last_screen_change_at_ms_atomic = .init(now_ms),
+            .status_atomic = .init(@intFromEnum(SessionStatus.running)),
+            .exit_code_atomic = .init(no_exit_code),
+        };
+    }
+
+    pub fn getStatus(self: *const Session) SessionStatus {
+        return @enumFromInt(self.status_atomic.load(.acquire));
+    }
+
+    pub fn setStatus(self: *Session, new_status: SessionStatus) void {
+        self.status_atomic.store(@intFromEnum(new_status), .release);
+    }
+
+    pub fn getExitCode(self: *const Session) ?i32 {
+        const v = self.exit_code_atomic.load(.acquire);
+        return if (v == no_exit_code) null else v;
+    }
+
+    /// Set the exit code. The caller must set `status` to a non-running
+    /// value afterwards (the status store is the release barrier that
+    /// publishes the code to readers).
+    pub fn setExitCode(self: *Session, code: i32) void {
+        self.exit_code_atomic.store(code, .release);
+    }
+
+    pub fn getLastScreenChange(self: *const Session) i64 {
+        return self.last_screen_change_at_ms_atomic.load(.acquire);
+    }
+
+    pub fn touchLastScreenChange(self: *Session, now_ms: i64) void {
+        self.last_screen_change_at_ms_atomic.store(now_ms, .release);
+    }
 
     pub fn deinit(self: *Session) void {
         // Tear down any still-attached clients before freeing the session.
