@@ -182,11 +182,11 @@ Every session is recorded to a JSONL log. `hty export --format asciicast` conver
 ```sh
 hty export my-session --format asciicast > run.cast
 
-# GIF
+# GIF — agg reads asciicast directly
 agg run.cast run.gif
 
-# MP4 / full control
-vhs run.cast -o run.mp4
+# MP4 — convert the GIF with ffmpeg
+agg run.cast run.gif && ffmpeg -i run.gif run.mp4
 
 # Share on asciinema.org
 asciinema upload run.cast
