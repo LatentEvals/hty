@@ -226,3 +226,13 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         return error.Detach;
     }
 }
+
+test "detectAttachOp recognizes attach requests" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\",\"session\":\"foo\"}"));
+    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\"}"));
+    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"snapshot\"}"));
+    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"spawn\",\"program\":\"/bin/sh\"}"));
+    try std.testing.expect(!detectAttachOp(alloc, "not json"));
+    try std.testing.expect(!detectAttachOp(alloc, "[\"attach\"]"));
+}

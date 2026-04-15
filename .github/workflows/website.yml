@@ -5,11 +5,11 @@ on:
     branches: [main]
     paths:
       - website/**
-      - src/help_text.zig
+      - src/commands/**
   pull_request:
     paths:
       - website/**
-      - src/help_text.zig
+      - src/commands/**
   workflow_dispatch:
 
 permissions:

@@ -407,3 +407,17 @@ pub fn eventToPayload(arena: Allocator, event: hty.OutputEvent) !EventPayload {
         },
     };
 }
+
+test "joinArgs handles empty, single, multi" {
+    const empty_result = try joinArgs(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(empty_result);
+    try std.testing.expectEqualStrings("", empty_result);
+
+    const single_result = try joinArgs(std.testing.allocator, &.{"foo"});
+    defer std.testing.allocator.free(single_result);
+    try std.testing.expectEqualStrings("foo", single_result);
+
+    const multi_result = try joinArgs(std.testing.allocator, &.{ "foo", "bar baz", "qux" });
+    defer std.testing.allocator.free(multi_result);
+    try std.testing.expectEqualStrings("foo bar baz qux", multi_result);
+}
