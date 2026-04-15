@@ -35,6 +35,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var cols: u16 = 80;
     var cwd: ?[]const u8 = null;
     var scrollback: usize = 10_000;
+    var json_output = false;
 
     var i: usize = 0;
     var program_args_start: ?usize = null;
@@ -67,6 +68,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--scrollback requires a value");
             scrollback = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
@@ -126,6 +129,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         },
     };
 
+    if (json_output) {
+        // Re-emit just the `session` sub-object wrapped so the top-level
+        // shape matches other --json commands: { "session": {...} }. We
+        // skip the outer `ok`/`error` fields because the client already
+        // consumed them via expectOkOrExit; anything else (like cwd) is
+        // a server concern not a wire-contract field.
+        try emitRunJson(alloc, sess_obj);
+        return;
+    }
+
     const id_val = sess_obj.get("id") orelse return;
     const id_str = switch (id_val) {
         .string => |s| s,
@@ -142,4 +155,20 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     } else {
         try common.printLine(try std.fmt.allocPrint(alloc, "session {s} started", .{id_str[0..8]}));
     }
+}
+
+fn emitRunJson(alloc: Allocator, sess_obj: std.json.ObjectMap) !void {
+    const inner = try std.json.Stringify.valueAlloc(
+        alloc,
+        std.json.Value{ .object = sess_obj },
+        .{},
+    );
+    defer alloc.free(inner);
+
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    try buf.appendSlice("{\"session\":");
+    try buf.appendSlice(inner);
+    try buf.appendSlice("}");
+    try common.printLine(buf.items);
 }

@@ -31,9 +31,15 @@ pub const SessionRegistry = struct {
     /// Lock order: registry_mutex → (any session-local mutex). Never
     /// acquired while holding a session-local lock.
     mutex: std.Thread.Mutex = .{},
+    /// Unix-epoch milliseconds at which this registry was created. Used by
+    /// `hty info --json` to report the server's uptime.
+    started_at_ms: i64 = 0,
 
     pub fn init(alloc: Allocator) SessionRegistry {
-        return .{ .alloc = alloc };
+        return .{
+            .alloc = alloc,
+            .started_at_ms = std.time.milliTimestamp(),
+        };
     }
 
     pub fn deinit(self: *SessionRegistry) void {

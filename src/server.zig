@@ -331,9 +331,12 @@ pub fn dispatchRequest(
 ) !Response {
     if (std.mem.eql(u8, op, "spawn")) return ops.handleSpawn(arena, registry, object, id);
     if (std.mem.eql(u8, op, "list")) return ops.handleList(arena, registry, id);
+    if (std.mem.eql(u8, op, "info")) return ops.handleInfo(arena, registry, id);
 
     // Validate the op before touching the session registry so unknown ops
     // surface as UnknownOperation rather than SessionNotFound.
+    // Note: `info` and `list` are dispatched above (no session needed), so
+    // they're not in this list.
     const known_ops = [_][]const u8{
         "snapshot",      "send_text",     "send_key",       "send_bytes_hex",
         "resize",        "wait_for_text", "wait_for_idle",  "wait_for_exit",

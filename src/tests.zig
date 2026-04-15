@@ -11,6 +11,7 @@ const std = @import("std");
 const hty = @import("hty");
 
 const list_cmd = @import("commands/list.zig");
+const info_cmd = @import("commands/info.zig");
 const SessionRegistry = @import("registry.zig").SessionRegistry;
 const processRequestLine = @import("server.zig").processRequestLine;
 const replayToTerminal = @import("commands/replay.zig").replayToTerminal;
@@ -2033,4 +2034,316 @@ test "concurrency: server shuts down cleanly while a wait handler is in flight" 
     });
     defer del_parsed.deinit();
     _ = try expectTestOk(del_parsed);
+}
+
+// ===========================================================================
+// `--json` output tests for info / run / wait (issue #22)
+// ===========================================================================
+
+test "info json with no live server populates local fields and marks server down" {
+    const alloc = std.testing.allocator;
+    const payload = try info_cmd.buildInfoPayload(
+        alloc,
+        "0.0.0",
+        "/tmp/sock",
+        "/tmp/state",
+        "/tmp/logs",
+        null,
+    );
+    try std.testing.expectEqualStrings("0.0.0", payload.version);
+    try std.testing.expectEqualStrings("/tmp/sock", payload.socket_path);
+    try std.testing.expectEqualStrings("/tmp/state", payload.state_dir);
+    try std.testing.expectEqualStrings("/tmp/logs", payload.log_dir);
+    try std.testing.expectEqual(false, payload.server.running);
+    try std.testing.expectEqual(@as(?i64, null), payload.server.pid);
+    try std.testing.expectEqual(@as(?i64, null), payload.server.uptime_ms);
+}
+
+test "info json with a live server reports pid and uptime" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    // Make the uptime non-zero so the assertion has something to check.
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+
+    var parsed = try testRequest(&registry, .{ .op = "info" });
+    defer parsed.deinit();
+    const response_line = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(response_line);
+
+    const payload = try info_cmd.buildInfoPayload(
+        alloc,
+        "0.0.0",
+        "/tmp/sock",
+        "/tmp/state",
+        "/tmp/logs",
+        response_line,
+    );
+    try std.testing.expectEqual(true, payload.server.running);
+    // pid and uptime_ms should both have been filled from the server.
+    try std.testing.expect(payload.server.pid != null);
+    try std.testing.expect(payload.server.pid.? > 0);
+    try std.testing.expect(payload.server.uptime_ms != null);
+    try std.testing.expect(payload.server.uptime_ms.? >= 0);
+}
+
+test "run json returns a session with id, name, program, and args (issue #22)" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    var parsed = try testRequest(&registry, .{
+        .op = "spawn",
+        .name = "runjson",
+        .program = "/bin/cat",
+        .args = [_][]const u8{"-u"},
+        .rows = 8,
+        .cols = 24,
+        .emit_raw_bytes = false,
+    });
+    defer parsed.deinit();
+    const object = try expectTestOk(parsed);
+
+    const session = object.get("session") orelse return error.InvalidResponse;
+    const session_obj = switch (session) {
+        .object => |o| o,
+        else => return error.InvalidResponse,
+    };
+
+    const id_val = session_obj.get("id") orelse return error.InvalidResponse;
+    try std.testing.expect(id_val == .string);
+    // UUID shape: 36 chars (8-4-4-4-12).
+    try std.testing.expectEqual(@as(usize, 36), id_val.string.len);
+    try std.testing.expectEqual(@as(u8, '-'), id_val.string[8]);
+    try std.testing.expectEqual(@as(u8, '-'), id_val.string[13]);
+    try std.testing.expectEqual(@as(u8, '-'), id_val.string[18]);
+    try std.testing.expectEqual(@as(u8, '-'), id_val.string[23]);
+
+    const name_val = session_obj.get("name") orelse return error.InvalidResponse;
+    try std.testing.expect(name_val == .string);
+    try std.testing.expectEqualStrings("runjson", name_val.string);
+
+    const program_val = session_obj.get("program") orelse return error.InvalidResponse;
+    try std.testing.expect(program_val == .string);
+    try std.testing.expectEqualStrings("/bin/cat", program_val.string);
+
+    const args_val = session_obj.get("args") orelse return error.InvalidResponse;
+    try std.testing.expect(args_val == .string);
+    try std.testing.expectEqualStrings("-u", args_val.string);
+
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "runjson" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait --json text match reports matched, elapsed_ms, and text.needle+offset" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wjson-text",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "wjson-text",
+            .text = "greetings earthlings\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "wjson-text",
+            .text = "earthlings",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const w = wait.object;
+
+        const matched = w.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .string);
+        try std.testing.expectEqualStrings("text", matched.string);
+
+        const elapsed = w.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        try std.testing.expect(elapsed.integer >= 0);
+
+        const text = w.get("text") orelse return error.InvalidResponse;
+        try std.testing.expect(text == .object);
+        const needle = text.object.get("needle") orelse return error.InvalidResponse;
+        try std.testing.expect(needle == .string);
+        try std.testing.expectEqualStrings("earthlings", needle.string);
+        const offset = text.object.get("offset") orelse return error.InvalidResponse;
+        try std.testing.expect(offset == .integer);
+        try std.testing.expect(offset.integer >= 0);
+
+        const session = w.get("session") orelse return error.InvalidResponse;
+        try std.testing.expect(session == .string);
+        try std.testing.expectEqual(@as(usize, 36), session.string.len);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "wjson-text" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait --json idle match reports matched=idle and elapsed_ms" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wjson-idle",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "wjson-idle",
+            .idle_ms = 50,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const w = wait.object;
+
+        const matched = w.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .string);
+        try std.testing.expectEqualStrings("idle", matched.string);
+
+        const elapsed = w.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        try std.testing.expect(elapsed.integer >= 0);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "wjson-idle" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait --json exit match reports matched=exit and exit.code" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    // `true` exits immediately with code 0. Resolve via PATH so this works
+    // on Linux (/bin/true) and macOS (/usr/bin/true).
+    const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
+    defer alloc.free(true_path);
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wjson-exit",
+            .program = true_path,
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_exit",
+            .session = "wjson-exit",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const w = wait.object;
+
+        const matched = w.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .string);
+        try std.testing.expectEqualStrings("exit", matched.string);
+
+        const exit_obj_val = w.get("exit") orelse return error.InvalidResponse;
+        try std.testing.expect(exit_obj_val == .object);
+        const code = exit_obj_val.object.get("code") orelse return error.InvalidResponse;
+        try std.testing.expect(code == .integer);
+        try std.testing.expectEqual(@as(i64, 0), code.integer);
+    }
+    // Best-effort cleanup — session may already be gone.
+    var kill_parsed = testRequest(&registry, .{ .op = "kill", .session = "wjson-exit" }) catch return;
+    kill_parsed.deinit();
+}
+
+test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wjson-timeout",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "wjson-timeout",
+            .text = "neverappears",
+            .timeout_ms = 150,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const timed_out = object.get("timed_out") orelse return error.InvalidResponse;
+        try std.testing.expect(timed_out == .bool);
+        try std.testing.expectEqual(true, timed_out.bool);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const w = wait.object;
+
+        const matched = w.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .null);
+
+        const to = w.get("timeout") orelse return error.InvalidResponse;
+        try std.testing.expect(to == .bool);
+        try std.testing.expectEqual(true, to.bool);
+
+        const elapsed = w.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        try std.testing.expect(elapsed.integer >= 0);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "wjson-timeout" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
 }

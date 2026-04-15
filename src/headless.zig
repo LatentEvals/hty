@@ -87,7 +87,7 @@ pub fn main() !void {
         return;
     }
     if (std.mem.eql(u8, verb, "keys")) return commands.keys_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "info")) return commands.info_mod.run(alloc);
+    if (std.mem.eql(u8, verb, "info")) return commands.info_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "run")) return commands.run_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "list")) return commands.list_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "watch")) return commands.watch_mod.run(alloc, subargs);
