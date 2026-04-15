@@ -48,6 +48,7 @@ const HtyRegex = opaque {};
 extern fn hty_regex_compile(pattern: [*:0]const u8) ?*HtyRegex;
 extern fn hty_regex_is_valid(re: *const HtyRegex) bool;
 extern fn hty_regex_match(re: *const HtyRegex, haystack: [*:0]const u8) bool;
+extern fn hty_regex_find(re: *const HtyRegex, haystack: [*:0]const u8) c_long;
 extern fn hty_regex_free(re: *HtyRegex) void;
 
 pub fn handleSpawn(
@@ -284,13 +285,14 @@ pub fn handleWaitForText(
         var snapshot = try sess.terminal.snapshot();
         defer snapshot.deinit(sess.alloc);
 
-        // For plain-text matches we can cheaply report the byte offset.
-        // Regex matches keep offset = -1 to avoid an extra regex execution
-        // just to compute the match position; clients that care can find
-        // it themselves on the returned buffer.
+        // Capture the byte offset of the match during the first (and only)
+        // scan so regex callers get a uniform `text.offset` field. The
+        // regex helper returns the offset directly from `regexec`'s
+        // pmatch[0], so this doesn't cost a second pattern execution —
+        // it's the same call that decides match-vs-no-match.
         const offset: ?i64 = if (compiled_regex) |re| blk: {
-            const matched = try regexMatchHaystack(sess.alloc, re, snapshot.buffer);
-            break :blk if (matched) @as(i64, -1) else null;
+            const pos = try regexFindHaystack(sess.alloc, re, snapshot.buffer);
+            break :blk pos;
         } else blk: {
             const idx = std.mem.indexOf(u8, snapshot.buffer, needle);
             break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
@@ -333,6 +335,20 @@ pub fn regexMatchHaystack(alloc: Allocator, re: *const HtyRegex, haystack: []con
     const temp_alloc = haystack_arena.allocator();
     const nul_haystack = try temp_alloc.dupeZ(u8, haystack);
     return hty_regex_match(re, nul_haystack.ptr);
+}
+
+/// Like `regexMatchHaystack` but returns the byte offset of the first match
+/// (or null when the pattern doesn't match). Uses the same bounded-arena
+/// pattern so repeated polling doesn't accumulate haystack copies.
+pub fn regexFindHaystack(alloc: Allocator, re: *const HtyRegex, haystack: []const u8) !?i64 {
+    var haystack_arena = std.heap.ArenaAllocator.init(alloc);
+    defer haystack_arena.deinit();
+
+    const temp_alloc = haystack_arena.allocator();
+    const nul_haystack = try temp_alloc.dupeZ(u8, haystack);
+    const pos = hty_regex_find(re, nul_haystack.ptr);
+    if (pos < 0) return null;
+    return @intCast(pos);
 }
 
 pub fn handleWaitForIdle(

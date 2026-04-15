@@ -2203,6 +2203,76 @@ test "wait --json text match reports matched, elapsed_ms, and text.needle+offset
     _ = try expectTestOk(kill_parsed);
 }
 
+test "wait --json regex match reports a real byte offset in text.offset" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "wjson-regex",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 60,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "wjson-regex",
+            .text = "prefix-- order 42 confirmed\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "wjson-regex",
+            .text = "order [0-9]+ confirmed",
+            .regex = true,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const w = wait.object;
+
+        const matched = w.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .string);
+        try std.testing.expectEqualStrings("text", matched.string);
+
+        const text = w.get("text") orelse return error.InvalidResponse;
+        try std.testing.expect(text == .object);
+        const offset = text.object.get("offset") orelse return error.InvalidResponse;
+        try std.testing.expect(offset == .integer);
+        // Regex matches must now produce a real offset, not -1.
+        try std.testing.expect(offset.integer >= 0);
+
+        // The reported offset must actually point at a matching prefix.
+        const snapshot = object.get("snapshot") orelse return error.InvalidResponse;
+        try std.testing.expect(snapshot == .object);
+        const buffer = snapshot.object.get("buffer") orelse return error.InvalidResponse;
+        try std.testing.expect(buffer == .string);
+        const buf = buffer.string;
+        const off: usize = @intCast(offset.integer);
+        try std.testing.expect(off < buf.len);
+        // The snapshot buffer starts with "prefix-- " before the matching
+        // region, so the offset should land at the start of "order ".
+        try std.testing.expect(std.mem.startsWith(u8, buf[off..], "order "));
+    }
+
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "wjson-regex" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
 test "wait --json idle match reports matched=idle and elapsed_ms" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(alloc);
