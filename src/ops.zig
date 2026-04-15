@@ -106,6 +106,13 @@ pub fn handleSpawn(
 }
 
 pub fn handleList(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Response {
+    // Build the summary list under the registry lock so we don't see a
+    // session being removed mid-iteration. `buildSessionSummary` only
+    // reads atomic/immutable session fields, so holding the lock across
+    // it is fine — no session-local locks acquired inside.
+    registry.mutex.lock();
+    defer registry.mutex.unlock();
+
     const summaries = try arena.alloc(SessionSummary, registry.by_id.count());
     var it = registry.by_id.valueIterator();
     var index: usize = 0;
@@ -149,7 +156,7 @@ pub fn handleSnapshot(arena: Allocator, sess: *Session, id: ?i64) !Response {
             .buffer = buffer,
             .screen_ansi = screen_ansi,
             .lines = lines,
-            .status = statusName(sess.status),
+            .status = statusName(sess.getStatus()),
         },
     };
 }
@@ -209,8 +216,16 @@ pub fn handleWaitForText(
     }
     defer if (compiled_regex) |re| hty_regex_free(re);
 
+    // Drain before each sleep. The accept thread also drains every 25ms,
+    // but in-process test callers drive `processRequestLine` directly
+    // with no accept loop, so the wait handlers remain the only thing
+    // flushing events into the log and updating session state. Each
+    // drainAll acquires the registry lock briefly and releases before
+    // the sleep, so concurrent workers are not serialized behind the
+    // wait.
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
+
         var snapshot = try sess.terminal.snapshot();
         defer snapshot.deinit(sess.alloc);
 
@@ -252,7 +267,8 @@ pub fn handleWaitForIdle(
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
-        const since = std.time.milliTimestamp() - sess.last_screen_change_at_ms;
+
+        const since = std.time.milliTimestamp() - sess.getLastScreenChange();
         if (since >= idle_ms) {
             var snapshot = try sess.terminal.snapshot();
             defer snapshot.deinit(sess.alloc);
@@ -276,11 +292,12 @@ pub fn handleWaitForExit(
 
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
-        if (sess.status != .running) {
+
+        if (sess.getStatus() != .running) {
             return .{
                 .id = id,
                 .ok = true,
-                .event = .{ .kind = "exited", .code = sess.exit_code },
+                .event = .{ .kind = "exited", .code = sess.getExitCode() },
             };
         }
         std.Thread.sleep(25 * std.time.ns_per_ms);
@@ -290,11 +307,11 @@ pub fn handleWaitForExit(
 
 pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, id: ?i64) !Response {
     _ = registry;
-    if (sess.status == .running) {
+    if (sess.getStatus() == .running) {
         logKilledEvent(arena, sess);
         closeLogFile(sess);
         sess.terminal.kill() catch {};
-        sess.status = .killed;
+        sess.setStatus(.killed);
         // Name stays reserved — the session record is still browsable and
         // replayable until explicitly removed with `hty delete`.
     }
@@ -303,11 +320,11 @@ pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, 
 
 pub fn handleDelete(arena: Allocator, registry: *SessionRegistry, sess: *Session, id: ?i64) !Response {
     // Terminate the child if it's still running so we don't orphan it.
-    if (sess.status == .running) {
+    if (sess.getStatus() == .running) {
         logKilledEvent(arena, sess);
         closeLogFile(sess);
         sess.terminal.kill() catch {};
-        sess.status = .killed;
+        sess.setStatus(.killed);
     } else {
         // Already ended; just make sure the log file handle is closed.
         closeLogFile(sess);
@@ -363,7 +380,7 @@ pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot
             .buffer = buffer,
             .screen_ansi = screen_ansi,
             .lines = lines,
-            .status = statusName(sess.status),
+            .status = statusName(sess.getStatus()),
         },
     };
 }
@@ -374,7 +391,7 @@ pub fn buildSessionSummary(arena: Allocator, sess: *Session) !SessionSummary {
         .name = if (sess.name) |n| try arena.dupe(u8, n) else null,
         .program = try arena.dupe(u8, sess.program),
         .args = try arena.dupe(u8, sess.args_joined),
-        .status = statusName(sess.status),
+        .status = statusName(sess.getStatus()),
         .created_at_ms = sess.created_at_ms,
     };
 }

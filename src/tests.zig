@@ -1605,3 +1605,351 @@ test "named sessions stay reserved across registry restarts until delete" {
         try expectTestError(parsed, "already exists");
     }
 }
+
+// ===========================================================================
+// Concurrency tests (LatentEvals/hty#14)
+// ===========================================================================
+//
+// Three layers, from fastest to most realistic:
+//
+// 1. In-process: drive processRequestLine from two threads on a shared
+//    registry. Proves the mutex design doesn't deadlock and produces
+//    coherent map state.
+//
+// 2. Socket-level: run the full server loop in a background thread on a
+//    temporary Unix socket. Two clients issue interleaved RPCs. One
+//    client runs a `wait_for_text` that will time out; the other must
+//    still get a `list` response within a generous but sub-wait budget.
+//    This is the "before: fails, after: passes" test for #14.
+//
+// 3. Shutdown-while-busy: ensures `runServerWithOpts` unwinds cleanly
+//    when a worker is mid-RPC, by joining the worker pool before
+//    registry teardown.
+
+const runServerWithOpts = @import("server.zig").runServerWithOpts;
+const dispatchRequest = @import("server.zig").dispatchRequest;
+
+test "concurrency: two workers drive the same registry without crashing" {
+    const alloc = std.testing.allocator;
+
+    const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-conc-inproc-{d}", .{std.time.nanoTimestamp()});
+    defer alloc.free(log_dir);
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // Spawn a session we can poke at from both threads.
+    const uuid = try spawnCatSession(&registry, "concurrent");
+    defer alloc.free(uuid);
+
+    const ThreadCtx = struct {
+        reg: *SessionRegistry,
+        op: []const u8,
+        success: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < 20) : (i += 1) {
+                // Each call builds its own arena inside processRequestLine,
+                // so nothing is shared between iterations.
+                var parsed = testRequest(self.reg, .{
+                    .op = self.op,
+                    .session = "concurrent",
+                }) catch return;
+                defer parsed.deinit();
+                _ = expectTestOk(parsed) catch return;
+            }
+            self.success.store(true, .release);
+        }
+    };
+
+    var ctx_a = ThreadCtx{ .reg = &registry, .op = "snapshot" };
+    var ctx_b = ThreadCtx{ .reg = &registry, .op = "list" };
+
+    const ta = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx_a});
+    const tb = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx_b});
+    ta.join();
+    tb.join();
+
+    try std.testing.expect(ctx_a.success.load(.acquire));
+    try std.testing.expect(ctx_b.success.load(.acquire));
+}
+
+// Shared harness for the socket-level concurrency tests: spins up a real
+// `runServerWithOpts` in a background thread on a tmp Unix socket and
+// returns the paths / signals needed to drive it + tear it down cleanly.
+const ServerHarness = struct {
+    socket_path: []u8,
+    log_dir: []u8,
+    stop: std.atomic.Value(bool),
+    thread: std.Thread,
+    server_err: std.atomic.Value(bool),
+    /// Heap-allocated context owned by the server thread. Freed here on
+    /// teardown after the thread has been joined so its storage outlives
+    /// any possible last access.
+    ctx: *ServerEntryCtx,
+
+    fn deinit(self: *ServerHarness, alloc: std.mem.Allocator) void {
+        self.stop.store(true, .release);
+        self.thread.join();
+        std.fs.cwd().deleteTree(self.log_dir) catch {};
+        alloc.destroy(self.ctx);
+        alloc.free(self.socket_path);
+        alloc.free(self.log_dir);
+    }
+};
+
+const ServerEntryCtx = struct {
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    stop: *std.atomic.Value(bool),
+    err_flag: *std.atomic.Value(bool),
+
+    fn run(self: *ServerEntryCtx) void {
+        runServerWithOpts(self.alloc, self.socket_path, .{
+            .empty_grace_ms = 30_000, // let stop_signal control exit
+            .stop_signal = self.stop,
+        }) catch {
+            self.err_flag.store(true, .release);
+        };
+    }
+};
+
+fn startServerHarness(alloc: std.mem.Allocator, tag: []const u8) !*ServerHarness {
+    const harness = try alloc.create(ServerHarness);
+    errdefer alloc.destroy(harness);
+
+    const stamp = std.time.nanoTimestamp();
+    const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-{s}-log-{d}", .{ tag, stamp });
+    errdefer alloc.free(log_dir);
+    try std.fs.cwd().makePath(log_dir);
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    // Unix-socket paths are capped at ~104 bytes on macOS / ~108 on
+    // Linux. Keep the path short and predictable; uniqueness comes from
+    // the nanosecond timestamp plus the per-test `tag`.
+    const socket_path = try std.fmt.allocPrint(alloc, "/tmp/hty-{s}-{d}.sock", .{ tag, stamp });
+    errdefer alloc.free(socket_path);
+    // Clear any stale path from a previous run — the server unlinks on
+    // its own, but this keeps the test hermetic if a prior run crashed.
+    std.fs.cwd().deleteFile(socket_path) catch {};
+
+    const ctx = try alloc.create(ServerEntryCtx);
+    errdefer alloc.destroy(ctx);
+
+    harness.* = .{
+        .socket_path = socket_path,
+        .log_dir = log_dir,
+        .stop = .init(false),
+        .server_err = .init(false),
+        .thread = undefined,
+        .ctx = ctx,
+    };
+
+    ctx.* = .{
+        .alloc = alloc,
+        .socket_path = harness.socket_path,
+        .stop = &harness.stop,
+        .err_flag = &harness.server_err,
+    };
+
+    harness.thread = try std.Thread.spawn(.{}, ServerEntryCtx.run, .{ctx});
+
+    // Give the server a moment to create the socket file.
+    var tries: usize = 0;
+    while (tries < 50) : (tries += 1) {
+        std.fs.accessAbsolute(harness.socket_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        return harness;
+    }
+    return error.ServerSocketNotReady;
+}
+
+fn socketRequest(
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    value: anytype,
+) !std.json.Parsed(std.json.Value) {
+    const request_line = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(request_line);
+
+    const stream = try std.net.connectUnixSocket(socket_path);
+    defer stream.close();
+
+    try stream.writeAll(request_line);
+    try stream.writeAll("\n");
+
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = stream.read(&chunk) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(chunk[0..n]);
+        if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
+    }
+    const newline = std.mem.indexOfScalar(u8, buf.items, '\n') orelse buf.items.len;
+    return std.json.parseFromSlice(std.json.Value, alloc, buf.items[0..newline], .{});
+}
+
+test "concurrency: long wait_for_text does not block concurrent list (LatentEvals/hty#14)" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "conc14");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // 1. Spawn a session via the server.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "sleepy",
+        });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        _ = obj;
+    }
+
+    // 2. In a background thread, kick off a wait_for_text for a needle
+    //    that will never appear, with a bounded timeout. This is the
+    //    handler that blocked everyone else in the pre-fix server.
+    const WaitCtx = struct {
+        alloc: std.mem.Allocator,
+        socket_path: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var parsed = socketRequest(self.alloc, self.socket_path, .{
+                .op = "wait_for_text",
+                .session = "sleepy",
+                .text = "impossible-needle-that-will-never-match",
+                .timeout_ms = 1500,
+            }) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            parsed.deinit();
+            self.done.store(true, .release);
+        }
+    };
+
+    var wait_ctx = WaitCtx{ .alloc = alloc, .socket_path = harness.socket_path };
+    const wait_thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&wait_ctx});
+
+    // Small delay so the wait handler is definitely mid-poll when we
+    // issue the competing list call. The wait does its first drainAll
+    // and then sleeps 25ms; 100ms is plenty of wiggle room.
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+
+    // 3. Issue a `list` request and time it. In the pre-fix server this
+    //    would queue behind the wait and return after ~1.5 seconds.
+    //    After the fix it should return within a drain tick plus a bit
+    //    of socket round-trip — well under 500ms on any CI runner.
+    const start = std.time.milliTimestamp();
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const elapsed = std.time.milliTimestamp() - start;
+
+    // Generous budget: the pre-fix behavior would be ~1500ms (the wait's
+    // full timeout). 500ms gives plenty of slack for slow CI runners
+    // without risking a false positive if the bug returns.
+    try std.testing.expect(elapsed < 500);
+
+    wait_thread.join();
+    try std.testing.expect(wait_ctx.done.load(.acquire));
+
+    // 4. Clean up the session so the server's empty-grace timer would
+    //    eventually fire (though we stop via the signal first).
+    var kill_parsed = try socketRequest(alloc, harness.socket_path, .{
+        .op = "delete",
+        .session = "sleepy",
+    });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "concurrency: server shuts down cleanly while a wait handler is in flight" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "concshut");
+    defer {
+        // deinit signals stop + joins the server thread. If the server
+        // can't unwind because a worker is stuck, this test would hang;
+        // that's the assertion — the wait_for_exit handler must observe
+        // the session's status transition and return promptly.
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "shutdowner",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Kick off a wait_for_exit with a timeout well past the test's own
+    // deadline. The only way this returns quickly is via status change.
+    const WaitCtx = struct {
+        alloc: std.mem.Allocator,
+        socket_path: []const u8,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var parsed = socketRequest(self.alloc, self.socket_path, .{
+                .op = "wait_for_exit",
+                .session = "shutdowner",
+                .timeout_ms = 30_000,
+            }) catch {
+                self.done.store(true, .release);
+                return;
+            };
+            parsed.deinit();
+            self.done.store(true, .release);
+        }
+    };
+
+    var wait_ctx = WaitCtx{ .alloc = alloc, .socket_path = harness.socket_path };
+    const wait_thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&wait_ctx});
+
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Kill the session — handleKill transitions status to .killed, which
+    // handleWaitForExit observes on its next poll (25ms).
+    var kill_parsed = try socketRequest(alloc, harness.socket_path, .{
+        .op = "kill",
+        .session = "shutdowner",
+    });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+
+    wait_thread.join();
+    try std.testing.expect(wait_ctx.done.load(.acquire));
+
+    // Clean up session record so the server's post-test shutdown is tidy.
+    var del_parsed = try socketRequest(alloc, harness.socket_path, .{
+        .op = "delete",
+        .session = "shutdowner",
+    });
+    defer del_parsed.deinit();
+    _ = try expectTestOk(del_parsed);
+}

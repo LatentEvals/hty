@@ -19,13 +19,30 @@ const getString = json_mod.getString;
 
 /// Append one JSONL line (no trailing newline on input) to the session's log
 /// file, followed by '\n'. Silent no-op if the session has no log file.
+///
+/// Takes `sess.log_mutex` so records from concurrent writers (drain thread,
+/// attach reader thread, RPC worker threads) don't interleave mid-line. The
+/// two `writeAll` calls underneath are not atomic at the syscall level —
+/// without the mutex, a big record could have another thread's newline
+/// injected between its payload and its terminator.
 pub fn writeLogEvent(sess: *Session, line: []const u8) void {
+    sess.log_mutex.lock();
+    defer sess.log_mutex.unlock();
+    writeLogEventLocked(sess, line);
+}
+
+/// Caller must hold `sess.log_mutex`. Used when a caller already holds the
+/// lock for a compound operation (e.g. `openSessionLog` — install the file
+/// handle and write the spawn line atomically with respect to drain events).
+fn writeLogEventLocked(sess: *Session, line: []const u8) void {
     const log_file = sess.log_file orelse return;
     log_file.writeAll(line) catch return;
     log_file.writeAll("\n") catch return;
 }
 
 pub fn closeLogFile(sess: *Session) void {
+    sess.log_mutex.lock();
+    defer sess.log_mutex.unlock();
     if (sess.log_file) |*f| {
         f.close();
         sess.log_file = null;
@@ -64,7 +81,6 @@ pub fn openSessionLog(
         file.close();
         return;
     };
-    sess.log_file = file;
 
     const spawn_payload = .{
         .t = std.time.milliTimestamp(),
@@ -75,8 +91,18 @@ pub fn openSessionLog(
         .rows = rows,
         .cols = cols,
     };
-    const line = std.json.Stringify.valueAlloc(arena, spawn_payload, .{}) catch return;
-    writeLogEvent(sess, line);
+    const line = std.json.Stringify.valueAlloc(arena, spawn_payload, .{}) catch {
+        file.close();
+        return;
+    };
+
+    // Install the file handle and write the spawn line atomically with
+    // respect to any concurrent drain events that would otherwise sneak in
+    // ahead of the spawn record.
+    sess.log_mutex.lock();
+    defer sess.log_mutex.unlock();
+    sess.log_file = file;
+    writeLogEventLocked(sess, line);
 
     if (sess.name) |name| {
         createByNameSymlink(arena, dir, name, &sess.id) catch |err| {

@@ -27,7 +27,118 @@ const handleAttachConnection = server_attach.handleAttachConnection;
 
 const empty_grace_ms: i64 = 10_000;
 
+/// Optional configuration for the server accept loop. Production uses the
+/// defaults; tests pass a short `empty_grace_ms` and/or a `stop_signal`
+/// they can flip externally so the loop exits promptly.
+pub const RunOpts = struct {
+    empty_grace_ms: i64 = empty_grace_ms,
+    /// If non-null, the accept loop returns as soon as it observes this
+    /// flag set to true (and after joining in-flight workers).
+    stop_signal: ?*std.atomic.Value(bool) = null,
+};
+
+/// One in-flight RPC connection owned by a worker thread. The accept loop
+/// spawns one of these per accept; the worker runs `workerMain`, which
+/// dispatches the request and then marks `done` so the accept loop reaps
+/// and joins the thread on its next sweep.
+const Worker = struct {
+    alloc: Allocator,
+    registry: *SessionRegistry,
+    conn: std.net.Server.Connection,
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+fn workerMain(worker: *Worker) void {
+    defer worker.done.store(true, .release);
+    const result = handleConnection(worker.alloc, worker.registry, &worker.conn) catch |err| blk: {
+        std.debug.print("request failed: {s}\n", .{@errorName(err)});
+        break :blk ConnectionResult.done;
+    };
+    switch (result) {
+        .done => worker.conn.stream.close(),
+        .attached => {}, // The attach reader thread now owns the stream.
+    }
+}
+
+/// Shared state between the accept loop and in-flight worker threads.
+/// `mutex` protects `workers` against concurrent append (new accept) and
+/// swapRemove (sweep after a worker signals done).
+const WorkerPool = struct {
+    alloc: Allocator,
+    mutex: std.Thread.Mutex = .{},
+    workers: std.ArrayListUnmanaged(*Worker) = .{},
+
+    fn init(alloc: Allocator) WorkerPool {
+        return .{ .alloc = alloc };
+    }
+
+    fn spawn(self: *WorkerPool, registry: *SessionRegistry, conn: std.net.Server.Connection) !void {
+        const worker = try self.alloc.create(Worker);
+        errdefer self.alloc.destroy(worker);
+        worker.* = .{ .alloc = self.alloc, .registry = registry, .conn = conn };
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.workers.append(self.alloc, worker);
+        worker.thread = try std.Thread.spawn(.{}, workerMain, .{worker});
+    }
+
+    /// Join any workers that have signalled `done`. Called periodically
+    /// from the accept loop so completed threads don't accumulate.
+    fn sweep(self: *WorkerPool) void {
+        self.mutex.lock();
+        var joined: std.ArrayListUnmanaged(*Worker) = .{};
+        defer joined.deinit(self.alloc);
+
+        var i: usize = 0;
+        while (i < self.workers.items.len) {
+            const w = self.workers.items[i];
+            if (w.done.load(.acquire)) {
+                _ = self.workers.swapRemove(i);
+                joined.append(self.alloc, w) catch {};
+                continue;
+            }
+            i += 1;
+        }
+        self.mutex.unlock();
+
+        // Join and free outside the lock so a slow join can't stall new
+        // accepts that want to register their own worker.
+        for (joined.items) |w| {
+            if (w.thread) |t| t.join();
+            self.alloc.destroy(w);
+        }
+    }
+
+    /// Drain all outstanding workers on shutdown. Each worker's RPC is
+    /// bounded by the protocol's timeouts (longest is `wait_for_*` at 10s
+    /// default, but most are <25ms). After this returns, no RPC workers
+    /// are still touching the registry.
+    fn joinAll(self: *WorkerPool) void {
+        self.mutex.lock();
+        const remaining = self.workers.toOwnedSlice(self.alloc) catch &.{};
+        self.mutex.unlock();
+        defer if (remaining.len > 0) self.alloc.free(remaining);
+
+        for (remaining) |w| {
+            if (w.thread) |t| t.join();
+            self.alloc.destroy(w);
+        }
+    }
+
+    fn outstanding(self: *WorkerPool) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.workers.items.len;
+    }
+};
+
 pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
+    return runServerWithOpts(alloc, socket_path, .{});
+}
+
+pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpts) !void {
     // Unlink stale socket file if present.
     std.posix.unlink(socket_path) catch |err| switch (err) {
         error.FileNotFound => {},
@@ -41,6 +152,11 @@ pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
 
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();
+
+    var pool = WorkerPool.init(alloc);
+    // Drain workers before tearing down the registry they might still
+    // reference. Ordering: workers first, registry second (reverse of init).
+    defer pool.joinAll();
 
     // Resolve the session log directory best-effort. If it can't be set up,
     // the server still runs — log hooks skip when registry.log_dir is null.
@@ -61,9 +177,9 @@ pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
     }
 
     // Auto-shutdown: start in "empty" state. Every time the registry drops to
-    // zero running sessions we note the timestamp; if we sit there for
-    // empty_grace_ms without a new session, exit the server. A new session
-    // clears the timer. The grace period absorbs rapid kill+run sequences.
+    // zero running sessions AND no worker threads are still mid-RPC, we note
+    // the timestamp; if we sit there for `empty_grace_ms` without new work,
+    // exit the server. A new session or a new RPC clears the timer.
     var empty_since_ms: ?i64 = std.time.milliTimestamp();
 
     while (true) {
@@ -83,35 +199,45 @@ pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
 
         // Drain every tick so attach clients see output promptly and the
         // session log file captures bytes even if the session has no RPC
-        // traffic driving it.
+        // traffic driving it. This is the only drain caller now — wait
+        // handlers used to call drainAll themselves but moved to pure
+        // read-only polling when the server became multi-threaded.
         registry.drainAll();
 
+        // Reap any workers that finished their RPC since the last tick.
+        pool.sweep();
+
         if (ready > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
-            var conn = server.accept() catch |err| {
+            const conn = server.accept() catch |err| {
                 std.debug.print("accept failed: {s}\n", .{@errorName(err)});
                 continue;
             };
-            const result = handleConnection(alloc, &registry, &conn) catch |err| blk: {
-                std.debug.print("request failed: {s}\n", .{@errorName(err)});
-                break :blk ConnectionResult.done;
+            pool.spawn(&registry, conn) catch |err| {
+                std.debug.print("worker spawn failed: {s}\n", .{@errorName(err)});
+                conn.stream.close();
             };
-            switch (result) {
-                .done => conn.stream.close(),
-                .attached => {}, // Reader thread owns the stream now.
-            }
+        }
+
+        // External stop signal (test harness) wins over the empty timer.
+        if (opts.stop_signal) |flag| {
+            if (flag.load(.acquire)) return;
         }
 
         // Update the empty-tracking timer based on the post-tick state.
         // Zombie (exited) sessions don't count — we only care whether
-        // there's any _running_ process we'd be cutting off.
-        if (registry.activeCount() > 0) {
+        // there's any _running_ process we'd be cutting off. In-flight
+        // workers also gate the timer: we won't initiate shutdown while
+        // a wait_for_* or other long RPC is mid-flight.
+        const active = registry.activeCount();
+        const busy = pool.outstanding();
+        if (active > 0 or busy > 0) {
             empty_since_ms = null;
         } else if (empty_since_ms == null) {
             empty_since_ms = std.time.milliTimestamp();
         }
 
         if (empty_since_ms) |since| {
-            if (std.time.milliTimestamp() - since >= empty_grace_ms) return;
+            if (std.time.milliTimestamp() - since >= opts.empty_grace_ms) return;
         }
     }
 }

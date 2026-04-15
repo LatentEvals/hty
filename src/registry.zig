@@ -26,12 +26,18 @@ pub const SessionRegistry = struct {
     /// (runServer owns the allocation). If null, session spawn/drain hooks
     /// skip log-file operations — used by unit tests.
     log_dir: ?[]const u8 = null,
+    /// Protects the two maps above against concurrent access from worker
+    /// threads running RPC handlers and the accept thread running drainAll.
+    /// Lock order: registry_mutex → (any session-local mutex). Never
+    /// acquired while holding a session-local lock.
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(alloc: Allocator) SessionRegistry {
         return .{ .alloc = alloc };
     }
 
     pub fn deinit(self: *SessionRegistry) void {
+        // No lock needed: callers must drop all references before deinit.
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {
             sess_ptr.*.deinit();
@@ -50,8 +56,15 @@ pub const SessionRegistry = struct {
         args_joined_owned: []u8,
         name_owned: ?[]u8,
     ) !*Session {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (name_owned) |n| {
             if (self.name_index.contains(n)) return error.NameAlreadyExists;
+            // `nameInUse` does filesystem I/O (scans the log dir). We hold
+            // the registry lock across it because the alternative — check
+            // without the lock, then take it — is TOCTOU-prone and session
+            // creation is cold-path.
             if (log_mod.nameInUse(self.alloc, self.log_dir, n)) return error.NameAlreadyExists;
         }
 
@@ -59,6 +72,7 @@ pub const SessionRegistry = struct {
         errdefer self.alloc.destroy(sess);
 
         const now = std.time.milliTimestamp();
+        const atomics = Session.initAtomics(now);
         sess.* = .{
             .alloc = self.alloc,
             .id = undefined,
@@ -67,8 +81,9 @@ pub const SessionRegistry = struct {
             .program = program_owned,
             .args_joined = args_joined_owned,
             .created_at_ms = now,
-            .last_screen_change_at_ms = now,
-            .status = .running,
+            .last_screen_change_at_ms_atomic = atomics.last_screen_change_at_ms_atomic,
+            .status_atomic = atomics.status_atomic,
+            .exit_code_atomic = atomics.exit_code_atomic,
         };
         uuid_mod.generateUuidV7(&sess.id);
 
@@ -80,11 +95,17 @@ pub const SessionRegistry = struct {
     /// Resolve a session reference (full UUID, unique prefix, or name).
     /// Returns null if no match. Returns error.AmbiguousPrefix if prefix matches 2+.
     pub fn resolve(self: *SessionRegistry, reference: []const u8) !?*Session {
-        // Exact ID match
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.resolveLocked(reference);
+    }
+
+    /// Caller must hold `self.mutex`. Used internally by `resolve` and by
+    /// operations like `resolveOrSole` that need to do multiple map reads
+    /// under a single lock.
+    fn resolveLocked(self: *SessionRegistry, reference: []const u8) !?*Session {
         if (self.by_id.get(reference)) |sess| return sess;
-        // Name match
         if (self.name_index.get(reference)) |sess| return sess;
-        // Prefix match on IDs
         var match_count: usize = 0;
         var match: ?*Session = null;
         var it = self.by_id.iterator();
@@ -100,8 +121,10 @@ pub const SessionRegistry = struct {
 
     /// Resolve or pick the sole session when reference is null.
     pub fn resolveOrSole(self: *SessionRegistry, reference: ?[]const u8) !*Session {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (reference) |r| {
-            return (try self.resolve(r)) orelse error.SessionNotFound;
+            return (try self.resolveLocked(r)) orelse error.SessionNotFound;
         }
         if (self.by_id.count() == 0) return error.SessionNotFound;
         if (self.by_id.count() > 1) return error.AmbiguousPrefix;
@@ -110,6 +133,8 @@ pub const SessionRegistry = struct {
     }
 
     pub fn remove(self: *SessionRegistry, sess: *Session) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         _ = self.by_id.remove(&sess.id);
         if (sess.name) |n| _ = self.name_index.remove(n);
         sess.deinit();
@@ -121,22 +146,32 @@ pub const SessionRegistry = struct {
     /// remove sessions from the registry — ended sessions linger as records
     /// that `hty list` / `hty logs` / `hty replay` can still find, until
     /// explicitly removed with `hty delete`.
+    ///
+    /// Holds `registry.mutex` for the whole iteration so workers can't
+    /// remove a session mid-drain. The per-session work inside the loop
+    /// acquires session-local locks (terminal, log, attach) — these are
+    /// always taken after `registry.mutex`, matching the declared lock order.
     pub fn drainAll(self: *SessionRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {
             const sess = sess_ptr.*;
             while (sess.terminal.pollEvent()) |event| {
                 const now = std.time.milliTimestamp();
                 switch (event) {
-                    .screen_update => sess.last_screen_change_at_ms = now,
+                    .screen_update => sess.touchLastScreenChange(now),
                     .exited => |code| {
                         // Only transition from .running — if the session
                         // was already marked .killed by handleKill, don't
                         // overwrite that with .exited when the child dies
                         // from the SIGKILL.
-                        if (sess.status == .running) {
-                            sess.status = .exited;
-                            sess.exit_code = code;
+                        if (sess.getStatus() == .running) {
+                            // Write exit_code before status so the release
+                            // store on status publishes both atomically.
+                            sess.setExitCode(code orelse Session.no_exit_code);
+                            sess.setStatus(.exited);
                             log_mod.logDrainedEvent(sess, now, event);
                             attach.broadcastExitedToAttach(sess, code);
                             log_mod.closeLogFile(sess);
@@ -145,8 +180,8 @@ pub const SessionRegistry = struct {
                         }
                     },
                     .failure => {
-                        if (sess.status == .running) {
-                            sess.status = .failed;
+                        if (sess.getStatus() == .running) {
+                            sess.setStatus(.failed);
                             log_mod.logDrainedEvent(sess, now, event);
                             log_mod.closeLogFile(sess);
                         }
@@ -170,11 +205,13 @@ pub const SessionRegistry = struct {
     /// the registry as zombies until either `hty kill` reaps them explicitly
     /// or the server auto-shuts-down. Used by the auto-shutdown timer — we
     /// don't want zombies to block an otherwise-idle server from exiting.
-    pub fn activeCount(self: *const SessionRegistry) usize {
+    pub fn activeCount(self: *SessionRegistry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var count: usize = 0;
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {
-            if (sess_ptr.*.status == .running) count += 1;
+            if (sess_ptr.*.getStatus() == .running) count += 1;
         }
         return count;
     }
