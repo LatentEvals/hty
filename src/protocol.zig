@@ -30,6 +30,13 @@ pub const SnapshotPayload = struct {
     buffer: []const u8,
     screen_ansi: []const u8,
     lines: []const []const u8,
+    /// Column-accurate grid view: `cells.len == rows` and every
+    /// `cells[r].len == cols`. Each entry is a UTF-8 grapheme string.
+    /// - Blank cell: `" "` (single space).
+    /// - Leading cell of a wide character: the grapheme (e.g. `"日"`).
+    /// - Spacer-tail cell (trailing half of a wide char): `""`.
+    /// Purely positional; carries no styling.
+    cells: []const []const []const u8,
     status: []const u8 = "running",
 };
 
