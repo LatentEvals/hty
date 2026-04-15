@@ -21,6 +21,7 @@ const commands = struct {
     const attach_mod = @import("commands/attach.zig");
     const replay_mod = @import("commands/replay.zig");
     const logs_mod = @import("commands/logs.zig");
+    const export_mod = @import("commands/export.zig");
     const keys_mod = @import("commands/keys.zig");
     const info_mod = @import("commands/info.zig");
 };
@@ -37,6 +38,8 @@ comptime {
     _ = @import("commands/send.zig");
     _ = @import("commands/logs.zig");
     _ = @import("commands/replay.zig");
+    _ = @import("commands/asciicast.zig");
+    _ = @import("commands/export.zig");
 }
 
 /// Suppress std.log output below error level across the whole binary.
@@ -97,6 +100,7 @@ pub fn main() !void {
     if (std.mem.eql(u8, verb, "kill")) return commands.kill_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "delete")) return commands.delete_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "logs")) return commands.logs_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "export")) return commands.export_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "replay")) return commands.replay_mod.run(alloc, subargs);
     if (std.mem.eql(u8, verb, "attach")) return commands.attach_mod.run(alloc, subargs);
 
