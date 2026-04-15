@@ -106,4 +106,23 @@ pub fn build(b: *std.Build) void {
     const run_golden_tests = b.addRunArtifact(golden_tests);
     run_golden_tests.setCwd(b.path("."));
     test_step.dependOn(&run_golden_tests.step);
+
+    // Real-program fixture tests. Same cwd pinning — reads session logs and
+    // goldens from `testdata/sessions/`. The fixture suite is deterministic
+    // because replay is pure byte-feeding into a fresh VT, so committed logs
+    // produce the same grid on every OS.
+    const fixture_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vt_fixture_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "hty", .module = lib_mod },
+            },
+        }),
+    });
+    const run_fixture_tests = b.addRunArtifact(fixture_tests);
+    run_fixture_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_fixture_tests.step);
 }
