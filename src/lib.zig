@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 pub const ghostty_vt = @import("ghostty-vt");
+pub const Normalize = @import("Normalize");
 
 // forkpty lives in <util.h> on macOS / BSD and <pty.h> on Linux.
 // Pick the right header at comptime based on the target OS.
@@ -84,7 +85,9 @@ pub const ScreenSnapshot = struct {
     /// Column-accurate grid. Always rectangular: `cells.len == rows` and
     /// every `cells[r].len == cols`. Each entry is a heap-allocated UTF-8
     /// grapheme string. Blank cells are `" "`, spacer tails of wide chars
-    /// are `""`.
+    /// are `""`. Grapheme strings are NFC-normalized so combining
+    /// sequences collapse to their precomposed form (e.g. `e + U+0301`
+    /// becomes `"é"`, 2 bytes).
     cells: [][]const []const u8,
 
     pub fn deinit(self: *ScreenSnapshot, alloc: std.mem.Allocator) void {
@@ -499,8 +502,10 @@ fn hasEnvKey(env: []const EnvVar, needle: []const u8) bool {
 /// - Blank cell: `" "` (single space, one byte).
 /// - Spacer tail/head of a wide character: `""` (empty string).
 /// - `codepoint_grapheme`: concat all codepoints (base + combining marks)
-///   into one UTF-8 string, so `e + U+0301` folds into one `"é"` cell.
-/// - Otherwise: the single codepoint encoded as UTF-8.
+///   and NFC-normalize the result, so `e + U+0301` folds into the
+///   precomposed `"é"` (2 bytes: 0xc3 0xa9).
+/// - Otherwise: the single codepoint encoded as UTF-8. Single-codepoint
+///   cells are already in NFC by definition, so they aren't re-normalized.
 ///
 /// Always rectangular: `result.len == rows`, every `result[r].len == cols`.
 /// Rows that the engine doesn't have yet (beyond `render_rows.len`) and
@@ -514,6 +519,12 @@ pub fn buildCells(
     var render_state: ghostty_vt.RenderState = .empty;
     defer render_state.deinit(alloc);
     try render_state.update(alloc, terminal);
+
+    // Init the Unicode NFC normalizer once per snapshot. Per-cell init
+    // would allocate the full Normalize tables on every grapheme, which
+    // is orders of magnitude more expensive than the normalization itself.
+    const normalize = try Normalize.init(alloc);
+    defer normalize.deinit(alloc);
 
     const row_slice = render_state.row_data.slice();
     const render_rows = row_slice.items(.cells);
@@ -542,7 +553,7 @@ pub fn buildCells(
             const graphemes = cell_slice.items(.grapheme);
 
             for (0..cols) |x_usize| {
-                row[cells_built] = try renderCellString(alloc, raw_cells, graphemes, x_usize);
+                row[cells_built] = try renderCellString(alloc, &normalize, raw_cells, graphemes, x_usize);
                 cells_built += 1;
             }
         } else {
@@ -560,6 +571,7 @@ pub fn buildCells(
 
 fn renderCellString(
     alloc: std.mem.Allocator,
+    normalize: *const Normalize,
     raw_cells: anytype,
     graphemes: anytype,
     x: usize,
@@ -573,11 +585,13 @@ fn renderCellString(
     }
     if (raw.content_tag == .codepoint_grapheme and graphemes[x].len > 0) {
         // `codepoint_grapheme` means the base char plus one or more
-        // combining codepoints. Emit the base then the combining marks so
-        // "e + U+0301" round-trips as the full "é" grapheme (two bytes in
-        // UTF-8: 0x65 0xcc 0x81) rather than just the bare combining mark.
+        // combining codepoints. Concat base + marks into the decomposed
+        // form, then NFC-normalize so "e + U+0301" round-trips as the
+        // precomposed "é" (2 bytes: 0xc3 0xa9) rather than 3 bytes of
+        // decomposed `e` + combining acute. Agents comparing cell
+        // contents to precomposed strings (the common case) need this.
         var buf = std.array_list.Managed(u8).init(alloc);
-        errdefer buf.deinit();
+        defer buf.deinit();
         var tmp: [4]u8 = undefined;
         const base_cp = raw.codepoint();
         if (base_cp != 0) {
@@ -588,7 +602,9 @@ fn renderCellString(
             const len = try std.unicode.utf8Encode(cp, &tmp);
             try buf.appendSlice(tmp[0..len]);
         }
-        return buf.toOwnedSlice();
+        var result = try normalize.nfc(alloc, buf.items);
+        defer result.deinit(alloc);
+        return alloc.dupe(u8, result.slice);
     }
     const cp = raw.codepoint();
     if (cp == 0) return alloc.dupe(u8, " ");
@@ -918,15 +934,15 @@ test "cells: CJK occupies leading-cell + empty spacer tail" {
 test "cells: combining marks fold into one cell" {
     const alloc = std.testing.allocator;
     // "e" + U+0301 (combining acute) — visually "é", a single grapheme.
-    // The spec says: concat all codepoints from a codepoint_grapheme cell,
-    // so the emitted string is the decomposed form (3 UTF-8 bytes:
-    // 'e' + 0xcc + 0x81), not the precomposed "é" (0xc3 0xa9). Either form
-    // renders as one glyph; what matters is that a single cell holds the
-    // entire grapheme (no spill into cells[0][1]).
+    // The cell string is NFC-normalized, so what was stored as a base +
+    // combining codepoint pair collapses to the 2-byte precomposed "é"
+    // (0xc3 0xa9). This is the form agents naturally write in their
+    // comparison strings.
     var h = try CellsHarness.init(alloc, 24, 80, "e\xcc\x81");
     defer h.deinit();
 
-    try std.testing.expectEqualStrings("e\xcc\x81", h.cells[0][0]);
+    try std.testing.expectEqualStrings("é", h.cells[0][0]);
+    try std.testing.expectEqual(@as(usize, 2), h.cells[0][0].len);
     try std.testing.expectEqualStrings(" ", h.cells[0][1]);
 }
 

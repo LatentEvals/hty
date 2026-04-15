@@ -26,6 +26,14 @@ pub fn build(b: *std.Build) void {
         lib_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
+    // zg provides the Unicode `Normalize` module used to fold combining
+    // marks into their precomposed form in the snapshot `cells` field.
+    // zg is explicitly modular — we only pull in `Normalize` to keep
+    // binary size bounded.
+    if (b.lazyDependency("zg", .{})) |dep| {
+        lib_mod.addImport("Normalize", dep.module("Normalize"));
+    }
+
     const lib = b.addLibrary(.{
         .linkage = .static,
         .name = "hty",

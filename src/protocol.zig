@@ -35,7 +35,10 @@ pub const SnapshotPayload = struct {
     /// - Blank cell: `" "` (single space).
     /// - Leading cell of a wide character: the grapheme (e.g. `"日"`).
     /// - Spacer-tail cell (trailing half of a wide char): `""`.
-    /// Purely positional; carries no styling.
+    /// Grapheme strings are NFC-normalized, so a base character plus
+    /// combining marks (e.g. `"e"` + `U+0301`) is returned as the
+    /// precomposed form (`"é"`, 2 UTF-8 bytes). Purely positional;
+    /// carries no styling.
     cells: []const []const []const u8,
     status: []const u8 = "running",
 };
