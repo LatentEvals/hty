@@ -10,6 +10,7 @@
 const std = @import("std");
 const hty = @import("hty");
 
+const list_cmd = @import("commands/list.zig");
 const SessionRegistry = @import("registry.zig").SessionRegistry;
 const processRequestLine = @import("server.zig").processRequestLine;
 const replayToTerminal = @import("commands/replay.zig").replayToTerminal;
@@ -1394,6 +1395,84 @@ test "list op returns one entry per session" {
     var k2 = try testRequest(&registry, .{ .op = "kill", .session = "two" });
     defer k2.deinit();
     _ = try expectTestOk(k2);
+}
+
+test "list json stays structured with no live server and no sessions" {
+    const alloc = std.testing.allocator;
+    var merged = try list_cmd.collectMergedSessions(alloc, null, null);
+    defer merged.deinit();
+
+    const response = try list_cmd.buildJsonResponse(merged.arena(), merged.entries.items);
+    try std.testing.expect(response.ok);
+    try std.testing.expect(response.sessions != null);
+    try std.testing.expectEqual(@as(usize, 0), response.sessions.?.len);
+}
+
+test "list json includes disk-backed sessions with no live server" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "list-json", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    {
+        var registry = SessionRegistry.init(alloc);
+        defer registry.deinit();
+        registry.log_dir = dirs.log_dir;
+
+        const uuid = try spawnCatSession(&registry, "diskonly");
+        defer alloc.free(uuid);
+    }
+
+    var merged = try list_cmd.collectMergedSessions(alloc, dirs.log_dir, null);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.entries.items.len);
+
+    const response = try list_cmd.buildJsonResponse(merged.arena(), merged.entries.items);
+    try std.testing.expect(response.ok);
+    try std.testing.expect(response.sessions != null);
+    const sessions = response.sessions.?;
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expectEqualStrings("diskonly", sessions[0].name.?);
+    try std.testing.expectEqualStrings("/bin/cat", sessions[0].program);
+}
+
+test "list json preserves null names for unnamed disk-backed sessions" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const dirs = try setupReplayLogDir(alloc, "list-json-null-name", &log_dir_buf);
+    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer alloc.free(dirs.by_name);
+
+    {
+        var registry = SessionRegistry.init(alloc);
+        defer registry.deinit();
+        registry.log_dir = dirs.log_dir;
+
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    var merged = try list_cmd.collectMergedSessions(alloc, dirs.log_dir, null);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.entries.items.len);
+
+    const response = try list_cmd.buildJsonResponse(merged.arena(), merged.entries.items);
+    try std.testing.expect(response.ok);
+    const sessions = response.sessions orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(usize, 1), sessions.len);
+    try std.testing.expect(sessions[0].name == null);
+    try std.testing.expectEqualStrings("/bin/cat", sessions[0].program);
 }
 
 test "delete op removes the session record and its log files" {
