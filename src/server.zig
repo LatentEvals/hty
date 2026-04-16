@@ -338,9 +338,9 @@ pub fn dispatchRequest(
     // Note: `info` and `list` are dispatched above (no session needed), so
     // they're not in this list.
     const known_ops = [_][]const u8{
-        "snapshot",      "send_text",     "send_key",       "send_bytes_hex",
-        "resize",        "wait_for_text", "wait_for_idle",  "wait_for_exit",
-        "kill",          "delete",
+        "snapshot",      "send_text",         "send_key",      "send_bytes_hex",
+        "resize",        "wait_for_text",     "wait_for_idle", "wait_for_exit",
+        "kill",          "delete",            "wait_and_snapshot",
     };
     var matched_op = false;
     for (known_ops) |candidate| {
@@ -364,6 +364,7 @@ pub fn dispatchRequest(
     if (std.mem.eql(u8, op, "wait_for_exit")) return ops.handleWaitForExit(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "kill")) return ops.handleKill(arena, registry, sess, id);
     if (std.mem.eql(u8, op, "delete")) return ops.handleDelete(arena, registry, sess, id);
+    if (std.mem.eql(u8, op, "wait_and_snapshot")) return ops.handleWaitAndSnapshot(arena, registry, sess, object, id);
 
     return error.UnknownOperation;
 }

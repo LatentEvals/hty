@@ -452,6 +452,180 @@ pub fn handleWaitForExit(
     };
 }
 
+/// Server-side fused wait+snapshot op. The client-side commands `hty send`
+/// and `hty run` issue this after their input ops have completed, so a
+/// single round-trip handles "wait for this condition and then snapshot
+/// the screen" without the race window the three-RPC `send → wait → snapshot`
+/// flow had (where idle could fire before the new send produced output).
+///
+/// The race fix is in the `idle` branch: the idle reference is
+/// `max(last_screen_change, op_start_ms)`, so a session that's been quiet
+/// for a long time before this op begins won't immediately satisfy
+/// `--wait-until-idle 100` — we only count idle time accumulated *after*
+/// this op started, which is at-or-after the moment the upstream send
+/// returned.
+///
+/// `wait_kind` selects the condition:
+/// - `"none"`        — no wait; just (optionally) snapshot.
+/// - `"duration"`    — sleep `duration_ms`, then (optionally) snapshot.
+/// - `"idle"`        — wait until the session has been idle for `idle_ms`
+///                     (default 100), measured against the op-start floor.
+/// - `"text"`        — wait until `text` appears in the rendered buffer.
+/// - `"regex"`       — wait until the POSIX regex in `text` matches.
+/// - `"exit"`        — wait until the child exits.
+///
+/// `timeout_ms` defaults to 30_000; a value of `0` disables the timeout.
+/// `snapshot` (bool) controls whether the response includes the snapshot
+/// payload.
+pub fn handleWaitAndSnapshot(
+    arena: Allocator,
+    registry: *SessionRegistry,
+    sess: *Session,
+    object: std.json.ObjectMap,
+    id: ?i64,
+) !Response {
+    const wait_kind_opt = try readOptionalString(object, "wait_kind");
+    const wait_kind = wait_kind_opt orelse "none";
+    const include_snapshot = try readOptionalBool(object, "snapshot", false);
+    const timeout_ms_field = try readOptionalU64(object, "timeout_ms", 30_000);
+    const start_ms = std.time.milliTimestamp();
+
+    // timeout_ms == 0 means "no timeout" — pin the deadline at the largest
+    // representable value so the loop never trips it.
+    const deadline: i64 = if (timeout_ms_field == 0)
+        std.math.maxInt(i64)
+    else
+        start_ms + @as(i64, @intCast(timeout_ms_field));
+
+    if (std.mem.eql(u8, wait_kind, "none")) {
+        return try buildFusedResponse(arena, id, sess, include_snapshot, null, 0, false, null, null);
+    }
+
+    if (std.mem.eql(u8, wait_kind, "duration")) {
+        const duration_ms = try readOptionalU64(object, "duration_ms", 0);
+        std.Thread.sleep(duration_ms * std.time.ns_per_ms);
+        registry.drainAll();
+        const elapsed = std.time.milliTimestamp() - start_ms;
+        return try buildFusedResponse(arena, id, sess, include_snapshot, "duration", elapsed, false, null, null);
+    }
+
+    if (std.mem.eql(u8, wait_kind, "idle")) {
+        const idle_ms_field = try readOptionalU64(object, "idle_ms", 100);
+        const idle_ms: i64 = @intCast(idle_ms_field);
+
+        while (std.time.milliTimestamp() <= deadline) {
+            registry.drainAll();
+            // Race fix: if the session was already idle before this op
+            // started, treat op-start as the idle reference instead.
+            const reference = @max(sess.getLastScreenChange(), start_ms);
+            const since = std.time.milliTimestamp() - reference;
+            if (since >= idle_ms) {
+                const elapsed = std.time.milliTimestamp() - start_ms;
+                return try buildFusedResponse(arena, id, sess, include_snapshot, "idle", elapsed, false, null, null);
+            }
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+        }
+        const elapsed = std.time.milliTimestamp() - start_ms;
+        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
+    }
+
+    if (std.mem.eql(u8, wait_kind, "text") or std.mem.eql(u8, wait_kind, "regex")) {
+        const needle = try readRequiredString(object, "text");
+        const use_regex = std.mem.eql(u8, wait_kind, "regex");
+
+        var compiled_regex: ?*HtyRegex = null;
+        if (use_regex) {
+            const nul_pattern = try arena.dupeZ(u8, needle);
+            compiled_regex = hty_regex_compile(nul_pattern.ptr);
+            if (compiled_regex == null or !hty_regex_is_valid(compiled_regex.?)) {
+                if (compiled_regex) |re| hty_regex_free(re);
+                return error.InvalidRegex;
+            }
+        }
+        defer if (compiled_regex) |re| hty_regex_free(re);
+
+        while (std.time.milliTimestamp() <= deadline) {
+            registry.drainAll();
+            var snapshot = try sess.terminal.snapshot();
+            defer snapshot.deinit(sess.alloc);
+
+            const offset: ?i64 = if (compiled_regex) |re| blk: {
+                break :blk try regexFindHaystack(sess.alloc, re, snapshot.buffer);
+            } else blk: {
+                const idx = std.mem.indexOf(u8, snapshot.buffer, needle);
+                break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
+            };
+            if (offset) |off| {
+                const elapsed = std.time.milliTimestamp() - start_ms;
+                const needle_owned = try arena.dupe(u8, needle);
+                const matched_label: []const u8 = if (use_regex) "regex" else "text";
+                const text_match = WaitTextMatch{ .needle = needle_owned, .offset = off };
+                return try buildFusedResponse(arena, id, sess, include_snapshot, matched_label, elapsed, false, text_match, null);
+            }
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+        }
+        const elapsed = std.time.milliTimestamp() - start_ms;
+        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
+    }
+
+    if (std.mem.eql(u8, wait_kind, "exit")) {
+        while (std.time.milliTimestamp() <= deadline) {
+            registry.drainAll();
+            if (sess.getStatus() != .running) {
+                const elapsed = std.time.milliTimestamp() - start_ms;
+                const code: i32 = sess.getExitCode() orelse 0;
+                return try buildFusedResponse(arena, id, sess, include_snapshot, "exit", elapsed, false, null, .{ .code = code });
+            }
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+        }
+        const elapsed = std.time.milliTimestamp() - start_ms;
+        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
+    }
+
+    return error.InvalidFieldValue;
+}
+
+/// Pack a wait + (optional) snapshot result into a Response. Centralizes
+/// the snapshot allocation so the wait branches above don't each duplicate
+/// the snapshot/wait-payload plumbing.
+fn buildFusedResponse(
+    arena: Allocator,
+    id: ?i64,
+    sess: *Session,
+    include_snapshot: bool,
+    matched: ?[]const u8,
+    elapsed_ms: i64,
+    timed_out: bool,
+    text: ?WaitTextMatch,
+    exit_info: ?WaitExitInfo,
+) !Response {
+    const sid = try arena.dupe(u8, &sess.id);
+    const wait_payload = WaitPayload{
+        .matched = matched,
+        .elapsed_ms = elapsed_ms,
+        .session = sid,
+        .timeout = timed_out,
+        .text = text,
+        .exit = exit_info,
+    };
+
+    if (!include_snapshot) {
+        return .{
+            .id = id,
+            .ok = true,
+            .timed_out = timed_out,
+            .wait = wait_payload,
+        };
+    }
+
+    var snapshot = try sess.terminal.snapshot();
+    defer snapshot.deinit(sess.alloc);
+    var response = try snapshotResponse(arena, id, snapshot, sess);
+    response.wait = wait_payload;
+    response.timed_out = timed_out;
+    return response;
+}
+
 pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, id: ?i64) !Response {
     _ = registry;
     if (sess.getStatus() == .running) {

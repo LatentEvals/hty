@@ -2546,6 +2546,477 @@ test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
 }
 
 // ============================================================================
+// Fused send/run with wait+snapshot (LatentEvals/hty#32)
+// ============================================================================
+//
+// These tests exercise the `wait_and_snapshot` op directly. The op underpins
+// `hty send --snapshot --wait-until-*` and `hty run --snapshot
+// --wait-until-*` — both client commands compose existing send/spawn calls
+// with this single fused wait so the post-action snapshot rides back on the
+// same response that satisfies the wait condition.
+
+test "wait_and_snapshot kind=idle returns matched=idle, elapsed_ms, and snapshot" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-idle",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-idle",
+            .wait_kind = "idle",
+            .idle_ms = 50,
+            .timeout_ms = 2_000,
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        const matched = wait.object.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expect(matched == .string);
+        try std.testing.expectEqualStrings("idle", matched.string);
+        const elapsed = wait.object.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        // The op-start floor on idle means we never satisfy idle in 0ms;
+        // we should always sit through at least one idle window.
+        try std.testing.expect(elapsed.integer >= 50);
+
+        const snap = object.get("snapshot") orelse return error.InvalidResponse;
+        try std.testing.expect(snap == .object);
+        try std.testing.expect(snap.object.get("buffer") != null);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-idle" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=text matches a string and includes the buffer" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-text",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "fused-text",
+            .text = "fused-hello\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-text",
+            .wait_kind = "text",
+            .text = "fused-hello",
+            .timeout_ms = 2_000,
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const matched = wait.object.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expectEqualStrings("text", matched.string);
+
+        const snap = object.get("snapshot") orelse return error.InvalidResponse;
+        const buffer = snap.object.get("buffer") orelse return error.InvalidResponse;
+        try std.testing.expect(std.mem.indexOf(u8, buffer.string, "fused-hello") != null);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-text" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=duration sleeps at least the requested ms" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-dur",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-dur",
+            .wait_kind = "duration",
+            .duration_ms = 80,
+            .timeout_ms = 2_000,
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const elapsed = wait.object.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        try std.testing.expect(elapsed.integer >= 80);
+
+        try std.testing.expect(object.get("snapshot") != null);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-dur" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot snapshot=false omits the snapshot field" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-nosnap",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-nosnap",
+            .wait_kind = "idle",
+            .idle_ms = 30,
+            .timeout_ms = 2_000,
+            .snapshot = false,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait == .object);
+        // The Response struct's optional snapshot serializes to JSON `null`
+        // when omitted (rather than missing the key entirely), so check for
+        // .null rather than absence.
+        const snap_val = object.get("snapshot") orelse return error.InvalidResponse;
+        try std.testing.expect(snap_val == .null);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-nosnap" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=none with snapshot=true returns the snapshot immediately" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-none",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-none",
+            .wait_kind = "none",
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        // No matched value when there's no wait.
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait.object.get("matched").? == .null);
+
+        const snap = object.get("snapshot") orelse return error.InvalidResponse;
+        try std.testing.expect(snap == .object);
+        try std.testing.expect(snap.object.get("buffer") != null);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-none" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=text reports timed_out=true on timeout" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-timeout",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-timeout",
+            .wait_kind = "text",
+            .text = "neverappears",
+            .timeout_ms = 150,
+            .snapshot = false,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const timed_out = object.get("timed_out") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(true, timed_out.bool);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        try std.testing.expect(wait.object.get("matched").? == .null);
+        const to = wait.object.get("timeout") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(true, to.bool);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-timeout" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot --wait-until-idle has op-start floor (no instant fire after long quiet)" {
+    // Race regression test (the central correctness goal of issue #32):
+    // a session that's been quiet for >100ms before this op begins should
+    // NOT immediately satisfy --wait-until-idle 100. The server measures
+    // idle from `max(last_screen_change, op_start_ms)`, so the wait must
+    // sit through at least the requested idle window even when no fresh
+    // screen change is observed during the op.
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-floor",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    // Drain the initial spawn screen change, then sit idle long enough
+    // that any naive `now - last_screen_change` would already exceed our
+    // target idle_ms.
+    std.Thread.sleep(250 * std.time.ns_per_ms);
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-floor",
+            .wait_kind = "idle",
+            .idle_ms = 100,
+            .timeout_ms = 2_000,
+            .snapshot = false,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const elapsed = wait.object.get("elapsed_ms") orelse return error.InvalidResponse;
+        try std.testing.expect(elapsed == .integer);
+        // With the op-start floor, elapsed must be at least one idle
+        // window. Without the fix, elapsed would be ~0ms because the
+        // pre-existing 250ms quiet would already satisfy the threshold.
+        try std.testing.expect(elapsed.integer >= 100);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-floor" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot timeout_ms=0 disables the timeout" {
+    // With timeout_ms=0, the deadline is i64.max — the op only returns
+    // when the wait condition is satisfied. Pair with a quick-firing
+    // condition (a 30ms idle window) so the test isn't slow.
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-no-timeout",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-no-timeout",
+            .wait_kind = "idle",
+            .idle_ms = 30,
+            .timeout_ms = 0,
+            .snapshot = false,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        // Should succeed (not time out).
+        const timed_out = object.get("timed_out") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(false, timed_out.bool);
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const matched = wait.object.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expectEqualStrings("idle", matched.string);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-no-timeout" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=regex matches a pattern and reports matched=regex" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-regex",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 60,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "fused-regex",
+            .text = "order 1234 confirmed\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-regex",
+            .wait_kind = "regex",
+            .text = "order [0-9]+ confirmed",
+            .timeout_ms = 2_000,
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const matched = wait.object.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expectEqualStrings("regex", matched.string);
+
+        // Regex matches still surface text.needle/text.offset.
+        const text_obj = wait.object.get("text") orelse return error.InvalidResponse;
+        try std.testing.expect(text_obj == .object);
+        const offset = text_obj.object.get("offset") orelse return error.InvalidResponse;
+        try std.testing.expect(offset == .integer);
+        try std.testing.expect(offset.integer >= 0);
+    }
+    var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "fused-regex" });
+    defer kill_parsed.deinit();
+    _ = try expectTestOk(kill_parsed);
+}
+
+test "wait_and_snapshot kind=exit returns matched=exit and the exit code" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
+    defer alloc.free(true_path);
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "fused-exit",
+            .program = true_path,
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_and_snapshot",
+            .session = "fused-exit",
+            .wait_kind = "exit",
+            .timeout_ms = 2_000,
+            .snapshot = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+
+        const wait = object.get("wait") orelse return error.InvalidResponse;
+        const matched = wait.object.get("matched") orelse return error.InvalidResponse;
+        try std.testing.expectEqualStrings("exit", matched.string);
+
+        const exit_obj = wait.object.get("exit") orelse return error.InvalidResponse;
+        const code = exit_obj.object.get("code") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(@as(i64, 0), code.integer);
+
+        // Snapshot is still present even after exit.
+        try std.testing.expect(object.get("snapshot") != null);
+    }
+    var kill_parsed = testRequest(&registry, .{ .op = "kill", .session = "fused-exit" }) catch return;
+    kill_parsed.deinit();
+}
+
+// ============================================================================
 // Session log origin tagging + attach lifecycle (LatentEvals/hty#33)
 // ============================================================================
 //
