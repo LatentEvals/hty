@@ -172,13 +172,53 @@ pub fn logDrainedEvent(sess: *Session, now_ms: i64, event: hty.OutputEvent) void
     writeLogEvent(sess, line);
 }
 
-pub fn logInputEvent(arena: Allocator, sess: *Session, bytes: []const u8) void {
+/// Every input event carries an `origin` tag (`"send"` or `"attach"`) so
+/// forensic readers can tell agent RPC traffic apart from interactive
+/// keystrokes. `client_id` is optional and only meaningful when origin is
+/// `"attach"`; it lets two concurrent attach clients be disambiguated.
+pub fn logInputEvent(
+    arena: Allocator,
+    sess: *Session,
+    bytes: []const u8,
+    origin: []const u8,
+    client_id: ?[]const u8,
+) void {
     if (sess.log_file == null) return;
     const hex = hex_mod.encodeHex(arena, bytes) catch return;
+    const line = if (client_id) |cid|
+        std.json.Stringify.valueAlloc(arena, .{
+            .t = std.time.milliTimestamp(),
+            .kind = "input",
+            .origin = origin,
+            .client_id = cid,
+            .bytes_hex = hex,
+        }, .{}) catch return
+    else
+        std.json.Stringify.valueAlloc(arena, .{
+            .t = std.time.milliTimestamp(),
+            .kind = "input",
+            .origin = origin,
+            .bytes_hex = hex,
+        }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
+pub fn logAttachConnectEvent(arena: Allocator, sess: *Session, client_id: []const u8) void {
+    if (sess.log_file == null) return;
     const line = std.json.Stringify.valueAlloc(arena, .{
         .t = std.time.milliTimestamp(),
-        .kind = "input",
-        .bytes_hex = hex,
+        .kind = "attach_connect",
+        .client_id = client_id,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
+pub fn logAttachDisconnectEvent(arena: Allocator, sess: *Session, client_id: []const u8) void {
+    if (sess.log_file == null) return;
+    const line = std.json.Stringify.valueAlloc(arena, .{
+        .t = std.time.milliTimestamp(),
+        .kind = "attach_disconnect",
+        .client_id = client_id,
     }, .{}) catch return;
     writeLogEvent(sess, line);
 }

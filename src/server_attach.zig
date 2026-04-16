@@ -18,6 +18,10 @@ const AttachClient = session_mod.AttachClient;
 const log_mod = @import("log.zig");
 const logInputEvent = log_mod.logInputEvent;
 const logResizeEvent = log_mod.logResizeEvent;
+const logAttachConnectEvent = log_mod.logAttachConnectEvent;
+const logAttachDisconnectEvent = log_mod.logAttachDisconnectEvent;
+
+const uuid_mod = @import("uuid.zig");
 
 const SessionRegistry = @import("registry.zig").SessionRegistry;
 
@@ -85,20 +89,40 @@ pub fn handleAttachConnection(
         }
     }
 
+    // Mint a stable client id so connect/input/disconnect log events for
+    // this attachment can be paired up, even when multiple clients overlap.
+    // Format: `attach-<uuidv7>`. The `attach-` prefix makes the id self-
+    // describing when it shows up in forensics tooling.
+    var uuid_buf: [36]u8 = undefined;
+    uuid_mod.generateUuidV7(&uuid_buf);
+    const client_id = std.fmt.allocPrint(alloc, "attach-{s}", .{uuid_buf[0..]}) catch return .done;
+    errdefer alloc.free(client_id);
+
     // Create the client and register it under the session's attach mutex.
-    const client = alloc.create(AttachClient) catch return .done;
+    const client = alloc.create(AttachClient) catch {
+        alloc.free(client_id);
+        return .done;
+    };
     client.* = .{
         .alloc = alloc,
         .session = sess,
         .stream = conn.stream,
+        .client_id = client_id,
     };
     sess.attach_mutex.lock();
     sess.attach_clients.append(alloc, client) catch {
         sess.attach_mutex.unlock();
+        alloc.free(client.client_id);
         alloc.destroy(client);
         return .done;
     };
     sess.attach_mutex.unlock();
+
+    // Record the connect event BEFORE the first input byte flows back to
+    // the PTY. The reader thread we spawn below may land an input event
+    // within microseconds of this line, so emitting connect here keeps
+    // the "bracketed by connect/disconnect" invariant intact.
+    logAttachConnectEvent(arena, sess, client.client_id);
 
     // Write the attach ack. Once this goes out the client flips into
     // streaming mode.
@@ -124,7 +148,9 @@ pub fn handleAttachConnection(
 
     // Spawn the reader thread that owns the socket from here on.
     client.reader_thread = std.Thread.spawn(.{}, attachReaderLoop, .{client}) catch {
-        // On spawn failure, remove from the list and tear down.
+        // On spawn failure, remove from the list and tear down. Emit a
+        // disconnect event since the connect event above already made it
+        // into the log and readers shouldn't see a dangling half-bracket.
         sess.attach_mutex.lock();
         var i: usize = 0;
         while (i < sess.attach_clients.items.len) : (i += 1) {
@@ -134,6 +160,9 @@ pub fn handleAttachConnection(
             }
         }
         sess.attach_mutex.unlock();
+        if (!client.disconnect_logged.swap(true, .acq_rel)) {
+            logAttachDisconnectEvent(arena, sess, client.client_id);
+        }
         client.deinit();
         return .done;
     };
@@ -206,8 +235,10 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         if (hex_val != .string) return;
         const bytes = decodeHex(arena, hex_val.string) catch return;
         client.session.terminal.send(.{ .bytes = bytes }) catch {};
-        // Mirror the RPC send path: record input in the log too.
-        logInputEvent(arena, client.session, bytes);
+        // Mirror the RPC send path: record input in the log too, tagged
+        // `origin: "attach"` with this connection's client_id so two
+        // overlapping attach clients remain distinguishable post-mortem.
+        logInputEvent(arena, client.session, bytes, "attach", client.client_id);
         return;
     }
 

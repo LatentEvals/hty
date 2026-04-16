@@ -102,13 +102,26 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         // Tear down any still-attached clients before freeing the session.
         // Takes the mutex just to be safe against a rogue late broadcast.
+        // Emit a disconnect for each still-open client before its storage
+        // goes away — this is our last chance to bracket the attach in the
+        // log. The reader-thread-exit path may have also flipped the
+        // `disconnect_logged` flag; the atomic swap ensures we emit
+        // exactly once per connection.
+        const log_mod = @import("log.zig");
         self.attach_mutex.lock();
         for (self.attach_clients.items) |client| {
             client.shutdown();
         }
         const clients_snapshot = self.attach_clients.toOwnedSlice(self.alloc) catch &.{};
         self.attach_mutex.unlock();
-        for (clients_snapshot) |client| client.deinit();
+        for (clients_snapshot) |client| {
+            if (!client.disconnect_logged.swap(true, .acq_rel)) {
+                var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_state.deinit();
+                log_mod.logAttachDisconnectEvent(arena_state.allocator(), self, client.client_id);
+            }
+            client.deinit();
+        }
         if (clients_snapshot.len > 0) self.alloc.free(clients_snapshot);
 
         if (self.log_file) |*f| {
@@ -130,8 +143,19 @@ pub const AttachClient = struct {
     alloc: Allocator,
     session: *Session,
     stream: std.net.Stream,
+    /// Opaque, self-describing id assigned by the server on accept. Appears
+    /// in the session log in `attach_connect`, `attach_disconnect`, and
+    /// `input` events whose origin is `"attach"`, so forensics can pair
+    /// connects with disconnects even when multiple clients overlap.
+    /// Format: `attach-<uuidv7>`. Owned by this struct; freed on deinit.
+    client_id: []u8,
     write_mutex: std.Thread.Mutex = .{},
     closed: std.atomic.Value(bool) = .init(false),
+    /// Set true once the `attach_disconnect` log event has been emitted.
+    /// Used by the reaper path to avoid double-emitting if both the
+    /// reader-thread-exit path and the session-deinit path run on the
+    /// same client.
+    disconnect_logged: std.atomic.Value(bool) = .init(false),
     reader_thread: ?std.Thread = null,
 
     pub fn isClosed(self: *const AttachClient) bool {
@@ -163,6 +187,7 @@ pub const AttachClient = struct {
         self.shutdown();
         if (self.reader_thread) |t| t.join();
         self.stream.close();
+        self.alloc.free(self.client_id);
         self.alloc.destroy(self);
     }
 };
