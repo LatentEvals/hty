@@ -23,6 +23,13 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6
+        with:
+          # `build.zig` runs `git describe --tags` at build time so
+          # `hty info` / `hty --version` can surface real version info.
+          # The default shallow checkout has no tags, which would force
+          # every CI build into the "no git info" fallback.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: install zig
         uses: montanaflynn/setup-zig@main

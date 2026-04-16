@@ -9,6 +9,7 @@ const ensure = @import("../ensure.zig");
 const protocol = @import("../protocol.zig");
 const json_mod = @import("../json.zig");
 const getInteger = json_mod.getInteger;
+const build_info = @import("build_info");
 
 pub fn helpText() []const u8 {
     return
@@ -31,7 +32,55 @@ pub fn helpText() []const u8 {
     ;
 }
 
-const version_str: []const u8 = "0.0.0";
+/// Git-derived build metadata. A plain struct so we can feed fake values
+/// into `renderVersionLine` in unit tests without touching the real
+/// `build_info` module.
+pub const GitInfo = struct {
+    version: []const u8,
+    commit: ?[]const u8,
+    tag: ?[]const u8,
+    dirty: bool,
+    describe: ?[]const u8,
+};
+
+fn currentGitInfo() GitInfo {
+    return .{
+        .version = build_info.version,
+        .commit = build_info.commit,
+        .tag = build_info.tag,
+        .dirty = build_info.dirty,
+        .describe = build_info.describe,
+    };
+}
+
+fn currentBuildInfo() protocol.BuildInfo {
+    return .{
+        .version = build_info.version,
+        .commit = build_info.commit,
+        .tag = build_info.tag,
+        .dirty = build_info.dirty,
+        .describe = build_info.describe,
+        .mode = build_info.mode,
+    };
+}
+
+/// Render the single-line version string used by `hty --version`, `hty -v`,
+/// and the first line of plain-text `hty info`. Three cases:
+///   * tagged clean:    `hty 0.1.2`
+///   * dev / dirty:     `hty 0.1.2-3-g7a8b9c0-dirty` (uses `describe`)
+///   * no git info:     `hty 0.1.2 (no git info)`
+/// Caller owns the returned slice.
+pub fn renderVersionLine(alloc: Allocator, info: GitInfo) ![]u8 {
+    // Clean tagged release: describe is just the tag, no suffix. Prefer
+    // the short form in that case.
+    if (info.tag != null and !info.dirty) {
+        return std.fmt.allocPrint(alloc, "hty {s}", .{info.version});
+    }
+    if (info.describe) |d| {
+        return std.fmt.allocPrint(alloc, "hty {s}", .{d});
+    }
+    return std.fmt.allocPrint(alloc, "hty {s} (no git info)", .{info.version});
+}
 
 pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var json_output = false;
@@ -59,7 +108,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     defer if (server_stats) |s| alloc.free(s);
 
     if (json_output) {
-        try emitJson(alloc, version_str, socket_path, state_dir, log_dir, server_stats);
+        try emitJson(alloc, build_info.version, socket_path, state_dir, log_dir, server_stats);
         return;
     }
 
@@ -70,6 +119,9 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     defer buf.deinit(alloc);
     const w = buf.writer(alloc);
 
+    const version_line = try renderVersionLine(alloc, currentGitInfo());
+    defer alloc.free(version_line);
+    try w.print("{s}\n", .{version_line});
     try w.print("socket:  {s}\n", .{socket_path});
     try w.print("logs:    {s}\n", .{log_dir});
     try w.print("server:  {s}\n", .{server_status});
@@ -86,6 +138,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     }
 
     try common.printRaw(buf.items);
+}
+
+/// Fast path for the top-level `hty --version` / `hty -v` flags. Prints
+/// the same version line plain-text `hty info` emits and returns. Kept
+/// here (rather than inlined in `headless.zig`) so there's a single
+/// source of truth for the version-line format.
+pub fn printVersionLine(alloc: Allocator) !void {
+    const line = try renderVersionLine(alloc, currentGitInfo());
+    defer alloc.free(line);
+    try common.printLine(line);
 }
 
 /// Ask the running server for its pid and uptime. Returns null if the
@@ -179,8 +241,45 @@ pub fn buildInfoPayload(
             .pid = server_pid,
             .uptime_ms = server_uptime_ms,
         },
+        .build = currentBuildInfo(),
     };
 }
 
-// The version is hard-coded to avoid a new build-system dependency. Bump
-// this in lockstep with build.zig.zon.
+test "renderVersionLine: tagged clean" {
+    const alloc = std.testing.allocator;
+    const line = try renderVersionLine(alloc, .{
+        .version = "0.1.2",
+        .commit = "7a8b9c0",
+        .tag = "v0.1.2",
+        .dirty = false,
+        .describe = "v0.1.2",
+    });
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("hty 0.1.2", line);
+}
+
+test "renderVersionLine: dev dirty build uses describe" {
+    const alloc = std.testing.allocator;
+    const line = try renderVersionLine(alloc, .{
+        .version = "0.1.2",
+        .commit = "7a8b9c0",
+        .tag = null,
+        .dirty = true,
+        .describe = "v0.1.2-3-g7a8b9c0-dirty",
+    });
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("hty v0.1.2-3-g7a8b9c0-dirty", line);
+}
+
+test "renderVersionLine: no git info falls back to plain version" {
+    const alloc = std.testing.allocator;
+    const line = try renderVersionLine(alloc, .{
+        .version = "0.1.2",
+        .commit = null,
+        .tag = null,
+        .dirty = false,
+        .describe = null,
+    });
+    defer alloc.free(line);
+    try std.testing.expectEqualStrings("hty 0.1.2 (no git info)", line);
+}

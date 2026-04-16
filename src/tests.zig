@@ -2115,6 +2115,50 @@ test "info json with no live server populates local fields and marks server down
     try std.testing.expectEqual(false, payload.server.running);
     try std.testing.expectEqual(@as(?i64, null), payload.server.pid);
     try std.testing.expectEqual(@as(?i64, null), payload.server.uptime_ms);
+    // `build` is populated from the `build_info` options module; values
+    // depend on the host environment so we only assert presence / shape.
+    try std.testing.expect(payload.build.version.len > 0);
+    try std.testing.expect(payload.build.mode.len > 0);
+}
+
+// Issue #28: `hty info --json` must emit a structured `build` object so
+// consumers can distinguish release / dev / no-git builds. We only check
+// field names + types here — actual values depend on the git state of
+// the checkout running the tests.
+test "info json payload serializes a build object with all the issue-28 fields" {
+    const alloc = std.testing.allocator;
+    const payload = try info_cmd.buildInfoPayload(
+        alloc,
+        "0.0.0",
+        "/tmp/sock",
+        "/tmp/state",
+        "/tmp/logs",
+        null,
+    );
+    const json = try std.json.Stringify.valueAlloc(alloc, payload, .{});
+    defer alloc.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+
+    const build_val = parsed.value.object.get("build") orelse return error.MissingBuildField;
+    try std.testing.expect(build_val == .object);
+    const build_obj = build_val.object;
+
+    // Required strings.
+    const version_val = build_obj.get("version") orelse return error.MissingField;
+    try std.testing.expect(version_val == .string);
+    const mode_val = build_obj.get("mode") orelse return error.MissingField;
+    try std.testing.expect(mode_val == .string);
+
+    // Nullable git-derived fields: must be present as either string or null.
+    for ([_][]const u8{ "commit", "tag", "describe" }) |field| {
+        const v = build_obj.get(field) orelse return error.MissingField;
+        try std.testing.expect(v == .string or v == .null);
+    }
+    const dirty_val = build_obj.get("dirty") orelse return error.MissingField;
+    try std.testing.expect(dirty_val == .bool);
 }
 
 test "info json with a live server reports pid and uptime" {

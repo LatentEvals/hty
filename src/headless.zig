@@ -74,6 +74,16 @@ pub fn main() !void {
 
     const verb = args[1];
 
+    // Top-level `--version` / `-v` prints the same concise version line the
+    // `info` command emits and exits 0. Handled here (not routed into
+    // `info.zig`) so there's no socket probe or path resolution on the fast
+    // path — useful when packagers call `hty --version` from constrained
+    // environments.
+    if (std.mem.eql(u8, verb, "--version") or std.mem.eql(u8, verb, "-v")) {
+        try commands.info_mod.printVersionLine(alloc);
+        return;
+    }
+
     // Hidden server entry point.
     if (std.mem.eql(u8, verb, "__server__")) {
         if (args.len < 3) {
