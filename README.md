@@ -148,6 +148,8 @@ Commands:
   kill      Terminate a session's process (the record stays for replay)
   delete    Permanently remove a session record and its log file
   logs      Show the event log for a session (works after it has exited)
+  export    Convert a recorded session log into a share-ready artifact
+            (currently asciinema v2 .cast)
   replay    Replay a recorded session by feeding its logged output back
             through a fresh in-memory VT engine. No side effects.
   attach    Interactively attach to a running session (bidirectional)
@@ -172,6 +174,25 @@ Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the 
 | 3    | `wait` timed out |
 | 4    | session prefix matched multiple sessions (ambiguous) |
 | 5    | a session with that name already exists |
+
+## Export to GIF / MP4
+
+Every session is recorded to a JSONL log. `hty export --format asciicast` converts that log into an [asciinema v2 cast](https://docs.asciinema.org/manual/asciicast/v2/), which plugs straight into the existing asciicast ecosystem:
+
+```sh
+hty export my-session --format asciicast > run.cast
+
+# GIF — agg reads asciicast directly
+agg run.cast run.gif
+
+# MP4 — convert the GIF with ffmpeg
+agg run.cast run.gif && ffmpeg -i run.gif run.mp4
+
+# Share on asciinema.org
+asciinema upload run.cast
+```
+
+Output and resize events are emitted faithfully. Input keystrokes are also included as `"i"` events with bursts coalesced (e.g. `hty send --text "hello"` becomes a single `"i"` frame). Most asciicast players ignore input frames during playback, which is the spec-correct behavior; any downstream renderer that wants to surface agent keystrokes has the data.
 
 ## Remote observation
 

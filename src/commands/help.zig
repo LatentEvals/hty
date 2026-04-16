@@ -29,6 +29,8 @@ pub fn generalHelpText() []const u8 {
     \\  kill      Terminate a session's process (the record stays for replay)
     \\  delete    Permanently remove a session record and its log file
     \\  logs      Show the event log for a session (works after it has exited)
+    \\  export    Convert a recorded session log into a share-ready artifact
+    \\            (currently asciinema v2 .cast)
     \\  replay    Replay a recorded session by feeding its logged output back
     \\            through a fresh in-memory VT engine. No side effects.
     \\  attach    Interactively attach to a running session (bidirectional)
@@ -62,6 +64,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, topic, "kill")) return @import("kill.zig").helpText();
     if (std.mem.eql(u8, topic, "delete")) return @import("delete.zig").helpText();
     if (std.mem.eql(u8, topic, "logs")) return @import("logs.zig").helpText();
+    if (std.mem.eql(u8, topic, "export")) return @import("export.zig").helpText();
     if (std.mem.eql(u8, topic, "replay")) return @import("replay.zig").helpText();
     if (std.mem.eql(u8, topic, "attach")) return @import("attach.zig").helpText();
     if (std.mem.eql(u8, topic, "keys")) return @import("keys.zig").helpText();
