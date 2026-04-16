@@ -2161,6 +2161,31 @@ test "info json payload serializes a build object with all the issue-28 fields" 
     try std.testing.expect(dirty_val == .bool);
 }
 
+// Issue: top-level `version` in `hty info --json` used to be the zon
+// string while `hty --version` printed the richer describe line — the
+// two disagreed. Fix is to drive both off `renderVersionString`. Since
+// the `run` codepath recomputes `version` from git state, this test
+// asserts the invariant directly: the top-level `version` equals
+// `build.describe` whenever `describe` is non-null.
+test "info json top-level version agrees with build.describe" {
+    const alloc = std.testing.allocator;
+    const git_info: info_cmd.GitInfo = .{
+        .version = "0.3.1",
+        .commit = "30aea6bd",
+        .tag = null,
+        .dirty = false,
+        .describe = "v0.3.1-11-g30aea6bd",
+    };
+    const version_str = try info_cmd.renderVersionString(alloc, git_info);
+    defer alloc.free(version_str);
+    try std.testing.expectEqualStrings("v0.3.1-11-g30aea6bd", version_str);
+
+    const version_line = try info_cmd.renderVersionLine(alloc, git_info);
+    defer alloc.free(version_line);
+    // Invariant: the CLI version line is `hty ` + the JSON version string.
+    try std.testing.expectEqualStrings("hty v0.3.1-11-g30aea6bd", version_line);
+}
+
 test "info json with a live server reports pid and uptime" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(alloc);

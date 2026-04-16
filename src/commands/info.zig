@@ -65,21 +65,30 @@ fn currentBuildInfo() protocol.BuildInfo {
 }
 
 /// Render the single-line version string used by `hty --version`, `hty -v`,
-/// and the first line of plain-text `hty info`. Three cases:
-///   * tagged clean:    `hty 0.1.2`
-///   * dev / dirty:     `hty 0.1.2-3-g7a8b9c0-dirty` (uses `describe`)
-///   * no git info:     `hty 0.1.2 (no git info)`
+/// and the first line of plain-text `hty info`. Two cases:
+///   * git describe available: use it verbatim after `hty ` — gives us
+///     `hty v0.3.1` for an exact-match tag, `hty v0.3.1-11-g30aea6bd`
+///     for a dev commit, and `hty v0.3.1-dirty` / `hty v0.3.1-11-g...-dirty`
+///     when the tree is dirty. Exact-match tags produce `describe == tag`.
+///   * no git (source tarball): `hty <version>`, where `<version>` is
+///     whatever the `-Dversion-string=` override or zon fallback produced.
 /// Caller owns the returned slice.
 pub fn renderVersionLine(alloc: Allocator, info: GitInfo) ![]u8 {
-    // Clean tagged release: describe is just the tag, no suffix. Prefer
-    // the short form in that case.
-    if (info.tag != null and !info.dirty) {
-        return std.fmt.allocPrint(alloc, "hty {s}", .{info.version});
-    }
     if (info.describe) |d| {
         return std.fmt.allocPrint(alloc, "hty {s}", .{d});
     }
-    return std.fmt.allocPrint(alloc, "hty {s} (no git info)", .{info.version});
+    return std.fmt.allocPrint(alloc, "hty {s}", .{info.version});
+}
+
+/// The same string `renderVersionLine` emits minus the `hty ` prefix.
+/// Used as the top-level `version` field in `hty info --json` so the
+/// CLI's `--version` output and the JSON always agree. Caller owns the
+/// returned slice.
+pub fn renderVersionString(alloc: Allocator, info: GitInfo) ![]u8 {
+    if (info.describe) |d| {
+        return alloc.dupe(u8, d);
+    }
+    return alloc.dupe(u8, info.version);
 }
 
 pub fn run(alloc: Allocator, args: []const []const u8) !void {
@@ -108,7 +117,13 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     defer if (server_stats) |s| alloc.free(s);
 
     if (json_output) {
-        try emitJson(alloc, build_info.version, socket_path, state_dir, log_dir, server_stats);
+        // Top-level `version` string must match what `--version` would
+        // print (minus the `hty ` prefix) so the two outputs always
+        // agree. Prefer `describe` when git info is available, fall back
+        // to the plumbed `build_info.version`.
+        const version_str = try renderVersionString(alloc, currentGitInfo());
+        defer alloc.free(version_str);
+        try emitJson(alloc, version_str, socket_path, state_dir, log_dir, server_stats);
         return;
     }
 
@@ -245,41 +260,41 @@ pub fn buildInfoPayload(
     };
 }
 
-test "renderVersionLine: tagged clean" {
+test "renderVersionLine: tagged clean uses describe verbatim" {
     const alloc = std.testing.allocator;
     const line = try renderVersionLine(alloc, .{
-        .version = "0.1.2",
+        .version = "0.4.0",
         .commit = "7a8b9c0",
-        .tag = "v0.1.2",
+        .tag = "v0.4.0",
         .dirty = false,
-        .describe = "v0.1.2",
+        .describe = "v0.4.0",
     });
     defer alloc.free(line);
-    try std.testing.expectEqualStrings("hty 0.1.2", line);
+    try std.testing.expectEqualStrings("hty v0.4.0", line);
 }
 
 test "renderVersionLine: dev dirty build uses describe" {
     const alloc = std.testing.allocator;
     const line = try renderVersionLine(alloc, .{
-        .version = "0.1.2",
+        .version = "0.4.0",
         .commit = "7a8b9c0",
         .tag = null,
         .dirty = true,
-        .describe = "v0.1.2-3-g7a8b9c0-dirty",
+        .describe = "v0.4.0-3-g7a8b9c0-dirty",
     });
     defer alloc.free(line);
-    try std.testing.expectEqualStrings("hty v0.1.2-3-g7a8b9c0-dirty", line);
+    try std.testing.expectEqualStrings("hty v0.4.0-3-g7a8b9c0-dirty", line);
 }
 
-test "renderVersionLine: no git info falls back to plain version" {
+test "renderVersionLine: no git info falls back to plain version field" {
     const alloc = std.testing.allocator;
     const line = try renderVersionLine(alloc, .{
-        .version = "0.1.2",
+        .version = "0.4.0",
         .commit = null,
         .tag = null,
         .dirty = false,
         .describe = null,
     });
     defer alloc.free(line);
-    try std.testing.expectEqualStrings("hty 0.1.2 (no git info)", line);
+    try std.testing.expectEqualStrings("hty 0.4.0", line);
 }
