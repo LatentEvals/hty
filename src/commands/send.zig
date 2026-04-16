@@ -8,13 +8,18 @@ const common = @import("common.zig");
 
 pub fn helpText() []const u8 {
     return
-    \\hty send [SESSION] --text "..." | --key NAME | --seq "..." | --bytes-hex HEX
+    \\hty send [SESSION] --text "..." | --raw-text "..." | --key NAME | --seq "..." | --bytes-hex HEX
     \\
-    \\Send input to a session. Exactly one of --text, --key, --seq,
-    \\--bytes-hex is required.
+    \\Send input to a session. Exactly one of --text, --raw-text, --key,
+    \\--seq, --bytes-hex is required.
     \\
     \\Flags:
     \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
+    \\  --raw-text STRING    UTF-8 bytes sent verbatim. No escape processing —
+    \\                       `\n` stays as literal backslash-n. Use this when
+    \\                       you want to type source code or other content that
+    \\                       contains backslashes you don't want interpreted.
+    \\                       Prefer over --text when shell quoting gets hairy.
     \\  --key NAME           Named key with optional modifiers.
     \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
     \\                       function keys (f1-f12), and combinations like
@@ -29,7 +34,8 @@ pub fn helpText() []const u8 {
     \\  --delay-before DUR   Sleep before sending (e.g. 200ms, 1s).
     \\  --delay-after DUR    Sleep after sending.
     \\  --delay-char DUR     Send text character-by-character with a delay
-    \\                       between each. Only works with --text or --seq.
+    \\                       between each. Only works with --text, --raw-text,
+    \\                       or --seq.
     \\
     ;
 }
@@ -37,6 +43,7 @@ pub fn helpText() []const u8 {
 pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var text: ?[]const u8 = null;
+    var raw_text: ?[]const u8 = null;
     var key: ?[]const u8 = null;
     var bytes_hex: ?[]const u8 = null;
     var seq: ?[]const u8 = null;
@@ -51,6 +58,10 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--text requires a value");
             text = args[i];
+        } else if (std.mem.eql(u8, arg, "--raw-text")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--raw-text requires a value");
+            raw_text = args[i];
         } else if (std.mem.eql(u8, arg, "--key")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--key requires a value");
@@ -86,15 +97,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         }
     }
 
-    var op_count: u8 = 0;
-    if (text != null) op_count += 1;
-    if (key != null) op_count += 1;
-    if (bytes_hex != null) op_count += 1;
-    if (seq != null) op_count += 1;
-    if (op_count != 1) {
-        try common.printErr("hty send requires exactly one of --text, --key, --bytes-hex, --seq");
+    countInputModes(.{
+        .text = text,
+        .raw_text = raw_text,
+        .key = key,
+        .bytes_hex = bytes_hex,
+        .seq = seq,
+    }) catch {
+        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq");
         std.process.exit(common.ExitCode.generic);
-    }
+    };
 
     // Parse delay flags.
     const before_ms: u64 = if (delay_before) |d| common.parseDurationMs(d) catch {
@@ -113,8 +125,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         unreachable;
     } else 0;
 
-    if (char_ms > 0 and text == null and seq == null) {
-        try common.printErr("--delay-char only applies to --text or --seq");
+    if (char_ms > 0 and text == null and raw_text == null and seq == null) {
+        try common.printErr("--delay-char only applies to --text, --raw-text, or --seq");
         std.process.exit(common.ExitCode.generic);
     }
 
@@ -140,6 +152,11 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         };
         token_list.tokens[0] = .{ .kind = .text, .value = unescaped };
         token_list.len = 1;
+    } else if (raw_text) |t| {
+        // --raw-text: bytes sent verbatim, no escape decoding.
+        token_list = .{};
+        token_list.tokens[0] = .{ .kind = .text, .value = t };
+        token_list.len = 1;
     } else if (key) |k| {
         token_list = .{};
         token_list.tokens[0] = .{ .kind = .key, .value = k };
@@ -153,33 +170,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // Expand --delay-char: split text tokens into per-character tokens
     // with delay tokens interleaved.
     if (char_ms > 0) {
-        var expanded: SeqTokenList = .{};
-        for (token_list.slice()) |token| {
-            if (token.kind == .text and token.value.len > 1) {
-                // Split into individual characters with delays between them.
-                var offset: usize = 0;
-                while (offset < token.value.len) {
-                    if (expanded.len >= expanded.tokens.len) break;
-                    // Handle multi-byte UTF-8: find the end of this codepoint.
-                    const byte = token.value[offset];
-                    const cp_len: usize = if (byte < 0x80) 1 else if (byte < 0xE0) 2 else if (byte < 0xF0) 3 else 4;
-                    const end = @min(offset + cp_len, token.value.len);
-                    expanded.tokens[expanded.len] = .{ .kind = .text, .value = token.value[offset..end] };
-                    expanded.len += 1;
-                    offset = end;
-                    // Add delay between characters (not after the last one).
-                    if (offset < token.value.len and expanded.len < expanded.tokens.len) {
-                        expanded.tokens[expanded.len] = .{ .kind = .delay, .value = "", .delay_ms = char_ms };
-                        expanded.len += 1;
-                    }
-                }
-            } else {
-                if (expanded.len >= expanded.tokens.len) break;
-                expanded.tokens[expanded.len] = token;
-                expanded.len += 1;
-            }
-        }
-        token_list = expanded;
+        token_list = expandDelayChar(token_list, char_ms);
     }
 
     // Prepend delay-before, append delay-after.
@@ -353,6 +344,62 @@ fn unescapeText(alloc: Allocator, input: []const u8) ![]const u8 {
     return buf.toOwnedSlice();
 }
 
+/// Split every `.text` token in `input` into one text token per UTF-8
+/// codepoint, interleaving `.delay` tokens of `char_ms` between adjacent
+/// characters. Non-text tokens (keys, hex-bytes, existing delays) pass
+/// through unchanged. Shared between `--text`, `--raw-text`, and `--seq`
+/// text tokens — `--raw-text` reaches this path the same way `--text`
+/// does, so `--delay-char` composes identically for both.
+fn expandDelayChar(input: SeqTokenList, char_ms: u64) SeqTokenList {
+    var expanded: SeqTokenList = .{};
+    for (input.slice()) |token| {
+        if (token.kind == .text and token.value.len > 1) {
+            var offset: usize = 0;
+            while (offset < token.value.len) {
+                if (expanded.len >= expanded.tokens.len) break;
+                // Handle multi-byte UTF-8: find the end of this codepoint.
+                const byte = token.value[offset];
+                const cp_len: usize = if (byte < 0x80) 1 else if (byte < 0xE0) 2 else if (byte < 0xF0) 3 else 4;
+                const end = @min(offset + cp_len, token.value.len);
+                expanded.tokens[expanded.len] = .{ .kind = .text, .value = token.value[offset..end] };
+                expanded.len += 1;
+                offset = end;
+                if (offset < token.value.len and expanded.len < expanded.tokens.len) {
+                    expanded.tokens[expanded.len] = .{ .kind = .delay, .value = "", .delay_ms = char_ms };
+                    expanded.len += 1;
+                }
+            }
+        } else {
+            if (expanded.len >= expanded.tokens.len) break;
+            expanded.tokens[expanded.len] = token;
+            expanded.len += 1;
+        }
+    }
+    return expanded;
+}
+
+/// The five mutually-exclusive input modes accepted by `hty send`. Exactly
+/// one must be non-null; any other count is a user error.
+const InputModes = struct {
+    text: ?[]const u8,
+    raw_text: ?[]const u8,
+    key: ?[]const u8,
+    bytes_hex: ?[]const u8,
+    seq: ?[]const u8,
+};
+
+/// Enforce the "exactly one input mode" rule. Returns an error on zero or
+/// multiple non-null fields so the caller can emit a stable error message.
+fn countInputModes(modes: InputModes) error{InvalidInputModeCount}!void {
+    var op_count: u8 = 0;
+    if (modes.text != null) op_count += 1;
+    if (modes.raw_text != null) op_count += 1;
+    if (modes.key != null) op_count += 1;
+    if (modes.bytes_hex != null) op_count += 1;
+    if (modes.seq != null) op_count += 1;
+    if (op_count != 1) return error.InvalidInputModeCount;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -478,4 +525,115 @@ test "unescapeText: multiple escapes in one string" {
     const result = try unescapeText(std.testing.allocator, "line1\\nline2\\ttab\\\\backslash");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("line1\nline2\ttab\\backslash", result);
+}
+
+// --raw-text semantics: --raw-text passes bytes verbatim to the `.text`
+// token without running unescapeText. The tests below pin down the byte
+// equality between what the shell hands us and what goes on the wire.
+// This is what distinguishes --raw-text from --text: --text would decode
+// `\n` into a real LF (0x0A); --raw-text keeps those as two separate
+// bytes (0x5C, 0x6E).
+
+test "raw-text: literal backslash-n stays two bytes" {
+    // What the shell passes when the user types `--raw-text 'hello\n'`.
+    const raw: []const u8 = "hello\\n";
+    // --raw-text skips unescapeText entirely: the value IS the byte slice.
+    try std.testing.expectEqual(@as(usize, 7), raw.len);
+    try std.testing.expectEqual(@as(u8, 'o'), raw[4]);
+    try std.testing.expectEqual(@as(u8, '\\'), raw[5]);
+    try std.testing.expectEqual(@as(u8, 'n'), raw[6]);
+    // Sanity check: --text would have collapsed the last two bytes into one.
+    const unescaped = try unescapeText(std.testing.allocator, raw);
+    defer std.testing.allocator.free(unescaped);
+    try std.testing.expectEqual(@as(usize, 6), unescaped.len);
+    try std.testing.expectEqual(@as(u8, '\n'), unescaped[5]);
+}
+
+test "raw-text: common C-style escape-looking sequences stay literal" {
+    // User intent: send the 8 bytes `\t\n\\\e` verbatim. --raw-text does
+    // zero translation; each of those backslashes/letters is its own byte.
+    const raw: []const u8 = "\\t\\n\\\\\\e";
+    try std.testing.expectEqual(@as(usize, 8), raw.len);
+    try std.testing.expectEqualStrings("\\t\\n\\\\\\e", raw);
+    // No LF, no TAB, no ESC — every byte is either '\\' or an ASCII letter.
+    for (raw) |b| try std.testing.expect(b == '\\' or (b >= 'a' and b <= 'z'));
+}
+
+test "helpText documents --raw-text" {
+    const text = helpText();
+    try std.testing.expect(std.mem.indexOf(u8, text, "--raw-text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "verbatim") != null);
+}
+
+test "countInputModes: exactly one mode is required" {
+    // Exactly one of each kind is OK.
+    try countInputModes(.{ .text = "y", .raw_text = null, .key = null, .bytes_hex = null, .seq = null });
+    try countInputModes(.{ .text = null, .raw_text = "y", .key = null, .bytes_hex = null, .seq = null });
+    try countInputModes(.{ .text = null, .raw_text = null, .key = "enter", .bytes_hex = null, .seq = null });
+    try countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = "2020", .seq = null });
+    try countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = null, .seq = "enter" });
+}
+
+test "countInputModes: zero modes is an error" {
+    try std.testing.expectError(
+        error.InvalidInputModeCount,
+        countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = null, .seq = null }),
+    );
+}
+
+test "countInputModes: --text and --raw-text together is a mutual-exclusion error" {
+    try std.testing.expectError(
+        error.InvalidInputModeCount,
+        countInputModes(.{ .text = "foo", .raw_text = "bar", .key = null, .bytes_hex = null, .seq = null }),
+    );
+}
+
+test "expandDelayChar: raw-text composes with --delay-char" {
+    // Simulate the token list --raw-text "ab" builds: one .text token with
+    // the two raw bytes. expandDelayChar should turn that into
+    // [text "a", delay 50, text "b"] — same as --text would.
+    var input: SeqTokenList = .{};
+    input.tokens[0] = .{ .kind = .text, .value = "ab" };
+    input.len = 1;
+
+    const out = expandDelayChar(input, 50);
+    const tokens = out.slice();
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqual(.text, tokens[0].kind);
+    try std.testing.expectEqualStrings("a", tokens[0].value);
+    try std.testing.expectEqual(.delay, tokens[1].kind);
+    try std.testing.expectEqual(@as(u64, 50), tokens[1].delay_ms);
+    try std.testing.expectEqual(.text, tokens[2].kind);
+    try std.testing.expectEqualStrings("b", tokens[2].value);
+}
+
+test "expandDelayChar: raw-text keeps literal backslash-n as two separate steps" {
+    // --raw-text 'a\n' --delay-char 50ms should split into [a] delay [\] delay [n].
+    var input: SeqTokenList = .{};
+    input.tokens[0] = .{ .kind = .text, .value = "a\\n" };
+    input.len = 1;
+
+    const out = expandDelayChar(input, 50);
+    const tokens = out.slice();
+    try std.testing.expectEqual(@as(usize, 5), tokens.len);
+    try std.testing.expectEqualStrings("a", tokens[0].value);
+    try std.testing.expectEqual(.delay, tokens[1].kind);
+    try std.testing.expectEqualStrings("\\", tokens[2].value);
+    try std.testing.expectEqual(.delay, tokens[3].kind);
+    try std.testing.expectEqualStrings("n", tokens[4].value);
+}
+
+test "countInputModes: --raw-text with any other mode is a mutual-exclusion error" {
+    try std.testing.expectError(
+        error.InvalidInputModeCount,
+        countInputModes(.{ .text = null, .raw_text = "x", .key = "enter", .bytes_hex = null, .seq = null }),
+    );
+    try std.testing.expectError(
+        error.InvalidInputModeCount,
+        countInputModes(.{ .text = null, .raw_text = "x", .key = null, .bytes_hex = "2020", .seq = null }),
+    );
+    try std.testing.expectError(
+        error.InvalidInputModeCount,
+        countInputModes(.{ .text = null, .raw_text = "x", .key = null, .bytes_hex = null, .seq = "enter" }),
+    );
 }
