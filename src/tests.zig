@@ -3524,3 +3524,391 @@ test "issue #33: hty logs renders [send] and [attach] prefixes" {
     // so readers can still distinguish it from real origins.
     try std.testing.expect(saw_unknown_prefix);
 }
+
+// ============================================================================
+// Push-based watch + pre-creation (LatentEvals/hty#29)
+// ============================================================================
+
+/// Line-buffered reader around a stream with a small per-line timeout.
+/// Holds a persistent buffer so that bytes read past the newline of one
+/// line are preserved for the next call. Tests instantiate one and use
+/// `readLine` as many times as needed, then call `deinit`.
+const LineReader = struct {
+    alloc: std.mem.Allocator,
+    stream: std.net.Stream,
+    buf: std.array_list.Managed(u8),
+
+    fn init(alloc: std.mem.Allocator, stream: std.net.Stream) LineReader {
+        return .{
+            .alloc = alloc,
+            .stream = stream,
+            .buf = std.array_list.Managed(u8).init(alloc),
+        };
+    }
+
+    fn deinit(self: *LineReader) void {
+        self.buf.deinit();
+    }
+
+    /// Read until the next '\n' and return the bytes before it (newline
+    /// consumed but not returned). Caller owns the returned slice.
+    fn readLine(self: *LineReader, timeout_ms: u64) ![]u8 {
+        const start_ns = std.time.nanoTimestamp();
+        const deadline_ns = start_ns + @as(i128, @intCast(timeout_ms * std.time.ns_per_ms));
+
+        // Serve from the existing buffer if a full line is already there.
+        if (std.mem.indexOfScalar(u8, self.buf.items, '\n')) |nl| {
+            return try self.popLine(nl);
+        }
+
+        var chunk: [512]u8 = undefined;
+        while (true) {
+            var pfd = [_]std.posix.pollfd{.{
+                .fd = self.stream.handle,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= deadline_ns) return error.ReadTimeout;
+            const remaining_ms: i32 = @intCast(@divTrunc(deadline_ns - now_ns, std.time.ns_per_ms));
+            const rc = try std.posix.poll(&pfd, @max(1, remaining_ms));
+            if (rc == 0) return error.ReadTimeout;
+            if ((pfd[0].revents & std.posix.POLL.IN) == 0) continue;
+
+            const n = try self.stream.read(&chunk);
+            if (n == 0) return error.EndOfStream;
+            try self.buf.appendSlice(chunk[0..n]);
+            if (std.mem.indexOfScalar(u8, self.buf.items, '\n')) |nl| {
+                return try self.popLine(nl);
+            }
+        }
+    }
+
+    fn popLine(self: *LineReader, nl: usize) ![]u8 {
+        const line = try self.alloc.dupe(u8, self.buf.items[0..nl]);
+        const rest_len = self.buf.items.len - nl - 1;
+        std.mem.copyForwards(u8, self.buf.items[0..rest_len], self.buf.items[nl + 1 ..]);
+        self.buf.shrinkRetainingCapacity(rest_len);
+        return line;
+    }
+};
+
+test "issue #29: watch against existing session receives started + initial snapshot" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "watch-existing");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // Spawn the target session up-front.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "watchexist",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Simulate a watch connection with a socketpair. We drive
+    // handleAttachConnection directly (no real accept loop) to keep the
+    // test hermetic. It's given a fake Connection whose stream is the
+    // server-side half of the pair.
+    const pair = try makeSocketPair();
+    // Note: the peer is explicitly closed below after we're done reading
+    // from it — not via defer — so the server's reader thread can notice
+    // EOF while the session is still alive, without double-close.
+
+    var conn: std.net.Server.Connection = .{
+        .stream = pair.local,
+        .address = undefined,
+    };
+
+    const line = "{\"op\":\"watch\",\"session\":\"watchexist\"}";
+    const result = try server_attach_mod.handleAttachConnection(
+        alloc,
+        &registry,
+        &conn,
+        line,
+        true, // read_only
+    );
+    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
+
+    var reader = LineReader.init(alloc, pair.peer);
+    defer reader.deinit();
+
+    // First line is the ack.
+    const ack = try reader.readLine(1000);
+    defer alloc.free(ack);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ack, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const ok = parsed.value.object.get("ok") orelse return error.MissingOk;
+        try std.testing.expect(ok == .bool and ok.bool);
+        // Not waiting — the session existed when we subscribed.
+        if (parsed.value.object.get("waiting")) |w| {
+            try std.testing.expect(!(w == .bool and w.bool));
+        }
+    }
+
+    // Next line should be the initial snapshot frame.
+    const snap = try reader.readLine(1000);
+    defer alloc.free(snap);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, snap, .{});
+        defer parsed.deinit();
+        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
+        try std.testing.expect(kind == .string);
+        try std.testing.expectEqualStrings("output", kind.string);
+        try std.testing.expect(parsed.value.object.get("bytes_hex") != null);
+    }
+
+    // Clean up: close the peer so the server reader thread exits.
+    // handleAttachConnection doesn't give us the client pointer back, so
+    // we find it on the session's attach list and shut it down.
+    const sess = try sessionByName(&registry, "watchexist");
+    pair.peer.close();
+    // Wait for the reader thread to notice EOF and flip `closed`.
+    // Loop for up to 1s.
+    var waited_ms: u32 = 0;
+    while (waited_ms < 1000) {
+        var any_open = false;
+        sess.attach_mutex.lock();
+        for (sess.attach_clients.items) |client| {
+            if (!client.isClosed()) any_open = true;
+        }
+        sess.attach_mutex.unlock();
+        if (!any_open) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        waited_ms += 10;
+    }
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "watchexist" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+test "issue #29: watch pre-creation promotes on spawn" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "watch-pending");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // No session exists yet. Park a watcher on a future name.
+    const pair = try makeSocketPair();
+    // Close the peer explicitly after reading — no defer (double-close).
+
+    var conn: std.net.Server.Connection = .{
+        .stream = pair.local,
+        .address = undefined,
+    };
+
+    const line = "{\"op\":\"watch\",\"session\":\"ghostname\"}";
+    const result = try server_attach_mod.handleAttachConnection(
+        alloc,
+        &registry,
+        &conn,
+        line,
+        true,
+    );
+    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
+
+    var reader = LineReader.init(alloc, pair.peer);
+    defer reader.deinit();
+
+    // First line is the waiting ack.
+    const ack = try reader.readLine(1000);
+    defer alloc.free(ack);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ack, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .object);
+        const ok = parsed.value.object.get("ok") orelse return error.MissingOk;
+        try std.testing.expect(ok == .bool and ok.bool);
+        const w = parsed.value.object.get("waiting") orelse return error.MissingWaiting;
+        try std.testing.expect(w == .bool and w.bool);
+    }
+
+    // Spawn the session with the matching name. Promotion happens
+    // synchronously inside registry.create() under the mutex.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "ghostname",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Next line must be the "started" frame.
+    const started = try reader.readLine(2000);
+    defer alloc.free(started);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, started, .{});
+        defer parsed.deinit();
+        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
+        try std.testing.expect(kind == .string);
+        try std.testing.expectEqualStrings("started", kind.string);
+    }
+
+    // Followed by the initial snapshot as an `output` frame.
+    const snap = try reader.readLine(2000);
+    defer alloc.free(snap);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, snap, .{});
+        defer parsed.deinit();
+        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
+        try std.testing.expect(kind == .string);
+        try std.testing.expectEqualStrings("output", kind.string);
+    }
+
+    // Verify the watcher was indeed promoted to an AttachClient on the
+    // new session, with read_only=true.
+    const sess = try sessionByName(&registry, "ghostname");
+    sess.attach_mutex.lock();
+    try std.testing.expect(sess.attach_clients.items.len >= 1);
+    var saw_readonly = false;
+    for (sess.attach_clients.items) |client| {
+        if (client.read_only) saw_readonly = true;
+    }
+    sess.attach_mutex.unlock();
+    try std.testing.expect(saw_readonly);
+
+    // Tear down.
+    pair.peer.close();
+    var waited_ms: u32 = 0;
+    while (waited_ms < 1000) {
+        var any_open = false;
+        sess.attach_mutex.lock();
+        for (sess.attach_clients.items) |client| {
+            if (!client.isClosed()) any_open = true;
+        }
+        sess.attach_mutex.unlock();
+        if (!any_open) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        waited_ms += 10;
+    }
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "ghostname" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+test "issue #29: read-only input frames are dropped by the server" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "watch-readonly-drop");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "rotest",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const sess = try sessionByName(&registry, "rotest");
+
+    // Build a read-only AttachClient directly and dispatch an input
+    // frame at it. It must be silently dropped — no error, no log entry.
+    var uuid_buf: [36]u8 = undefined;
+    uuid_mod_tests.generateUuidV7(&uuid_buf);
+    const client_id = try std.fmt.allocPrint(alloc, "attach-{s}", .{uuid_buf[0..]});
+    errdefer alloc.free(client_id);
+
+    const pair = try makeSocketPair();
+    defer pair.peer.close();
+
+    const client = try alloc.create(AttachClientTest);
+    errdefer alloc.destroy(client);
+    client.* = .{
+        .alloc = alloc,
+        .session = sess,
+        .stream = pair.local,
+        .client_id = client_id,
+        .read_only = true,
+    };
+    sess.attach_mutex.lock();
+    try sess.attach_clients.append(alloc, client);
+    sess.attach_mutex.unlock();
+    {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        log_mod_tests.logAttachConnectEvent(arena_state.allocator(), sess, client.client_id);
+    }
+
+    // Dispatch an input frame — for a read-only client this is a no-op
+    // (no error, no PTY send, no log event).
+    const frame = "{\"op\":\"input\",\"bytes_hex\":\"7a\"}";
+    try server_attach_mod.dispatchAttachFrame(client, frame);
+
+    // A resize frame from a read-only client must likewise be dropped.
+    const resize_frame = "{\"op\":\"resize\",\"rows\":99,\"cols\":99}";
+    try server_attach_mod.dispatchAttachFrame(client, resize_frame);
+
+    // Tear down client.
+    client.shutdown();
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "rotest" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+
+    const contents = try readAttachLog(alloc, log_dir, "rotest");
+    defer alloc.free(contents);
+    const events = try parseLogEvents(alloc, contents);
+    defer freeLogEvents(events);
+
+    // No `input` event with origin=attach should be present — the
+    // read-only client's input was dropped. Resize events from the
+    // client should also be absent.
+    for (events) |ev| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v != .string) continue;
+        const kind = kind_v.string;
+        if (std.mem.eql(u8, kind, "input")) {
+            if (ev.obj.get("origin")) |o| {
+                if (o == .string) {
+                    try std.testing.expect(!std.mem.eql(u8, o.string, "attach"));
+                }
+            }
+        }
+        if (std.mem.eql(u8, kind, "resize")) {
+            // Any resize present in the log must have come from the
+            // initial spawn (8x24), not from our bogus 99x99 frame.
+            const rows = ev.obj.get("rows") orelse continue;
+            if (rows == .integer) try std.testing.expect(rows.integer != 99);
+        }
+    }
+}

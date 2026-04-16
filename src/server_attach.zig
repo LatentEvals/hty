@@ -27,20 +27,29 @@ const SessionRegistry = @import("registry.zig").SessionRegistry;
 
 pub const ConnectionResult = enum { done, attached };
 
-/// Parse the request line far enough to recognize an attach op. Errors and
-/// non-attach ops both return false so the normal RPC path handles them.
-pub fn detectAttachOp(alloc: Allocator, line: []const u8) bool {
+/// Distinguishes between the normal RPC path, an interactive attach, and
+/// a read-only watch. The accept loop uses this to decide whether to
+/// hand off socket ownership to `handleAttachConnection` and with which
+/// `read_only` setting.
+pub const AttachOp = enum { none, attach, watch };
+
+/// Parse the request line far enough to recognize an attach-style op
+/// (interactive `attach` or read-only `watch`). Errors and non-matching
+/// ops return `.none` so the normal RPC path handles them.
+pub fn detectAttachOp(alloc: Allocator, line: []const u8) AttachOp {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return false;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch return .none;
     const object = switch (parsed) {
         .object => |o| o,
-        else => return false,
+        else => return .none,
     };
-    const op_val = object.get("op") orelse return false;
-    if (op_val != .string) return false;
-    return std.mem.eql(u8, op_val.string, "attach");
+    const op_val = object.get("op") orelse return .none;
+    if (op_val != .string) return .none;
+    if (std.mem.eql(u8, op_val.string, "attach")) return .attach;
+    if (std.mem.eql(u8, op_val.string, "watch")) return .watch;
+    return .none;
 }
 
 /// Full lifecycle of an attach-style connection: parse the request,
@@ -49,11 +58,19 @@ pub fn detectAttachOp(alloc: Allocator, line: []const u8) bool {
 /// for the rest of the attach lifetime. Returns `.attached` on success
 /// so the accept loop hands off socket ownership; `.done` on failure
 /// (the accept loop closes the connection).
+///
+/// `read_only` flips two behaviors: (1) the resulting `AttachClient` is
+/// marked read-only so `dispatchAttachFrame` drops input/resize frames,
+/// and (2) an unresolved *name* reference parks the socket on the
+/// registry's pending-watchers map instead of writing an error —
+/// enabling `hty watch <name>` before the session is spawned.
+/// See LatentEvals/hty#29.
 pub fn handleAttachConnection(
     alloc: Allocator,
     registry: *SessionRegistry,
     conn: *std.net.Server.Connection,
     line: []const u8,
+    read_only: bool,
 ) !ConnectionResult {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -73,18 +90,35 @@ pub fn handleAttachConnection(
 
     const session_ref = readOptionalString(object, "session") catch null;
     const sess = registry.resolveOrSole(session_ref) catch |err| {
+        // Pre-creation pending path: if read_only and the ref is a
+        // non-empty name string that doesn't resolve, park the socket
+        // in the registry's pending-watchers map and return. Ambiguous
+        // prefixes still fail fast — adding sessions can't disambiguate
+        // an existing ambiguity, and a null session_ref (sole-session
+        // mode) can't be pre-registered.
+        if (read_only and err == error.SessionNotFound) {
+            if (session_ref) |name| {
+                if (name.len > 0) {
+                    return parkWatchSubscriber(registry, conn, name);
+                }
+            }
+        }
         try writeAttachError(conn.stream, requestErrorMessage(err));
         return .done;
     };
 
     // Optional resize on attach so the PTY matches the observer's terminal.
-    if (object.get("rows")) |rv| {
-        if (object.get("cols")) |cv| {
-            if (rv == .integer and cv == .integer) {
-                const rows: u16 = @intCast(@max(1, rv.integer));
-                const cols: u16 = @intCast(@max(1, cv.integer));
-                sess.terminal.resize(rows, cols) catch {};
-                logResizeEvent(arena, sess, rows, cols);
+    // Watch subscribers are read-only — their terminal size is informational
+    // only and must not perturb the PTY the session is driving.
+    if (!read_only) {
+        if (object.get("rows")) |rv| {
+            if (object.get("cols")) |cv| {
+                if (rv == .integer and cv == .integer) {
+                    const rows: u16 = @intCast(@max(1, rv.integer));
+                    const cols: u16 = @intCast(@max(1, cv.integer));
+                    sess.terminal.resize(rows, cols) catch {};
+                    logResizeEvent(arena, sess, rows, cols);
+                }
             }
         }
     }
@@ -108,6 +142,7 @@ pub fn handleAttachConnection(
         .session = sess,
         .stream = conn.stream,
         .client_id = client_id,
+        .read_only = read_only,
     };
     sess.attach_mutex.lock();
     sess.attach_clients.append(alloc, client) catch {
@@ -174,6 +209,39 @@ pub fn writeAttachAck(stream: std.net.Stream) !void {
     try stream.writeAll("{\"ok\":true}\n");
 }
 
+/// Ack variant for pre-creation subscribers. Includes `waiting:true` so
+/// the client knows to paint a "Waiting…" frame and delay any per-client
+/// setup (for attach: raw mode, SIGWINCH) until the `started` frame
+/// arrives. Older clients that don't recognize the field safely ignore it.
+pub fn writeAttachAckWaiting(stream: std.net.Stream) !void {
+    try stream.writeAll("{\"ok\":true,\"waiting\":true}\n");
+}
+
+/// Park a watch-style subscriber whose target session doesn't exist yet.
+/// Writes the waiting-ack, parks the socket on the registry's pending
+/// map, and returns `.attached` so the accept loop surrenders ownership
+/// of the stream. The socket is promoted to a real `AttachClient` the
+/// next time a session with a matching name is created.
+fn parkWatchSubscriber(
+    registry: *SessionRegistry,
+    conn: *std.net.Server.Connection,
+    name: []const u8,
+) !ConnectionResult {
+    // Send the waiting ack BEFORE parking so the client knows it's
+    // subscribed. If the ack write fails the socket is already toast —
+    // don't bother parking it.
+    writeAttachAckWaiting(conn.stream) catch {
+        return .done;
+    };
+    _ = registry.parkPendingWatcher(name, conn.stream) catch {
+        // Parking failed (allocation or thread spawn). Best we can do is
+        // write an error and let the client retry.
+        writeAttachError(conn.stream, "server busy; could not park pending watcher") catch {};
+        return .done;
+    };
+    return .attached;
+}
+
 pub fn writeAttachError(stream: std.net.Stream, message: []const u8) !void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(
@@ -231,6 +299,11 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
     const op = op_val.string;
 
     if (std.mem.eql(u8, op, "input")) {
+        // Read-only (watch) clients may not drive the PTY. Silently drop
+        // the frame rather than erroring — a stale or confused client
+        // shouldn't tear the connection down, but must not be able to
+        // type into a watched session.
+        if (client.read_only) return;
         const hex_val = object.get("bytes_hex") orelse return;
         if (hex_val != .string) return;
         const bytes = decodeHex(arena, hex_val.string) catch return;
@@ -243,6 +316,8 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
     }
 
     if (std.mem.eql(u8, op, "resize")) {
+        // Watch clients can't resize the PTY. See comment on `input`.
+        if (client.read_only) return;
         const rows_val = object.get("rows") orelse return;
         const cols_val = object.get("cols") orelse return;
         if (rows_val != .integer or cols_val != .integer) return;
@@ -258,12 +333,14 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
     }
 }
 
-test "detectAttachOp recognizes attach requests" {
+test "detectAttachOp recognizes attach and watch requests" {
     const alloc = std.testing.allocator;
-    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\",\"session\":\"foo\"}"));
-    try std.testing.expect(detectAttachOp(alloc, "{\"op\":\"attach\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"snapshot\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "{\"op\":\"spawn\",\"program\":\"/bin/sh\"}"));
-    try std.testing.expect(!detectAttachOp(alloc, "not json"));
-    try std.testing.expect(!detectAttachOp(alloc, "[\"attach\"]"));
+    try std.testing.expectEqual(AttachOp.attach, detectAttachOp(alloc, "{\"op\":\"attach\",\"session\":\"foo\"}"));
+    try std.testing.expectEqual(AttachOp.attach, detectAttachOp(alloc, "{\"op\":\"attach\"}"));
+    try std.testing.expectEqual(AttachOp.watch, detectAttachOp(alloc, "{\"op\":\"watch\",\"session\":\"foo\"}"));
+    try std.testing.expectEqual(AttachOp.watch, detectAttachOp(alloc, "{\"op\":\"watch\"}"));
+    try std.testing.expectEqual(AttachOp.none, detectAttachOp(alloc, "{\"op\":\"snapshot\"}"));
+    try std.testing.expectEqual(AttachOp.none, detectAttachOp(alloc, "{\"op\":\"spawn\",\"program\":\"/bin/sh\"}"));
+    try std.testing.expectEqual(AttachOp.none, detectAttachOp(alloc, "not json"));
+    try std.testing.expectEqual(AttachOp.none, detectAttachOp(alloc, "[\"attach\"]"));
 }

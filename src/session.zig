@@ -157,6 +157,14 @@ pub const AttachClient = struct {
     /// same client.
     disconnect_logged: std.atomic.Value(bool) = .init(false),
     reader_thread: ?std.Thread = null,
+    /// If true, the client is a `hty watch` subscriber: it sits on the
+    /// same broadcast list as a full attach client, receives the same
+    /// initial snapshot and live output/exit frames, but any `input` /
+    /// `resize` frames it sends are silently dropped by the server-side
+    /// reader loop. This lets watch piggyback on attach's broadcast
+    /// infrastructure with one flag rather than a parallel subscriber
+    /// list. See LatentEvals/hty#29.
+    read_only: bool = false,
 
     pub fn isClosed(self: *const AttachClient) bool {
         return self.closed.load(.acquire);
