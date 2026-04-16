@@ -200,6 +200,12 @@ fn printFormattedEvent(alloc: Allocator, obj: std.json.ObjectMap, t: i64) !void 
     try common.printLine(line);
 }
 
+/// Test-only re-export of the internal `buildEventDetail` so cross-file tests
+/// can assert on the rendered prefix without duplicating the match logic.
+pub fn buildEventDetailForTest(alloc: Allocator, kind: []const u8, obj: std.json.ObjectMap) ![]u8 {
+    return buildEventDetail(alloc, kind, obj);
+}
+
 fn buildEventDetail(alloc: Allocator, kind: []const u8, obj: std.json.ObjectMap) ![]u8 {
     if (std.mem.eql(u8, kind, "spawn")) {
         const program = getString(obj, "program") orelse "";
@@ -222,14 +228,28 @@ fn buildEventDetail(alloc: Allocator, kind: []const u8, obj: std.json.ObjectMap)
     if (std.mem.eql(u8, kind, "input") or std.mem.eql(u8, kind, "output")) {
         const hex = getString(obj, "bytes_hex") orelse "";
         const nbytes = hex.len / 2;
+        // Input events carry an `origin` tag (issue #33) — render it as a
+        // bracketed prefix so agent-driven traffic is distinguishable from
+        // interactive attach keystrokes at a glance. Old logs predating
+        // origin tagging render as `[?]` so the prefix stays column-
+        // aligned and the missing tag is visible rather than implied.
+        const origin_prefix = if (std.mem.eql(u8, kind, "input")) blk: {
+            const origin = getString(obj, "origin") orelse break :blk "[?] ";
+            if (std.mem.eql(u8, origin, "send")) break :blk "[send] ";
+            if (std.mem.eql(u8, origin, "attach")) break :blk "[attach] ";
+            break :blk "[?] ";
+        } else "";
         // For printable ASCII input, show the quoted string; else show hex.
         if (std.mem.eql(u8, kind, "input") and nbytes > 0 and nbytes <= 32) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             if (decodeHex(arena_state.allocator(), hex) catch null) |decoded| {
                 if (isMostlyPrintable(decoded)) {
-                    return try std.fmt.allocPrint(alloc, "{s} ({d} byte{s})", .{
-                        try quoteForDisplay(alloc, decoded),
+                    const quoted = try quoteForDisplay(alloc, decoded);
+                    defer alloc.free(quoted);
+                    return try std.fmt.allocPrint(alloc, "{s}{s} ({d} byte{s})", .{
+                        origin_prefix,
+                        quoted,
                         nbytes,
                         if (nbytes == 1) "" else "s",
                     });
@@ -239,7 +259,13 @@ fn buildEventDetail(alloc: Allocator, kind: []const u8, obj: std.json.ObjectMap)
         const preview_len = @min(hex.len, 16);
         const preview = hex[0..preview_len];
         const ellipsis: []const u8 = if (hex.len > preview_len) "..." else "";
-        return try std.fmt.allocPrint(alloc, "{s}{s} ({d} bytes)", .{ preview, ellipsis, nbytes });
+        return try std.fmt.allocPrint(alloc, "{s}{s}{s} ({d} bytes)", .{ origin_prefix, preview, ellipsis, nbytes });
+    }
+    if (std.mem.eql(u8, kind, "attach_connect") or std.mem.eql(u8, kind, "attach_disconnect")) {
+        const cid = getString(obj, "client_id") orelse "";
+        // Short form for readability; the full id is always in the JSON.
+        const short_len = @min(cid.len, 15); // "attach-" (7) + 8 hex chars
+        return try std.fmt.allocPrint(alloc, "{s}", .{cid[0..short_len]});
     }
     if (std.mem.eql(u8, kind, "title")) {
         const title = getString(obj, "title") orelse "";

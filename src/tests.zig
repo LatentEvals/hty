@@ -2544,3 +2544,512 @@ test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
     defer kill_parsed.deinit();
     _ = try expectTestOk(kill_parsed);
 }
+
+// ============================================================================
+// Session log origin tagging + attach lifecycle (LatentEvals/hty#33)
+// ============================================================================
+//
+// The send-origin test goes through the standard `testRequest` harness so it
+// covers the full RPC path. The attach-origin tests construct `AttachClient`s
+// directly from a socketpair to avoid depending on the server's XDG-resolved
+// log dir — we want these tests hermetic under /tmp.
+
+const session_mod_tests = @import("session.zig");
+const AttachClientTest = session_mod_tests.AttachClient;
+const server_attach_mod = @import("server_attach.zig");
+const attach_mod = @import("attach.zig");
+const uuid_mod_tests = @import("uuid.zig");
+const log_mod_tests = @import("log.zig");
+const replay_mod = @import("commands/replay.zig");
+const logs_cmd = @import("commands/logs.zig");
+
+/// Set up a hermetic log dir under /tmp for an attach test. Returns the
+/// absolute log_dir path (owned by the caller; free with `alloc.free`).
+fn setupAttachLogDir(alloc: std.mem.Allocator, tag: []const u8) ![]u8 {
+    const log_dir = try std.fmt.allocPrint(
+        alloc,
+        "/tmp/hty-attach-{s}-{d}",
+        .{ tag, std.time.nanoTimestamp() },
+    );
+    errdefer alloc.free(log_dir);
+    try std.fs.cwd().makePath(log_dir);
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+    return log_dir;
+}
+
+/// Read the session's log file through the by-name symlink.
+fn readAttachLog(alloc: std.mem.Allocator, log_dir: []const u8, name: []const u8) ![]u8 {
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/{s}.jsonl", .{ log_dir, name });
+    defer alloc.free(link_path);
+    const file = try std.fs.openFileAbsolute(link_path, .{});
+    defer file.close();
+    return try file.readToEndAlloc(alloc, 1024 * 1024);
+}
+
+/// Parse a JSONL log into owned objects. Caller frees the returned slice
+/// AND each parsed value inside via `parsed[i].deinit()`.
+const LoggedObj = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    obj: std.json.ObjectMap,
+};
+
+fn parseLogEvents(alloc: std.mem.Allocator, bytes: []const u8) ![]LoggedObj {
+    var out = std.array_list.Managed(LoggedObj).init(alloc);
+    errdefer {
+        for (out.items) |item| item.parsed.deinit();
+        out.deinit();
+    }
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        if (parsed.value != .object) {
+            parsed.deinit();
+            continue;
+        }
+        try out.append(.{ .parsed = parsed, .obj = parsed.value.object });
+    }
+    return out.toOwnedSlice();
+}
+
+fn freeLogEvents(items: []LoggedObj) void {
+    for (items) |*item| item.parsed.deinit();
+    std.testing.allocator.free(items);
+}
+
+test "issue #33: send ops tag log events with origin=send" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "send-origin");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "sendorig",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "sendorig",
+            .text = "y",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "sendorig" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const contents = try readAttachLog(alloc, log_dir, "sendorig");
+    defer alloc.free(contents);
+
+    // Every input event must carry `origin:"send"` — and there must be
+    // at least one, since we issued a send_text.
+    const events = try parseLogEvents(alloc, contents);
+    defer freeLogEvents(events);
+    var saw_input = false;
+    for (events) |ev| {
+        const kind = ev.obj.get("kind") orelse continue;
+        if (kind != .string) continue;
+        if (!std.mem.eql(u8, kind.string, "input")) continue;
+        saw_input = true;
+        const origin = ev.obj.get("origin") orelse return error.MissingOrigin;
+        try std.testing.expect(origin == .string);
+        try std.testing.expectEqualStrings("send", origin.string);
+    }
+    try std.testing.expect(saw_input);
+}
+
+/// Make a connected socketpair and return (local, peer) as `std.net.Stream`s.
+/// Caller closes both. `local` is the end we hand to `AttachClient`; `peer`
+/// is the end the test uses to pretend to be an attach client.
+const SocketPair = struct {
+    local: std.net.Stream,
+    peer: std.net.Stream,
+};
+
+fn makeSocketPair() !SocketPair {
+    var fds: [2]std.posix.fd_t = undefined;
+    const rc = std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
+    if (rc != 0) return error.SocketPairFailed;
+    return .{
+        .local = .{ .handle = fds[0] },
+        .peer = .{ .handle = fds[1] },
+    };
+}
+
+/// Build an AttachClient with a minted client_id over `local` and register it
+/// on the session's attach list, the way `handleAttachConnection` would. The
+/// caller owns lifecycle — the client is reaped via `reapClosedAttachClients`
+/// after its socket is closed, OR via session deinit.
+fn registerAttachClient(
+    alloc: std.mem.Allocator,
+    sess: *session_mod_tests.Session,
+    local: std.net.Stream,
+) !*AttachClientTest {
+    var uuid_buf: [36]u8 = undefined;
+    uuid_mod_tests.generateUuidV7(&uuid_buf);
+    const client_id = try std.fmt.allocPrint(alloc, "attach-{s}", .{uuid_buf[0..]});
+    errdefer alloc.free(client_id);
+
+    const client = try alloc.create(AttachClientTest);
+    errdefer alloc.destroy(client);
+    client.* = .{
+        .alloc = alloc,
+        .session = sess,
+        .stream = local,
+        .client_id = client_id,
+    };
+
+    sess.attach_mutex.lock();
+    try sess.attach_clients.append(alloc, client);
+    sess.attach_mutex.unlock();
+
+    // Record the connect event — this is what `handleAttachConnection`
+    // does in production right after appending to the list.
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    log_mod_tests.logAttachConnectEvent(arena_state.allocator(), sess, client.client_id);
+    return client;
+}
+
+/// Get a session pointer by name for tests that need to poke at the
+/// attach machinery directly. Returns an error if the session is gone.
+fn sessionByName(registry: *SessionRegistry, name: []const u8) !*session_mod_tests.Session {
+    return registry.resolveOrSole(name);
+}
+
+test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "attach-lifecycle");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "atcat",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const sess = try sessionByName(&registry, "atcat");
+
+    // Simulate an attach connection with a socketpair.
+    const pair = try makeSocketPair();
+    defer pair.peer.close();
+
+    const client = try registerAttachClient(alloc, sess, pair.local);
+    const client_id_owned = try alloc.dupe(u8, client.client_id);
+    defer alloc.free(client_id_owned);
+
+    // Dispatch an input frame the way `attachReaderLoop` would.
+    const frame = "{\"op\":\"input\",\"bytes_hex\":\"71\"}";
+    try server_attach_mod.dispatchAttachFrame(client, frame);
+
+    // Abort: close the peer, mark the client closed, reap.
+    client.shutdown();
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "atcat" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+
+    const contents = try readAttachLog(alloc, log_dir, "atcat");
+    defer alloc.free(contents);
+
+    const events = try parseLogEvents(alloc, contents);
+    defer freeLogEvents(events);
+
+    var saw_connect = false;
+    var saw_attach_input = false;
+    var saw_disconnect = false;
+    for (events) |ev| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v != .string) continue;
+        const kind = kind_v.string;
+
+        if (std.mem.eql(u8, kind, "attach_connect")) {
+            const cid = ev.obj.get("client_id") orelse return error.MissingClientId;
+            try std.testing.expectEqualStrings(client_id_owned, cid.string);
+            saw_connect = true;
+        } else if (std.mem.eql(u8, kind, "attach_disconnect")) {
+            const cid = ev.obj.get("client_id") orelse return error.MissingClientId;
+            try std.testing.expectEqualStrings(client_id_owned, cid.string);
+            saw_disconnect = true;
+        } else if (std.mem.eql(u8, kind, "input")) {
+            const origin = ev.obj.get("origin") orelse return error.MissingOrigin;
+            if (std.mem.eql(u8, origin.string, "attach")) {
+                const cid = ev.obj.get("client_id") orelse return error.MissingClientId;
+                try std.testing.expectEqualStrings(client_id_owned, cid.string);
+                saw_attach_input = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_connect);
+    try std.testing.expect(saw_attach_input);
+    try std.testing.expect(saw_disconnect);
+
+    // client_id format is documented: "attach-" + UUIDv7.
+    try std.testing.expect(std.mem.startsWith(u8, client_id_owned, "attach-"));
+    try std.testing.expectEqual(@as(usize, "attach-".len + 36), client_id_owned.len);
+}
+
+test "issue #33: interleaved send/attach produces ordered origin labels" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "interleaved");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "inter",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 1. send
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "inter",
+            .text = "a",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // 2. attach, input, detach
+    const sess = try sessionByName(&registry, "inter");
+    const pair = try makeSocketPair();
+    defer pair.peer.close();
+
+    const client = try registerAttachClient(alloc, sess, pair.local);
+    const frame = "{\"op\":\"input\",\"bytes_hex\":\"62\"}"; // 'b'
+    try server_attach_mod.dispatchAttachFrame(client, frame);
+    client.shutdown();
+    attach_mod.reapClosedAttachClients(sess);
+
+    // 3. send again
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "inter",
+            .text = "c",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "inter" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+
+    const contents = try readAttachLog(alloc, log_dir, "inter");
+    defer alloc.free(contents);
+
+    // Walk events and check the origin labels on input events appear in the
+    // expected order: send, attach, send. Also assert the attach input is
+    // bracketed by attach_connect / attach_disconnect.
+    const events = try parseLogEvents(alloc, contents);
+    defer freeLogEvents(events);
+
+    var input_origins = std.array_list.Managed([]const u8).init(alloc);
+    defer input_origins.deinit();
+    var has_connect_before_attach_input = false;
+    var has_disconnect_after_attach_input = false;
+    var attach_input_idx: ?usize = null;
+
+    for (events, 0..) |ev, idx| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v != .string) continue;
+        const kind = kind_v.string;
+        if (std.mem.eql(u8, kind, "input")) {
+            const origin = ev.obj.get("origin") orelse return error.MissingOrigin;
+            try input_origins.append(origin.string);
+            if (std.mem.eql(u8, origin.string, "attach")) {
+                attach_input_idx = idx;
+            }
+        }
+    }
+    try std.testing.expect(attach_input_idx != null);
+    for (events[0..attach_input_idx.?]) |ev| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v == .string and std.mem.eql(u8, kind_v.string, "attach_connect")) {
+            has_connect_before_attach_input = true;
+        }
+    }
+    for (events[attach_input_idx.? + 1 ..]) |ev| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v == .string and std.mem.eql(u8, kind_v.string, "attach_disconnect")) {
+            has_disconnect_after_attach_input = true;
+        }
+    }
+    try std.testing.expect(has_connect_before_attach_input);
+    try std.testing.expect(has_disconnect_after_attach_input);
+
+    try std.testing.expectEqual(@as(usize, 3), input_origins.items.len);
+    try std.testing.expectEqualStrings("send", input_origins.items[0]);
+    try std.testing.expectEqualStrings("attach", input_origins.items[1]);
+    try std.testing.expectEqualStrings("send", input_origins.items[2]);
+}
+
+test "issue #33: abrupt attach drop still logs attach_disconnect" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "abrupt");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "abrupt",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const sess = try sessionByName(&registry, "abrupt");
+    const pair = try makeSocketPair();
+
+    const client = try registerAttachClient(alloc, sess, pair.local);
+    const client_id_owned = try alloc.dupe(u8, client.client_id);
+    defer alloc.free(client_id_owned);
+
+    // "Abrupt": close the peer end (no detach op, no protocol teardown).
+    // Mirror what `attachReaderLoop` does when its read() returns 0 or
+    // errors: flip the client closed, then the reaper does the rest.
+    pair.peer.close();
+    client.shutdown();
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "abrupt" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+
+    const contents = try readAttachLog(alloc, log_dir, "abrupt");
+    defer alloc.free(contents);
+
+    const events = try parseLogEvents(alloc, contents);
+    defer freeLogEvents(events);
+
+    var disconnects: usize = 0;
+    for (events) |ev| {
+        const kind_v = ev.obj.get("kind") orelse continue;
+        if (kind_v != .string) continue;
+        if (std.mem.eql(u8, kind_v.string, "attach_disconnect")) {
+            const cid = ev.obj.get("client_id") orelse return error.MissingClientId;
+            try std.testing.expectEqualStrings(client_id_owned, cid.string);
+            disconnects += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), disconnects);
+}
+
+test "issue #33: pre-feature log parses through replayToTerminal (backward compat)" {
+    const alloc = std.testing.allocator;
+
+    // Synthetic pre-feature log: no `origin` on the input event, no
+    // `attach_*` events. Every pre-feature session matched this shape, so
+    // if replay blows up on this it's a hard regression.
+    const legacy_log =
+        \\{"t":1700000000000,"kind":"spawn","program":"cat","args":[],"rows":24,"cols":80}
+        \\{"t":1700000000100,"kind":"input","bytes_hex":"68"}
+        \\{"t":1700000000110,"kind":"output","bytes_hex":"68"}
+        \\{"t":1700000000120,"kind":"exited","code":0}
+    ;
+
+    var result = try replay_mod.replayToTerminal(alloc, legacy_log, 24, 80);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 24), result.rows);
+    try std.testing.expectEqual(@as(u16, 80), result.cols);
+}
+
+test "issue #33: hty logs renders [send] and [attach] prefixes" {
+    const alloc = std.testing.allocator;
+
+    // Build mixed-origin log bytes in-memory and feed them through the
+    // same code path `hty logs` uses to render human-readable detail.
+    const mixed_log =
+        \\{"t":100,"kind":"spawn","program":"cat","args":[],"rows":24,"cols":80}
+        \\{"t":200,"kind":"input","origin":"send","bytes_hex":"79"}
+        \\{"t":300,"kind":"attach_connect","client_id":"attach-abcd1234"}
+        \\{"t":400,"kind":"input","origin":"attach","client_id":"attach-abcd1234","bytes_hex":"71"}
+        \\{"t":500,"kind":"attach_disconnect","client_id":"attach-abcd1234"}
+        \\{"t":600,"kind":"input","bytes_hex":"7a"}
+    ;
+
+    var saw_send_prefix = false;
+    var saw_attach_prefix = false;
+    var saw_unknown_prefix = false;
+
+    var it = std.mem.splitScalar(u8, mixed_log, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+        const obj = parsed.value.object;
+        const kind_v = obj.get("kind") orelse continue;
+        if (kind_v != .string) continue;
+        const kind = kind_v.string;
+        if (!std.mem.eql(u8, kind, "input")) continue;
+
+        const detail = try logs_cmd.buildEventDetailForTest(alloc, kind, obj);
+        defer alloc.free(detail);
+
+        if (std.mem.indexOf(u8, detail, "[send]") != null) saw_send_prefix = true;
+        if (std.mem.indexOf(u8, detail, "[attach]") != null) saw_attach_prefix = true;
+        if (std.mem.indexOf(u8, detail, "[?]") != null) saw_unknown_prefix = true;
+    }
+    try std.testing.expect(saw_send_prefix);
+    try std.testing.expect(saw_attach_prefix);
+    // The trailing legacy-style input (no origin) must render as `[?]`
+    // so readers can still distinguish it from real origins.
+    try std.testing.expect(saw_unknown_prefix);
+}

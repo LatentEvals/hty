@@ -10,6 +10,7 @@
 const std = @import("std");
 const session_mod = @import("session.zig");
 const hex_mod = @import("hex.zig");
+const log_mod = @import("log.zig");
 
 const Session = session_mod.Session;
 const AttachClient = session_mod.AttachClient;
@@ -56,7 +57,11 @@ pub fn broadcastExitedToAttach(sess: *Session, code: ?i32) void {
 }
 
 /// Remove any attached clients whose socket has been closed (either by the
-/// client itself or by a failed write in the broadcast loop).
+/// client itself or by a failed write in the broadcast loop). Every reaped
+/// client emits an `attach_disconnect` log event — this is the single
+/// choke-point that fires for both graceful detach and abrupt drops
+/// (broken pipe, ssh tunnel closed, client process killed), because every
+/// one of those paths ends up flipping `client.closed` and landing here.
 pub fn reapClosedAttachClients(sess: *Session) void {
     sess.attach_mutex.lock();
     var reaped: std.ArrayListUnmanaged(*AttachClient) = .{};
@@ -75,6 +80,14 @@ pub fn reapClosedAttachClients(sess: *Session) void {
     sess.attach_mutex.unlock();
 
     // deinit joins the reader thread — do it outside the mutex so the reader
-    // can call back into session state without deadlocking.
-    for (reaped.items) |client| client.deinit();
+    // can call back into session state without deadlocking. Emit the
+    // disconnect event before deinit so the client_id is still valid.
+    for (reaped.items) |client| {
+        if (!client.disconnect_logged.swap(true, .acq_rel)) {
+            var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
+            defer arena_state.deinit();
+            log_mod.logAttachDisconnectEvent(arena_state.allocator(), sess, client.client_id);
+        }
+        client.deinit();
+    }
 }

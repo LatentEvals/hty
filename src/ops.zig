@@ -226,7 +226,7 @@ fn dupeCells(arena: Allocator, src: [][]const []const u8) ![]const []const []con
 
 pub fn handleSendText(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     const text = try readRequiredString(object, "text");
-    logInputEvent(arena, sess, text);
+    logInputEvent(arena, sess, text, "send", null);
     try sess.terminal.send(.{ .text = text });
     return .{ .id = id, .ok = true };
 }
@@ -234,7 +234,7 @@ pub fn handleSendText(arena: Allocator, sess: *Session, object: std.json.ObjectM
 pub fn handleSendKey(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     const key = try readRequiredString(object, "key");
     const bytes = try keyToBytes(arena, key);
-    logInputEvent(arena, sess, bytes);
+    logInputEvent(arena, sess, bytes, "send", null);
     try sess.terminal.send(.{ .bytes = bytes });
     return .{ .id = id, .ok = true };
 }
@@ -242,7 +242,7 @@ pub fn handleSendKey(arena: Allocator, sess: *Session, object: std.json.ObjectMa
 pub fn handleSendBytesHex(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     const bytes_hex = try readRequiredString(object, "bytes_hex");
     const bytes = try decodeHex(arena, bytes_hex);
-    logInputEvent(arena, sess, bytes);
+    logInputEvent(arena, sess, bytes, "send", null);
     try sess.terminal.send(.{ .bytes = bytes });
     return .{ .id = id, .ok = true };
 }
