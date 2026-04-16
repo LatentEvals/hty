@@ -25,6 +25,12 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v6
+        with:
+          # `build.zig` embeds `git describe --tags` output so released
+          # binaries report the tag they were built from. Without a full
+          # fetch with tags, that would fall back to just a short SHA.
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: install zig
         uses: montanaflynn/setup-zig@main

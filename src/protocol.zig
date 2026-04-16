@@ -71,6 +71,18 @@ pub const InfoPayload = struct {
     state_dir: []const u8,
     log_dir: []const u8,
     server: ServerInfo,
+    build: BuildInfo,
+};
+
+/// Build-time metadata baked in by `build.zig` from `git describe` etc.
+/// Git fields are null for source-tarball / non-git builds.
+pub const BuildInfo = struct {
+    version: []const u8,
+    commit: ?[]const u8 = null,
+    tag: ?[]const u8 = null,
+    dirty: bool = false,
+    describe: ?[]const u8 = null,
+    mode: []const u8,
 };
 
 pub const ServerInfo = struct {

@@ -134,6 +134,14 @@ pub fn handleInfo(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Respo
                 .pid = server_pid,
                 .uptime_ms = uptime_ms,
             },
+            // The server-side `info` response only exists to surface
+            // pid / uptime; the client rebuilds the full payload
+            // (including `build`) before rendering, so an empty stub
+            // is enough here.
+            .build = .{
+                .version = "",
+                .mode = "",
+            },
         },
     };
 }
