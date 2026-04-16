@@ -1336,6 +1336,64 @@ test "send_bytes_hex op rejects malformed hex" {
     _ = try expectTestOk(k);
 }
 
+// Round-trip for `hty send --raw-text`: the client skips its C-style escape
+// decoder and hands the argument bytes through unchanged. Exercising that
+// here means issuing `send_text` with the literal 7-byte string `hello\n`
+// (backslash + n, no LF) — which is exactly what the client produces for
+// `--raw-text 'hello\n'`. We assert the echo contains those two literal
+// bytes and no real newline snuck in.
+test "send_text with literal backslash-n preserves bytes verbatim (--raw-text round trip)" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "rawcat");
+    defer std.testing.allocator.free(uuid);
+
+    // 7 bytes: h e l l o \ n — no real LF.
+    const literal: []const u8 = "hello\\n";
+    try std.testing.expectEqual(@as(usize, 7), literal.len);
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "rawcat",
+            .text = literal,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    {
+        // Wait for the literal substring to appear in the echoed buffer.
+        // `wait_for_text.text` is a literal substring match so searching for
+        // "hello\\n" (backslash + n) is a direct check.
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "rawcat",
+            .text = literal,
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const snapshot = object.get("snapshot") orelse return error.InvalidResponse;
+        const snapshot_object = switch (snapshot) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+        const buffer = snapshot_object.get("buffer") orelse return error.InvalidResponse;
+        try std.testing.expect(buffer == .string);
+        // The literal 7 bytes must appear contiguously (no LF splitting).
+        try std.testing.expect(std.mem.indexOf(u8, buffer.string, literal) != null);
+        // And confirm there's no "hello\n" (real LF) anywhere — if the
+        // client had unescaped, the buffer would contain h,e,l,l,o,0x0A.
+        try std.testing.expect(std.mem.indexOf(u8, buffer.string, "hello\n") == null);
+    }
+
+    var k = try testRequest(&registry, .{ .op = "kill", .session = "rawcat" });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
 test "send_key op accepts a symbolic key name" {
     var registry = SessionRegistry.init(std.testing.allocator);
     defer registry.deinit();
