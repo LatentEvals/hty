@@ -37,6 +37,26 @@ pub fn helpText() []const u8 {
     \\                       between each. Only works with --text, --raw-text,
     \\                       or --seq.
     \\
+    \\Wait + snapshot flags (fuse send + wait + snapshot into one round-trip):
+    \\  --snapshot           Include the post-action snapshot in the response.
+    \\                       Combines with --json and --ansi like `hty snapshot`.
+    \\  --wait-duration DUR  Sleep DUR after sending, then snapshot. Requires
+    \\                       --snapshot (otherwise use --delay-after).
+    \\  --wait-until-idle [MS]
+    \\                       Block until the screen has been quiet for MS
+    \\                       milliseconds (default 100). The idle window is
+    \\                       measured from the moment this op begins on the
+    \\                       server, so a session that was already quiet
+    \\                       before the send won't trip the check immediately.
+    \\  --wait-until-text STR    Block until STR appears in the rendered buffer.
+    \\  --wait-until-regex RE    Block until RE (POSIX extended) matches.
+    \\  --wait-until-exit        Block until the child process exits.
+    \\  --timeout DUR        Cap on any --wait-until-* (default 30s; 0 = none).
+    \\  --json               With --snapshot, emit `{ok, matched, elapsed_ms,
+    \\                       snapshot, ...}` instead of the plain buffer.
+    \\  --ansi               With --snapshot, print the styled ANSI rendering
+    \\                       instead of the plain buffer.
+    \\
     ;
 }
 
@@ -50,6 +70,17 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var delay_before: ?[]const u8 = null;
     var delay_after: ?[]const u8 = null;
     var delay_char: ?[]const u8 = null;
+
+    var snapshot_flag = false;
+    var json_output = false;
+    var ansi_output = false;
+    var wait_duration_str: ?[]const u8 = null;
+    var wait_until_idle = false;
+    var wait_until_idle_ms_str: ?[]const u8 = null;
+    var wait_until_text: ?[]const u8 = null;
+    var wait_until_regex: ?[]const u8 = null;
+    var wait_until_exit = false;
+    var timeout_str: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -86,6 +117,39 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--delay-char requires a value");
             delay_char = args[i];
+        } else if (std.mem.eql(u8, arg, "--snapshot")) {
+            snapshot_flag = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            json_output = true;
+        } else if (std.mem.eql(u8, arg, "--ansi")) {
+            ansi_output = true;
+        } else if (std.mem.eql(u8, arg, "--wait-duration")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--wait-duration requires a value");
+            wait_duration_str = args[i];
+        } else if (std.mem.eql(u8, arg, "--wait-until-idle")) {
+            wait_until_idle = true;
+            // Optional positional value: consume the next arg only if it
+            // looks like a duration (digit-prefixed). Otherwise leave it
+            // for the next flag/positional slot.
+            if (i + 1 < args.len and looksLikeDurationArg(args[i + 1])) {
+                i += 1;
+                wait_until_idle_ms_str = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--wait-until-text")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--wait-until-text requires a value");
+            wait_until_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--wait-until-regex")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--wait-until-regex requires a value");
+            wait_until_regex = args[i];
+        } else if (std.mem.eql(u8, arg, "--wait-until-exit")) {
+            wait_until_exit = true;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--timeout requires a value");
+            timeout_str = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
@@ -95,6 +159,33 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             try common.printErrFmt("unexpected argument: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
         }
+    }
+
+    // Validate the new wait/snapshot flag combinations before doing any I/O.
+    var wait_kind_count: u8 = 0;
+    if (wait_until_idle) wait_kind_count += 1;
+    if (wait_until_text != null) wait_kind_count += 1;
+    if (wait_until_regex != null) wait_kind_count += 1;
+    if (wait_until_exit) wait_kind_count += 1;
+    if (wait_kind_count > 1) {
+        try common.printErr("at most one of --wait-until-idle, --wait-until-text, --wait-until-regex, --wait-until-exit may be supplied");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (wait_duration_str != null and wait_kind_count > 0) {
+        try common.printErr("--wait-duration is incompatible with --wait-until-*");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (wait_duration_str != null and !snapshot_flag) {
+        try common.printErr("--wait-duration without --snapshot is just a delay; use --delay-after, or add --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if ((json_output or ansi_output) and !snapshot_flag) {
+        try common.printErr("--json and --ansi require --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (json_output and ansi_output) {
+        try common.printErr("--json and --ansi are mutually exclusive");
+        std.process.exit(common.ExitCode.generic);
     }
 
     countInputModes(.{
@@ -232,6 +323,256 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         defer parsed.deinit();
         _ = try common.expectOkOrExit(parsed);
     }
+
+    // Fused wait + snapshot. After the input tokens have all landed in the
+    // PTY, optionally issue one wait_and_snapshot RPC. The new server op
+    // measures idle from the moment the request begins (not from the last
+    // raw screen change), which is at-or-after the moment the previous
+    // send_text RPCs returned — so a session that was already idle before
+    // the send won't immediately satisfy --wait-until-idle.
+    if (snapshot_flag or wait_kind_count > 0 or wait_duration_str != null) {
+        const wait_kind: []const u8 = if (wait_until_idle)
+            "idle"
+        else if (wait_until_text != null)
+            "text"
+        else if (wait_until_regex != null)
+            "regex"
+        else if (wait_until_exit)
+            "exit"
+        else if (wait_duration_str != null)
+            "duration"
+        else
+            "none";
+
+        const timeout_ms: u64 = if (timeout_str) |t| common.parseDurationMs(t) catch {
+            try common.printErr("invalid --timeout value");
+            std.process.exit(common.ExitCode.generic);
+            unreachable;
+        } else 30_000;
+
+        const idle_ms: u64 = if (wait_until_idle_ms_str) |s| parseIdleArg(s) catch {
+            try common.printErr("invalid --wait-until-idle value");
+            std.process.exit(common.ExitCode.generic);
+            unreachable;
+        } else 100;
+
+        const duration_ms: u64 = if (wait_duration_str) |d| common.parseDurationMs(d) catch {
+            try common.printErr("invalid --wait-duration value");
+            std.process.exit(common.ExitCode.generic);
+            unreachable;
+        } else 0;
+
+        const needle: ?[]const u8 = wait_until_text orelse wait_until_regex;
+
+        try issueFusedWait(alloc, .{
+            .session_ref = session_ref,
+            .wait_kind = wait_kind,
+            .needle = needle,
+            .idle_ms = idle_ms,
+            .duration_ms = duration_ms,
+            .timeout_ms = timeout_ms,
+            .snapshot = snapshot_flag,
+            .json_output = json_output,
+            .ansi_output = ansi_output,
+        });
+    }
+}
+
+/// `--wait-until-idle` takes an optional MS positional value. To decide
+/// whether the next argv token belongs to the flag or to a different
+/// position, peek at the first byte: durations always start with a digit.
+/// (Session names are alphabetic in the natural usage `hty send NAME --...`.)
+fn looksLikeDurationArg(arg: []const u8) bool {
+    if (arg.len == 0) return false;
+    return arg[0] >= '0' and arg[0] <= '9';
+}
+
+/// Parse the `--wait-until-idle` value. The flag is documented as taking
+/// `MS`, matching `hty wait --idle MS` — so a bare integer means
+/// milliseconds (not seconds, as `parseDurationMs` would have it). A
+/// suffixed value (e.g. `200ms`, `1s`) falls through to `parseDurationMs`
+/// for parity with `--timeout` / `--wait-duration`.
+pub fn parseIdleArg(text: []const u8) !u64 {
+    if (text.len == 0) return error.InvalidDuration;
+    var i: usize = 0;
+    while (i < text.len and text[i] >= '0' and text[i] <= '9') i += 1;
+    if (i == 0) return error.InvalidDuration;
+    if (i == text.len) return try std.fmt.parseInt(u64, text, 10);
+    return try common.parseDurationMs(text);
+}
+
+pub const FusedRequest = struct {
+    session_ref: ?[]const u8,
+    wait_kind: []const u8,
+    needle: ?[]const u8 = null,
+    idle_ms: u64 = 100,
+    duration_ms: u64 = 0,
+    timeout_ms: u64 = 30_000,
+    snapshot: bool = false,
+};
+
+/// Build and send the wait_and_snapshot RPC. Returns the parsed JSON
+/// response; caller is responsible for `parsed.deinit()` and for inspecting
+/// the response (success / timeout / error) and formatting the output.
+pub fn sendFusedWait(alloc: Allocator, req: FusedRequest) !std.json.Parsed(std.json.Value) {
+    var payload_buf = std.array_list.Managed(u8).init(alloc);
+    defer payload_buf.deinit();
+    var writer = payload_buf.writer();
+
+    try writer.writeAll("{\"op\":\"wait_and_snapshot\",\"wait_kind\":");
+    try common.writeJsonString(writer.any(), req.wait_kind);
+    try writer.print(",\"timeout_ms\":{d},\"snapshot\":{s}", .{
+        req.timeout_ms,
+        if (req.snapshot) "true" else "false",
+    });
+    if (std.mem.eql(u8, req.wait_kind, "idle")) {
+        try writer.print(",\"idle_ms\":{d}", .{req.idle_ms});
+    } else if (std.mem.eql(u8, req.wait_kind, "duration")) {
+        try writer.print(",\"duration_ms\":{d}", .{req.duration_ms});
+    } else if (std.mem.eql(u8, req.wait_kind, "text") or std.mem.eql(u8, req.wait_kind, "regex")) {
+        try writer.writeAll(",\"text\":");
+        try common.writeJsonString(writer.any(), req.needle.?);
+    }
+    if (req.session_ref) |s| {
+        try writer.writeAll(",\"session\":");
+        try common.writeJsonString(writer.any(), s);
+    }
+    try writer.writeAll("}");
+
+    const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+    defer alloc.free(response_line);
+
+    return std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
+}
+
+const FusedWaitParams = struct {
+    session_ref: ?[]const u8,
+    wait_kind: []const u8,
+    needle: ?[]const u8,
+    idle_ms: u64,
+    duration_ms: u64,
+    timeout_ms: u64,
+    snapshot: bool,
+    json_output: bool,
+    ansi_output: bool,
+};
+
+/// Build and issue the wait_and_snapshot RPC, then format the response
+/// according to --json / --ansi / default flags. Exits the process on
+/// timeout (code 3) or server-reported error.
+pub fn issueFusedWait(alloc: Allocator, params: FusedWaitParams) !void {
+    var parsed = try sendFusedWait(alloc, .{
+        .session_ref = params.session_ref,
+        .wait_kind = params.wait_kind,
+        .needle = params.needle,
+        .idle_ms = params.idle_ms,
+        .duration_ms = params.duration_ms,
+        .timeout_ms = params.timeout_ms,
+        .snapshot = params.snapshot,
+    });
+    defer parsed.deinit();
+    const object = try common.expectOkOrExit(parsed);
+
+    const timed_out = readTimedOut(object);
+
+    if (params.json_output) {
+        try emitFusedJson(alloc, object, params.snapshot, null);
+        if (timed_out) std.process.exit(common.ExitCode.wait_timeout);
+        return;
+    }
+
+    if (params.snapshot) try printSnapshotBody(object, params.ansi_output);
+
+    if (timed_out) {
+        try common.printErr("timed out");
+        std.process.exit(common.ExitCode.wait_timeout);
+    }
+}
+
+/// Read `timed_out` from the top-level response (server sets it on the
+/// envelope alongside the `wait` payload).
+pub fn readTimedOut(object: std.json.ObjectMap) bool {
+    if (object.get("timed_out")) |to_val| {
+        if (to_val == .bool and to_val.bool) return true;
+    }
+    return false;
+}
+
+/// Print either the plain `buffer` field or the styled `screen_ansi` field
+/// from the response's `snapshot` sub-object, with a trailing newline.
+pub fn printSnapshotBody(object: std.json.ObjectMap, ansi_output: bool) !void {
+    const snap_val = object.get("snapshot") orelse return;
+    if (snap_val != .object) return;
+    const field = if (ansi_output) "screen_ansi" else "buffer";
+    const body = snap_val.object.get(field) orelse return;
+    if (body != .string) return;
+    try common.printRaw(body.string);
+    try common.printRaw("\n");
+}
+
+/// Reshape the server response into the issue's documented `--json` shape:
+/// `{ok, matched, elapsed_ms, snapshot?, timeout?}`. The server returns
+/// matched/elapsed_ms inside a `wait` sub-object alongside the snapshot,
+/// matching the existing `hty wait --json` contract; this function pulls
+/// them up to the top level so the fused commands have a flat envelope.
+/// `extra_session_field` (used by `hty run`) prepends a `session: {...}`
+/// entry so the freshly-spawned session id is part of the JSON response.
+pub fn emitFusedJson(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    include_snapshot: bool,
+    extra_session_field: ?[]const u8,
+) !void {
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    var writer = buf.writer();
+
+    try writer.writeAll("{\"ok\":true");
+
+    if (extra_session_field) |sess_json| {
+        try writer.writeAll(",\"session\":");
+        try writer.writeAll(sess_json);
+    }
+
+    var matched_val: ?std.json.Value = null;
+    var elapsed_ms: i64 = 0;
+    var timeout: bool = false;
+    if (object.get("wait")) |wait_val| {
+        if (wait_val == .object) {
+            const w = wait_val.object;
+            if (w.get("matched")) |m| matched_val = m;
+            if (w.get("elapsed_ms")) |e| {
+                if (e == .integer) elapsed_ms = e.integer;
+            }
+            if (w.get("timeout")) |t| {
+                if (t == .bool) timeout = t.bool;
+            }
+        }
+    }
+
+    try writer.writeAll(",\"matched\":");
+    if (matched_val) |m| {
+        switch (m) {
+            .string => |s| try common.writeJsonString(writer.any(), s),
+            else => try writer.writeAll("null"),
+        }
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"elapsed_ms\":{d}", .{elapsed_ms});
+    if (timeout) try writer.writeAll(",\"timeout\":true");
+
+    if (include_snapshot) {
+        if (object.get("snapshot")) |snap_val| {
+            const snap_json = try std.json.Stringify.valueAlloc(alloc, snap_val, .{});
+            defer alloc.free(snap_json);
+            try writer.writeAll(",\"snapshot\":");
+            try writer.writeAll(snap_json);
+        }
+    }
+
+    try writer.writeAll("}");
+    try common.printLine(buf.items);
 }
 
 const SeqToken = struct {
