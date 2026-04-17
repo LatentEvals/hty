@@ -4,90 +4,121 @@ AI agents can use hty to interact with any terminal program the same way a human
 
 ## The agent loop
 
-Every agent-driven terminal interaction follows the same pattern:
+Every agent-driven terminal interaction reduces to the same three questions: "is the program ready?", "what is it showing me?", and "what should I type next?" hty packages the first two into a single round-trip so each tool call by the agent corresponds to one observable change in the session.
 
-1. **Run** — start the program in a named hty session
-2. **Snapshot** — read the current screen to understand the program's state
-3. **Decide** — choose what to type based on what you see
-4. **Send** — type the input
-5. **Wait** — block until the screen is ready for the next decision
-6. **Repeat** — loop back to snapshot until the task is done
-
-The `wait` commands are what make this reliable. Instead of inserting arbitrary `sleep` calls, you wait for a specific condition — a text string appearing, the screen going idle, or the program exiting — before reading and acting again.
-
-## A complete example: git add -p
-
-The following script drives `git add -p` to stage one hunk and skip another:
+The fused form of `hty send` and `hty run` is the fast path:
 
 ```sh
-hty run --name review -- git add -p
-hty wait review --text "Stage this hunk" --timeout 5000
-hty snapshot review          # read the screen
-hty send review --text "y\n" # stage this hunk
-hty wait review --idle 200 --timeout 3000
-hty send review --text "n\n" # skip the next one
-hty send review --text "q\n"
-hty wait review --exit --timeout 2000
+# One call: type input, wait for the program to be ready, return the screen.
+hty send review --text "y\n" --snapshot --wait-until-idle 200 --json
 ```
 
-Step by step:
+That single command sends `y\n`, blocks until the rendered screen has been quiet for 200 ms, then returns a JSON payload with the post-action snapshot plus `matched` / `elapsed_ms`. The agent now has everything it needs to decide the next action: no second tool call required, and no race between "I sent input" and "I read the screen too early."
 
-- `hty run --name review -- git add -p` starts `git add -p` in a new session named `review`. The session runs detached; the command returns immediately.
-- `hty wait review --text "Stage this hunk" --timeout 5000` blocks until that exact string appears on screen, or 5 seconds pass.
-- `hty snapshot review` reads the rendered screen as JSON so the agent can inspect which file and hunk is shown.
-- `hty send review --text "y\n"` types `y` followed by Enter, staging the hunk.
-- `hty wait review --idle 200 --timeout 3000` waits for the screen to stop updating for 200 ms — git is rendering the next hunk.
-- `hty send review --text "n\n"` skips the next hunk.
-- `hty send review --text "q\n"` quits the interactive session.
-- `hty wait review --exit --timeout 2000` blocks until the process exits.
+The slower but more explicit three-step form (`send` → `wait` → `snapshot`) is still available for interactive exploration, and it's what you reach for when the condition you want to wait on comes much later than the thing you typed.
+
+## A complete example: create-next-app
+
+The following script drives `create-next-app`'s interactive questionnaire, making deliberate choices at each prompt:
+
+```sh
+# Launch the scaffolder and wait for the first question
+hty run --name app --snapshot \
+  --wait-until-text "What is your project named?" --timeout 30000 \
+  -- npx create-next-app
+
+# Answer "my-app" + Enter, wait for the next prompt
+hty send app --text "my-app\n" --snapshot \
+  --wait-until-text "TypeScript?" --timeout 10000
+
+# Accept TypeScript (Enter) and wait for the next one
+hty send app --key enter --snapshot \
+  --wait-until-text "ESLint?" --timeout 5000
+
+# …and so on for each prompt. Finally, wait for the scaffolder to finish.
+hty send app --key enter --snapshot --wait-until-exit --timeout 120000
+```
+
+Each step is a single round-trip that returns the new screen state, so the agent can inspect `.snapshot.buffer` (or `.snapshot.lines`) to verify the prompt looked the way it expected before committing to the next answer.
+
+<Callout type="info">
+See the [README quickstart](https://github.com/LatentEvals/hty#quickstart) for the canonical `git add -p` walkthrough, which uses the same pattern against an even simpler program.
+</Callout>
 
 ## Reading the screen
 
-`hty snapshot` returns JSON. Use `jq` to extract the parts you need:
+With `--json`, the fused form already includes the snapshot in its response. When you want a standalone read — e.g. between user turns, or to re-inspect state after an external event — call `hty snapshot --json` directly:
 
 ```sh
-# Get plain text content — the full rendered buffer as a single string
-hty snapshot my-session | jq -r '.snapshot.buffer'
+# Full rendered buffer as a single string
+hty snapshot my-session --json | jq -r '.snapshot.buffer'
 
-# Get an individual line by index (0-based)
-hty snapshot my-session | jq -r '.snapshot.lines[0]'
+# Individual line by index (0-based)
+hty snapshot my-session --json | jq -r '.snapshot.lines[0]'
 
-# Check if specific text is present
-hty snapshot my-session | jq -r '.snapshot.buffer' | grep -q "error" && echo "error found"
+# Test for a specific string
+hty snapshot my-session --json | jq -r '.snapshot.buffer' | grep -q "error" && echo "error found"
+
+# Cursor position (1-indexed)
+hty snapshot my-session --json | jq '.snapshot.cursor_row, .snapshot.cursor_col'
 ```
+
+`hty snapshot` without `--json` prints plain text; pair it with `--json` whenever you want to pipe into `jq` or read structured metadata like `status`, `cursor_row`, or the per-cell `cells` grid.
 
 ## Waiting for the right moment
 
-`hty wait` supports three modes. Use the one that matches what you're waiting for:
+Every wait condition that `hty wait` supports is also available on fused `run` / `send` as `--wait-until-*`. Pick the mode that matches what you're waiting for:
 
 ```sh
-# Wait for a specific string to appear (e.g., a shell prompt)
+# Wait for a specific string (e.g., a shell prompt)
 hty wait session --text "$ " --timeout 5000
 
-# Wait for a regex pattern (POSIX extended regex)
-hty wait session --text "(error|Error|ERROR)" --regex --timeout 5000
+# Wait for a POSIX extended regex
+hty wait session --regex "(error|Error|ERROR)" --timeout 5000
 
-# Wait for the screen to stop updating — useful after sending input
+# Wait for the rendered screen to stop updating
 hty wait session --idle 300 --timeout 10000
 
 # Wait for the program to exit
 hty wait session --exit --timeout 30000
 ```
 
-Use `--text` when you know exactly what string signals readiness. Use `--idle` when the program produces output whose exact content you don't know in advance. Use `--exit` to confirm the program has finished before checking its results.
+Use `--text` when you know the exact string that signals readiness. Use `--regex` when you need to match one of several possibilities (e.g. "success" or "error" lines). Use `--idle` when the program produces output whose exact content you don't know in advance — it measures the rendered screen, not raw I/O, so programs that redraw continuously (like `top` or spinners) will never go idle. Use `--exit` to confirm the program has finished before checking results.
 
 ## Handling timeouts
 
-`hty wait` exits with code `3` when the timeout expires. Always check for this and capture the screen state on failure:
+`hty wait` exits with code `3` when the timeout expires. Pass `--json` to get a structured result back so the agent can distinguish success from timeout without checking exit codes:
 
 ```sh
-hty wait my-session --text "ready" --timeout 5000
-if [ $? -eq 3 ]; then
-  echo "Timed out waiting for ready"
-  hty snapshot my-session | jq -r '.snapshot.buffer'
-  exit 1
-fi
+hty wait my-session --text "ready" --timeout 5000 --json
+# → { "ok": true,  "matched": true,  "mode": "text", "elapsed_ms": 284 }
+# or { "ok": false, "matched": false, "elapsed_ms": 5000, ... } on timeout
 ```
+
+On a fused `send --snapshot`, the same fields appear at the top level of the response alongside the snapshot, so the agent sees both "did the wait match?" and "what does the screen look like now?" in one payload.
+
+## Typing source code or regex: `--raw-text`
+
+`--text` processes C-style escapes: `\n` becomes a newline, `\t` a tab, `\\` a literal backslash. That's usually what you want for "type a command and press Enter."
+
+But when an agent pastes source code, a regex, or any content that contains backslashes it does *not* want interpreted, use `--raw-text` instead — it sends the UTF-8 bytes verbatim:
+
+```sh
+# With --text, the \n inside the regex would turn into a real newline.
+hty send my-session --raw-text "const re = /\\n/;"
+```
+
+Prefer `--raw-text` whenever shell quoting of backslashes starts to look hairy.
+
+## Compound input: `--seq`
+
+For sequences that mix text, named keys, and pauses, `--seq` sends the whole thing in one call:
+
+```sh
+hty send my-session --seq '"git status" enter 300ms "q"'
+```
+
+Quoted strings are text, durations (`200ms`, `1s`) are pauses, bare words are key names. Often cleaner than chaining three separate `send` calls.
 
 ## Programs hty works with
 

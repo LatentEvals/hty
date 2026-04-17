@@ -33,9 +33,16 @@ Run `hty info` on the remote machine to see the socket path:
 
 ```sh
 $ hty info
+hty v0.5.0
 socket:  /run/user/1000/hty/sock
 logs:    /home/user/.local/state/hty/logs
 server:  running
+```
+
+For scripted tunnel setup, use `--json` and `jq` so you don't have to hardcode the path:
+
+```sh
+REMOTE_SOCK=$(ssh user@remote-host hty info --json | jq -r .socket_path)
 ```
 
 ### 3. Open an SSH tunnel
@@ -43,6 +50,8 @@ server:  running
 From your laptop, forward the remote Unix socket to a local path:
 
 ```sh
+ssh -L "/tmp/hty-remote.sock:${REMOTE_SOCK}" user@remote-host
+# or, with a hardcoded path:
 ssh -L /tmp/hty-remote.sock:/run/user/1000/hty/sock user@remote-host
 ```
 
@@ -73,3 +82,5 @@ If you're running a long CI job on a remote machine and want to observe it from 
 3. Set `HTY_SOCKET` and run `hty watch build`
 
 You'll see the terminal output of the running CI session in real time. Press `Ctrl+C` to stop watching — the remote session continues unaffected.
+
+`hty watch` will also wait for a named session that doesn't exist *yet*: you can start the watcher on your laptop first (through the tunnel) and then kick off the remote job, and `watch` starts streaming the moment that session spawns. This removes the "did I start the watcher in time?" race when demoing a run.

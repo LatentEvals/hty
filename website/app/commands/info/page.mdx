@@ -9,9 +9,10 @@ Show resolved filesystem paths and whether the server is running. Useful for loc
 ## Default output
 
 ```
-socket   /run/user/1000/hty.sock
-logs     /home/me/.local/state/hty/logs
-server   running (pid 12345)
+hty v0.5.0
+socket:  /run/user/1000/hty/sock
+logs:    /home/me/.local/state/hty/logs
+server:  running
 ```
 
 If any of `$HTY_SOCKET`, `$XDG_RUNTIME_DIR`, or `$XDG_STATE_HOME` are set, they are listed below the main block so you can see why the paths resolved the way they did.
@@ -26,17 +27,23 @@ hty info --json
 
 ```json
 {
-  "socket": "/run/user/1000/hty.sock",
-  "logs": "/home/me/.local/state/hty/logs",
-  "server": { "running": true, "pid": 12345 }
+  "version": "0.5.0",
+  "socket_path": "/run/user/1000/hty/sock",
+  "state_dir": "/home/me/.local/state/hty",
+  "log_dir": "/home/me/.local/state/hty/logs",
+  "server": { "running": true, "pid": 12345, "uptime_ms": 28340 },
+  "build": { "commit": "abc1234", "dirty": false }
 }
 ```
+
+`server.pid` and `server.uptime_ms` are only present when the server is actually running. `build` reports the commit info embedded at compile time.
 
 ## Examples
 
 ```sh
 # Find the socket path to forward over SSH
-ssh -L "$(hty info --json | jq -r .socket):$(hty info --json | jq -r .socket)" remote-host
+REMOTE_SOCK=$(ssh user@remote hty info --json | jq -r .socket_path)
+ssh -L "/tmp/hty-remote.sock:${REMOTE_SOCK}" user@remote
 
 # Check whether the server is up from a script
 hty info --json | jq -e '.server.running' >/dev/null
