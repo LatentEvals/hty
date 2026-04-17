@@ -43,6 +43,7 @@ With `--json`, the output includes structured metadata:
 | `title` | Window title set by the program, or `null`. |
 | `status` | Session status: `running`, `exited`, `failed`, or `killed`. |
 | `cells` | 2D array shaped `[rows][cols]`, where each entry is the glyph at that column. Lets you reason about column-accurate coordinates — wide characters (e.g. CJK) occupy their starting column and their trailing cell is reported separately, so you can map a visual position to an exact `(row, col)` without re-tokenizing `buffer`. |
+| `mouse` | Per-session mouse-input mode, inferred from `CSI ?1000/1002/1003 h/l` (event set) and `?1006 h/l` (SGR extended) toggles observed on the output stream. Fields: `enabled` (true when any event-set mode is on — the gate `hty send --click` checks), `x10` (?1000), `button_event` (?1002), `any_event` (?1003), `sgr` (?1006). |
 
 ## Parsing the output
 

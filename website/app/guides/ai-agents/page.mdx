@@ -110,6 +110,23 @@ hty send my-session --raw-text "const re = /\\n/;"
 
 Prefer `--raw-text` whenever shell quoting of backslashes starts to look hairy.
 
+## Mouse input
+
+A handful of TUIs (btop, lazygit, k9s, tmux copy-mode) are far easier to drive with clicks than with keyboard navigation. `hty send` supports clicks, drags, and scroll events — but only against apps that have opted into mouse mode via the usual `CSI ?1000/1002/1003 h` sequences. The snapshot payload exposes the current state so the agent can check before it clicks:
+
+```sh
+# Is mouse input available in this session?
+hty snapshot lazygit --json | jq '.snapshot.mouse.enabled'
+
+# Click row 5, column 12 (1-indexed, same coords as the snapshot grid)
+hty send lazygit --click 5 12
+
+# Drag to select — useful for tmux copy-mode
+hty send my-tmux --drag 3 4 3 20
+```
+
+If the app has no mouse mode enabled, the command fails with `error: target app has not enabled mouse input` and exits non-zero. Agents should prefer keyboard navigation as the primary primitive and fall back to clicks only when the target explicitly supports it.
+
 ## Compound input: `--seq`
 
 For sequences that mix text, named keys, and pauses, `--seq` sends the whole thing in one call:

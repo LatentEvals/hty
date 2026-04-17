@@ -4069,3 +4069,315 @@ test "issue #29: read-only input frames are dropped by the server" {
         }
     }
 }
+
+// ============================================================================
+// Mouse input (issue #24)
+// ============================================================================
+
+/// Fixture app: emits `CSI ?... h` mouse-enable sequences, then appends
+/// every byte it reads from stdin to $HTY_MOUSE_RECORD until EOT (0x04).
+/// The test drives `hty send --click/--drag/--scroll` and reads the
+/// record file to assert the wire bytes.
+fn spawnMouseFixture(
+    registry: *SessionRegistry,
+    name: []const u8,
+    modes: []const []const u8,
+    record_path: []const u8,
+) !void {
+    const alloc = std.testing.allocator;
+    const py = findCommand(alloc, "python3") orelse return error.SkipZigTest;
+    defer alloc.free(py);
+
+    // Build args: scripts/fixtures/mouse-echo.py <modes...>
+    var args_list = std.ArrayListUnmanaged([]const u8){};
+    defer args_list.deinit(alloc);
+    try args_list.append(alloc, "scripts/fixtures/mouse-echo.py");
+    for (modes) |m| try args_list.append(alloc, m);
+
+    var env_list = std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }){};
+    defer env_list.deinit(alloc);
+    try env_list.append(alloc, .{ .key = "HTY_MOUSE_RECORD", .value = record_path });
+
+    var parsed = try testRequest(registry, .{
+        .op = "spawn",
+        .name = name,
+        .program = py,
+        .args = args_list.items,
+        .env = env_list.items,
+        .rows = 24,
+        .cols = 80,
+    });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+
+    // Wait for the fixture to print its enable sequence and "READY\n".
+    var ready = try testRequest(registry, .{
+        .op = "wait_for_text",
+        .session = name,
+        .text = "READY",
+        .timeout_ms = 5_000,
+    });
+    defer ready.deinit();
+    _ = try expectTestOk(ready);
+
+    // One more idle pass so the raw_bytes for the enable sequence are
+    // fully drained and the session's mouse_state is up to date.
+    var idle = try testRequest(registry, .{
+        .op = "wait_for_idle",
+        .session = name,
+        .idle_ms = 100,
+        .timeout_ms = 2_000,
+    });
+    defer idle.deinit();
+    _ = try expectTestOk(idle);
+}
+
+fn killMouseFixture(registry: *SessionRegistry, name: []const u8) !void {
+    // Send EOT so the fixture exits cleanly; then kill to be safe.
+    {
+        var p = try testRequest(registry, .{
+            .op = "send_bytes_hex",
+            .session = name,
+            .bytes_hex = "04",
+        });
+        defer p.deinit();
+        _ = try expectTestOk(p);
+    }
+    var k = try testRequest(registry, .{ .op = "kill", .session = name });
+    defer k.deinit();
+    _ = try expectTestOk(k);
+}
+
+test "mouse: snapshot exposes mouse state after app enables 1002+1006" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    defer alloc.free(rec);
+    std.fs.deleteFileAbsolute(rec) catch {};
+    defer std.fs.deleteFileAbsolute(rec) catch {};
+
+    spawnMouseFixture(&registry, "mouse_snap", &.{ "1002", "1006" }, rec) catch |err| {
+        if (err == error.SkipZigTest) return err;
+        return err;
+    };
+    defer killMouseFixture(&registry, "mouse_snap") catch {};
+
+    var snap = try testRequest(&registry, .{ .op = "snapshot", .session = "mouse_snap" });
+    defer snap.deinit();
+    const obj = try expectTestOk(snap);
+
+    const snap_val = obj.get("snapshot") orelse return error.InvalidResponse;
+    try std.testing.expect(snap_val == .object);
+    const mouse_val = snap_val.object.get("mouse") orelse return error.InvalidResponse;
+    try std.testing.expect(mouse_val == .object);
+    const m = mouse_val.object;
+    try std.testing.expect(m.get("enabled").?.bool);
+    try std.testing.expect(m.get("button_event").?.bool);
+    try std.testing.expect(m.get("sgr").?.bool);
+    try std.testing.expect(!m.get("x10").?.bool);
+    try std.testing.expect(!m.get("any_event").?.bool);
+}
+
+test "mouse: send_mouse refuses when mouse is disabled" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "no_mouse");
+    defer alloc.free(uuid);
+    defer {
+        if (testRequest(&registry, .{ .op = "kill", .session = "no_mouse" })) |kk| {
+            var k_mut = kk;
+            k_mut.deinit();
+        } else |_| {}
+    }
+
+    var parsed = try testRequest(&registry, .{
+        .op = "send_mouse",
+        .session = "no_mouse",
+        .event = "press",
+        .button = "left",
+        .row = 5,
+        .col = 10,
+    });
+    defer parsed.deinit();
+
+    const resp = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.InvalidResponse,
+    };
+    try std.testing.expectEqual(false, resp.get("ok").?.bool);
+    const err_val = resp.get("error") orelse return error.InvalidResponse;
+    try std.testing.expect(err_val == .string);
+    try std.testing.expect(std.mem.indexOf(u8, err_val.string, "mouse") != null);
+}
+
+test "mouse: click emits SGR press+release when 1006 is enabled" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    defer alloc.free(rec);
+    std.fs.deleteFileAbsolute(rec) catch {};
+    defer std.fs.deleteFileAbsolute(rec) catch {};
+
+    spawnMouseFixture(&registry, "mouse_click", &.{ "1002", "1006" }, rec) catch |err| {
+        if (err == error.SkipZigTest) return err;
+        return err;
+    };
+    defer killMouseFixture(&registry, "mouse_click") catch {};
+
+    // --click 5 10 => press at (5,10), release at (5,10).
+    {
+        var p = try testRequest(&registry, .{
+            .op = "send_mouse",
+            .session = "mouse_click",
+            .event = "press",
+            .button = "left",
+            .row = 5,
+            .col = 10,
+        });
+        defer p.deinit();
+        _ = try expectTestOk(p);
+    }
+    {
+        var p = try testRequest(&registry, .{
+            .op = "send_mouse",
+            .session = "mouse_click",
+            .event = "release",
+            .button = "left",
+            .row = 5,
+            .col = 10,
+        });
+        defer p.deinit();
+        _ = try expectTestOk(p);
+    }
+
+    // Give the fixture a moment to flush the bytes to the record file.
+    var idle = try testRequest(&registry, .{
+        .op = "wait_for_idle",
+        .session = "mouse_click",
+        .idle_ms = 100,
+        .timeout_ms = 2_000,
+    });
+    defer idle.deinit();
+    _ = try expectTestOk(idle);
+
+    const file = std.fs.openFileAbsolute(rec, .{}) catch |err| {
+        std.debug.print("record file missing: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer file.close();
+    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(contents);
+
+    // Expected SGR wire: ESC [ < 0 ; 10 ; 5 M (press) then ESC [ < 0 ; 10 ; 5 m (release).
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;10;5M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;10;5m") != null);
+}
+
+test "mouse: drag emits press + motion + release" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    defer alloc.free(rec);
+    std.fs.deleteFileAbsolute(rec) catch {};
+    defer std.fs.deleteFileAbsolute(rec) catch {};
+
+    spawnMouseFixture(&registry, "mouse_drag", &.{ "1002", "1006" }, rec) catch |err| {
+        if (err == error.SkipZigTest) return err;
+        return err;
+    };
+    defer killMouseFixture(&registry, "mouse_drag") catch {};
+
+    // Drag (3,4) -> (7,8): press at from, motion at to, release at to.
+    const events = [_]struct { ev: []const u8, r: u32, c: u32 }{
+        .{ .ev = "press", .r = 3, .c = 4 },
+        .{ .ev = "motion", .r = 7, .c = 8 },
+        .{ .ev = "release", .r = 7, .c = 8 },
+    };
+    for (events) |e| {
+        var p = try testRequest(&registry, .{
+            .op = "send_mouse",
+            .session = "mouse_drag",
+            .event = e.ev,
+            .button = "left",
+            .row = e.r,
+            .col = e.c,
+        });
+        defer p.deinit();
+        _ = try expectTestOk(p);
+    }
+
+    var idle = try testRequest(&registry, .{
+        .op = "wait_for_idle",
+        .session = "mouse_drag",
+        .idle_ms = 100,
+        .timeout_ms = 2_000,
+    });
+    defer idle.deinit();
+    _ = try expectTestOk(idle);
+
+    const file = try std.fs.openFileAbsolute(rec, .{});
+    defer file.close();
+    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(contents);
+
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;4;3M") != null); // press
+    // Motion encodes button+32 = 32 in SGR: ESC [ < 32 ; col ; row M
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<32;8;7M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;8;7m") != null); // release
+}
+
+test "mouse: X10 encoding when only 1000 is on (no SGR)" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    defer alloc.free(rec);
+    std.fs.deleteFileAbsolute(rec) catch {};
+    defer std.fs.deleteFileAbsolute(rec) catch {};
+
+    spawnMouseFixture(&registry, "mouse_x10", &.{"1000"}, rec) catch |err| {
+        if (err == error.SkipZigTest) return err;
+        return err;
+    };
+    defer killMouseFixture(&registry, "mouse_x10") catch {};
+
+    {
+        var p = try testRequest(&registry, .{
+            .op = "send_mouse",
+            .session = "mouse_x10",
+            .event = "press",
+            .button = "left",
+            .row = 2,
+            .col = 3,
+        });
+        defer p.deinit();
+        _ = try expectTestOk(p);
+    }
+
+    var idle = try testRequest(&registry, .{
+        .op = "wait_for_idle",
+        .session = "mouse_x10",
+        .idle_ms = 100,
+        .timeout_ms = 2_000,
+    });
+    defer idle.deinit();
+    _ = try expectTestOk(idle);
+
+    const file = try std.fs.openFileAbsolute(rec, .{});
+    defer file.close();
+    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer alloc.free(contents);
+
+    // X10 press: ESC [ M <0+32=' '> <col+32=35='#'> <row+32=34='"'>.
+    const expected = [_]u8{ 0x1b, '[', 'M', 32, 35, 34 };
+    try std.testing.expect(std.mem.indexOf(u8, contents, &expected) != null);
+}

@@ -206,6 +206,7 @@ pub fn handleSnapshot(arena: Allocator, sess: *Session, id: ?i64) !Response {
             .lines = lines,
             .cells = cells,
             .status = statusName(sess.getStatus()),
+            .mouse = mouseWireFromSnapshot(sess.mouse_state.snapshot()),
         },
     };
 }
@@ -245,6 +246,109 @@ pub fn handleSendBytesHex(arena: Allocator, sess: *Session, object: std.json.Obj
     logInputEvent(arena, sess, bytes, "send", null);
     try sess.terminal.send(.{ .bytes = bytes });
     return .{ .id = id, .ok = true };
+}
+
+/// Encode a single mouse event into the bytes the target app expects,
+/// using whichever encoding it has negotiated on the output stream
+/// (SGR `?1006` preferred; falls back to legacy X10). Picks SGR whenever
+/// `?1006` is set *or* the coordinates exceed the X10 range (byte + 32,
+/// capped at 223), so we never silently truncate a click to the wrong
+/// cell.
+///
+/// Wire shape: `{op: "send_mouse", event: "press"|"release"|"motion",
+/// button: "left"|"right"|"middle"|"wheel_up"|"wheel_down", row: N,
+/// col: N}`. Rows and cols are 1-indexed (snapshot convention).
+///
+/// If no app has enabled mouse input (none of `?1000` / `?1002` / `?1003`
+/// observed), returns `error.MouseNotEnabled` — the client surfaces this
+/// as a clear "target app has not enabled mouse input" error. Design
+/// choice (a) in the spec: agents need to know the click was a no-op.
+pub fn handleSendMouse(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
+    const event = try readRequiredString(object, "event");
+    const button = try readRequiredString(object, "button");
+    const row_u64 = try json.readRequiredU64(object, "row");
+    const col_u64 = try json.readRequiredU64(object, "col");
+    if (row_u64 == 0 or col_u64 == 0) return error.InvalidFieldValue;
+
+    const mouse = sess.mouse_state.snapshot();
+    if (!mouse.enabled()) return error.MouseNotEnabled;
+
+    // Ghostty's VT engine speaks in 1-indexed rows/cols, matching
+    // xterm's wire format — no off-by-one here.
+    const row: u32 = @intCast(row_u64);
+    const col: u32 = @intCast(col_u64);
+
+    // Map logical button to the base code used in both X10 and SGR
+    // encodings. 0/1/2 = left/middle/right press; 64/65 = wheel up/down
+    // (the "release" concept doesn't apply for wheels — we always emit
+    // a single press). Motion adds 32 to the button code in both
+    // encodings.
+    var base: u32 = undefined;
+    var is_wheel = false;
+    if (std.mem.eql(u8, button, "left")) {
+        base = 0;
+    } else if (std.mem.eql(u8, button, "middle")) {
+        base = 1;
+    } else if (std.mem.eql(u8, button, "right")) {
+        base = 2;
+    } else if (std.mem.eql(u8, button, "wheel_up")) {
+        base = 64;
+        is_wheel = true;
+    } else if (std.mem.eql(u8, button, "wheel_down")) {
+        base = 65;
+        is_wheel = true;
+    } else {
+        return error.InvalidFieldValue;
+    }
+
+    const is_motion = std.mem.eql(u8, event, "motion");
+    const is_release = std.mem.eql(u8, event, "release");
+    const is_press = std.mem.eql(u8, event, "press");
+    if (!is_motion and !is_release and !is_press) return error.InvalidFieldValue;
+
+    // Motion flag lives in bit 5 of the button code for both encodings.
+    var button_code = base;
+    if (is_motion) button_code |= 32;
+
+    // Fall back to SGR if the app asked for it, or if legacy X10 would
+    // overflow its single-byte coordinate field (col/row > 223 once you
+    // add the +32 offset and cap at 0xFF). Cleaner than silently
+    // clipping — agents picking coords out of a large snapshot would
+    // otherwise click the wrong cell at the edge of a wide terminal.
+    const use_sgr = mouse.sgr or col > 223 or row > 223;
+
+    var buf = std.array_list.Managed(u8).init(arena);
+    if (use_sgr) {
+        // `ESC [ < <btn> ; <col> ; <row> M/m` — M for press/motion,
+        // m for release. Wheels use M.
+        const terminator: u8 = if (is_release and !is_wheel) 'm' else 'M';
+        try buf.writer().print("\x1b[<{d};{d};{d}{c}", .{ button_code, col, row, terminator });
+    } else {
+        // X10: `ESC [ M <btn+32> <col+32> <row+32>`. Release maps to
+        // button 3 (same for all buttons) in legacy encoding; motion
+        // adds 32 in the button field (already applied above for
+        // motion). Wheel events use the raw 64/65 code untouched.
+        const x10_btn: u32 = if (is_release and !is_wheel) 3 else button_code;
+        try buf.writer().print("\x1b[M", .{});
+        try buf.append(@intCast(@min(x10_btn + 32, 0xFF)));
+        try buf.append(@intCast(@min(col + 32, 0xFF)));
+        try buf.append(@intCast(@min(row + 32, 0xFF)));
+    }
+
+    const bytes = buf.items;
+    logInputEvent(arena, sess, bytes, "send", null);
+    try sess.terminal.send(.{ .bytes = bytes });
+    return .{ .id = id, .ok = true };
+}
+
+fn mouseWireFromSnapshot(s: session_mod.MouseStateSnapshot) protocol.MouseStateWire {
+    return .{
+        .enabled = s.enabled(),
+        .x10 = s.x10,
+        .button_event = s.button_event,
+        .any_event = s.any_event,
+        .sgr = s.sgr,
+    };
 }
 
 pub fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
@@ -716,6 +820,7 @@ pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot
             .lines = lines,
             .cells = cells,
             .status = statusName(sess.getStatus()),
+            .mouse = mouseWireFromSnapshot(sess.mouse_state.snapshot()),
         },
     };
 }

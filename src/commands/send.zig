@@ -9,9 +9,11 @@ const common = @import("common.zig");
 pub fn helpText() []const u8 {
     return
     \\hty send [SESSION] --text "..." | --raw-text "..." | --key NAME | --seq "..." | --bytes-hex HEX
+    \\                   | --click ROW COL | --drag FROM_ROW FROM_COL TO_ROW TO_COL
+    \\                   | --scroll up|down
     \\
     \\Send input to a session. Exactly one of --text, --raw-text, --key,
-    \\--seq, --bytes-hex is required.
+    \\--seq, --bytes-hex, --click, --drag, --scroll is required.
     \\
     \\Flags:
     \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
@@ -29,6 +31,22 @@ pub fn helpText() []const u8 {
     \\                       are pauses, and bare words are key names.
     \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
     \\  --bytes-hex HEX      Raw bytes encoded as hex.
+    \\
+    \\Mouse input (issue #24). Rows and columns are 1-indexed, matching
+    \\snapshot conventions. The target app must have enabled mouse mode
+    \\(the usual `CSI ?1000/1002/1003 h` sequences); otherwise the
+    \\command fails with "target app has not enabled mouse input". Check
+    \\`hty snapshot --json`'s `mouse.enabled` to verify.
+    \\  --click ROW COL      Click at ROW/COL. Defaults to left button;
+    \\                       combine with --button to change.
+    \\  --drag FROM_ROW FROM_COL TO_ROW TO_COL
+    \\                       Press at the FROM cell, motion, release at TO.
+    \\  --scroll up|down     Scroll at the cursor (or --at ROW COL); emits
+    \\                       --amount N events (default 1).
+    \\  --button B           Button for --click / --drag: left (default),
+    \\                       right, middle.
+    \\  --at ROW COL         Row/col for --scroll. Defaults to 1 1.
+    \\  --amount N           Repeat count for --scroll. Default 1.
     \\
     \\Delay flags (optional, combine with any mode above):
     \\  --delay-before DUR   Sleep before sending (e.g. 200ms, 1s).
@@ -70,6 +88,21 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var delay_before: ?[]const u8 = null;
     var delay_after: ?[]const u8 = null;
     var delay_char: ?[]const u8 = null;
+
+    // Mouse input flags. Coordinate pairs are stored as parsed u32s;
+    // --click and --scroll consume 2 positional values each, --drag
+    // consumes 4. See issue #24.
+    var click_row: ?u32 = null;
+    var click_col: ?u32 = null;
+    var drag_from_row: ?u32 = null;
+    var drag_from_col: ?u32 = null;
+    var drag_to_row: ?u32 = null;
+    var drag_to_col: ?u32 = null;
+    var scroll_dir: ?[]const u8 = null;
+    var scroll_at_row: u32 = 1;
+    var scroll_at_col: u32 = 1;
+    var scroll_amount: u32 = 1;
+    var mouse_button: []const u8 = "left";
 
     var snapshot_flag = false;
     var json_output = false;
@@ -150,6 +183,41 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--timeout requires a value");
             timeout_str = args[i];
+        } else if (std.mem.eql(u8, arg, "--click")) {
+            if (i + 2 >= args.len) return common.printUsageAndExit("--click requires ROW and COL");
+            click_row = parseUInt(args[i + 1]) catch return common.printUsageAndExit("--click ROW must be a positive integer");
+            click_col = parseUInt(args[i + 2]) catch return common.printUsageAndExit("--click COL must be a positive integer");
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--drag")) {
+            if (i + 4 >= args.len) return common.printUsageAndExit("--drag requires FROM_ROW FROM_COL TO_ROW TO_COL");
+            drag_from_row = parseUInt(args[i + 1]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
+            drag_from_col = parseUInt(args[i + 2]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
+            drag_to_row = parseUInt(args[i + 3]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
+            drag_to_col = parseUInt(args[i + 4]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
+            i += 4;
+        } else if (std.mem.eql(u8, arg, "--scroll")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--scroll requires up|down");
+            if (!std.mem.eql(u8, args[i], "up") and !std.mem.eql(u8, args[i], "down")) {
+                return common.printUsageAndExit("--scroll argument must be 'up' or 'down'");
+            }
+            scroll_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--at")) {
+            if (i + 2 >= args.len) return common.printUsageAndExit("--at requires ROW and COL");
+            scroll_at_row = parseUInt(args[i + 1]) catch return common.printUsageAndExit("--at ROW must be a positive integer");
+            scroll_at_col = parseUInt(args[i + 2]) catch return common.printUsageAndExit("--at COL must be a positive integer");
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--amount")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--amount requires a value");
+            scroll_amount = parseUInt(args[i]) catch return common.printUsageAndExit("--amount must be a positive integer");
+        } else if (std.mem.eql(u8, arg, "--button")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--button requires a value");
+            if (!std.mem.eql(u8, args[i], "left") and !std.mem.eql(u8, args[i], "right") and !std.mem.eql(u8, args[i], "middle")) {
+                return common.printUsageAndExit("--button must be one of left, right, middle");
+            }
+            mouse_button = args[i];
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
@@ -186,6 +254,87 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     if (json_output and ansi_output) {
         try common.printErr("--json and --ansi are mutually exclusive");
         std.process.exit(common.ExitCode.generic);
+    }
+
+    // Count mouse-mode flags separately: they're mutually exclusive with
+    // the keyboard/text input modes and with each other.
+    var mouse_mode_count: u8 = 0;
+    if (click_row != null) mouse_mode_count += 1;
+    if (drag_from_row != null) mouse_mode_count += 1;
+    if (scroll_dir != null) mouse_mode_count += 1;
+
+    const kb_mode_count: u8 = blk: {
+        var c: u8 = 0;
+        if (text != null) c += 1;
+        if (raw_text != null) c += 1;
+        if (key != null) c += 1;
+        if (bytes_hex != null) c += 1;
+        if (seq != null) c += 1;
+        break :blk c;
+    };
+
+    if (mouse_mode_count + kb_mode_count == 0) {
+        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq, --click, --drag, --scroll");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (mouse_mode_count + kb_mode_count > 1) {
+        try common.printErr("hty send: --click, --drag, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive");
+        std.process.exit(common.ExitCode.generic);
+    }
+
+    // Mouse-mode path: dispatch send_mouse RPCs and we're done (no fused
+    // wait/snapshot for now; those still compose with keyboard modes the
+    // same way they did before). We return before the keyboard token
+    // pipeline below.
+    if (mouse_mode_count == 1) {
+        try runMouseMode(alloc, session_ref, .{
+            .click_row = click_row,
+            .click_col = click_col,
+            .drag_from_row = drag_from_row,
+            .drag_from_col = drag_from_col,
+            .drag_to_row = drag_to_row,
+            .drag_to_col = drag_to_col,
+            .scroll_dir = scroll_dir,
+            .scroll_at_row = scroll_at_row,
+            .scroll_at_col = scroll_at_col,
+            .scroll_amount = scroll_amount,
+            .button = mouse_button,
+            .delay_before_ms = if (delay_before) |d| common.parseDurationMs(d) catch 0 else 0,
+            .delay_after_ms = if (delay_after) |d| common.parseDurationMs(d) catch 0 else 0,
+        });
+
+        // Mouse modes still compose with --snapshot / --wait-* the same way
+        // keyboard modes do.
+        if (snapshot_flag or wait_kind_count > 0 or wait_duration_str != null) {
+            const wait_kind: []const u8 = if (wait_until_idle)
+                "idle"
+            else if (wait_until_text != null)
+                "text"
+            else if (wait_until_regex != null)
+                "regex"
+            else if (wait_until_exit)
+                "exit"
+            else if (wait_duration_str != null)
+                "duration"
+            else
+                "none";
+            const timeout_ms: u64 = if (timeout_str) |t| common.parseDurationMs(t) catch 30_000 else 30_000;
+            const idle_ms: u64 = if (wait_until_idle_ms_str) |s| parseIdleArg(s) catch 100 else 100;
+            const duration_ms: u64 = if (wait_duration_str) |d| common.parseDurationMs(d) catch 0 else 0;
+            const needle: ?[]const u8 = wait_until_text orelse wait_until_regex;
+            try issueFusedWait(alloc, .{
+                .session_ref = session_ref,
+                .wait_kind = wait_kind,
+                .needle = needle,
+                .idle_ms = idle_ms,
+                .duration_ms = duration_ms,
+                .timeout_ms = timeout_ms,
+                .snapshot = snapshot_flag,
+                .json_output = json_output,
+                .ansi_output = ansi_output,
+            });
+        }
+        return;
     }
 
     countInputModes(.{
@@ -376,6 +525,90 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             .ansi_output = ansi_output,
         });
     }
+}
+
+fn parseUInt(s: []const u8) !u32 {
+    if (s.len == 0) return error.InvalidInt;
+    const n = try std.fmt.parseInt(u32, s, 10);
+    if (n == 0) return error.InvalidInt;
+    return n;
+}
+
+const MouseModeParams = struct {
+    click_row: ?u32,
+    click_col: ?u32,
+    drag_from_row: ?u32,
+    drag_from_col: ?u32,
+    drag_to_row: ?u32,
+    drag_to_col: ?u32,
+    scroll_dir: ?[]const u8,
+    scroll_at_row: u32,
+    scroll_at_col: u32,
+    scroll_amount: u32,
+    button: []const u8,
+    delay_before_ms: u64,
+    delay_after_ms: u64,
+};
+
+/// Execute the mouse-mode send. Issues one send_mouse RPC per underlying
+/// event: --click = press + release; --drag = press + motion + release;
+/// --scroll = N wheel presses. The server picks the wire encoding based
+/// on the session's observed mouse modes. The first RPC may fail with
+/// `MouseNotEnabled` — surface the error identically to other send ops
+/// and exit with the generic error code.
+fn runMouseMode(alloc: Allocator, session_ref: ?[]const u8, p: MouseModeParams) !void {
+    if (p.delay_before_ms > 0) std.Thread.sleep(p.delay_before_ms * std.time.ns_per_ms);
+
+    if (p.click_row) |row| {
+        const col = p.click_col.?;
+        try sendMouseEvent(alloc, session_ref, "press", p.button, row, col);
+        try sendMouseEvent(alloc, session_ref, "release", p.button, row, col);
+    } else if (p.drag_from_row) |fr| {
+        const fc = p.drag_from_col.?;
+        const tr = p.drag_to_row.?;
+        const tc = p.drag_to_col.?;
+        try sendMouseEvent(alloc, session_ref, "press", p.button, fr, fc);
+        try sendMouseEvent(alloc, session_ref, "motion", p.button, tr, tc);
+        try sendMouseEvent(alloc, session_ref, "release", p.button, tr, tc);
+    } else if (p.scroll_dir) |dir| {
+        const wheel_btn: []const u8 = if (std.mem.eql(u8, dir, "up")) "wheel_up" else "wheel_down";
+        var n: u32 = 0;
+        while (n < p.scroll_amount) : (n += 1) {
+            try sendMouseEvent(alloc, session_ref, "press", wheel_btn, p.scroll_at_row, p.scroll_at_col);
+        }
+    }
+
+    if (p.delay_after_ms > 0) std.Thread.sleep(p.delay_after_ms * std.time.ns_per_ms);
+}
+
+fn sendMouseEvent(
+    alloc: Allocator,
+    session_ref: ?[]const u8,
+    event: []const u8,
+    button: []const u8,
+    row: u32,
+    col: u32,
+) !void {
+    var buf = std.array_list.Managed(u8).init(alloc);
+    defer buf.deinit();
+    var writer = buf.writer();
+    try writer.writeAll("{\"op\":\"send_mouse\",\"event\":");
+    try common.writeJsonString(writer.any(), event);
+    try writer.writeAll(",\"button\":");
+    try common.writeJsonString(writer.any(), button);
+    try writer.print(",\"row\":{d},\"col\":{d}", .{ row, col });
+    if (session_ref) |s| {
+        try writer.writeAll(",\"session\":");
+        try common.writeJsonString(writer.any(), s);
+    }
+    try writer.writeAll("}");
+
+    const response_line = try common.sendRawRequest(alloc, buf.items);
+    defer alloc.free(response_line);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
+    defer parsed.deinit();
+    _ = try common.expectOkOrExit(parsed);
 }
 
 /// `--wait-until-idle` takes an optional MS positional value. To decide

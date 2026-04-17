@@ -43,6 +43,21 @@ pub const SnapshotPayload = struct {
     /// carries no styling.
     cells: []const []const []const u8,
     status: []const u8 = "running",
+    /// Per-session mouse-input mode state (issue #24). Populated from
+    /// DEC private-mode toggles (CSI ?1000/1002/1003/1006 h/l) seen in
+    /// the PTY output stream. `enabled` is `x10 or button_event or
+    /// any_event` — the flag `hty send --click` gates on.
+    mouse: MouseStateWire = .{},
+};
+
+/// Wire shape for per-session mouse-input mode. Flat booleans matching
+/// the DEC private-mode numbers so clients can read them unambiguously.
+pub const MouseStateWire = struct {
+    enabled: bool = false,
+    x10: bool = false,
+    button_event: bool = false,
+    any_event: bool = false,
+    sgr: bool = false,
 };
 
 pub const EventPayload = struct {
@@ -140,6 +155,7 @@ pub fn requestErrorMessage(err: anyerror) []const u8 {
         error.InvalidHex => "invalid hex bytes; expected an even-length hexadecimal string",
         error.UnknownOperation => "unknown op",
         error.InvalidRegex => "invalid regex pattern",
+        error.MouseNotEnabled => "target app has not enabled mouse input",
         else => @errorName(err),
     };
 }

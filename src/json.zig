@@ -46,6 +46,17 @@ pub fn readOptionalBool(object: std.json.ObjectMap, key: []const u8, default: bo
     };
 }
 
+pub fn readRequiredU64(object: std.json.ObjectMap, key: []const u8) !u64 {
+    const value = object.get(key) orelse return error.MissingField;
+    return switch (value) {
+        .integer => |integer| {
+            if (integer < 0) return error.InvalidFieldValue;
+            return @intCast(integer);
+        },
+        else => error.InvalidFieldType,
+    };
+}
+
 pub fn readOptionalU64(object: std.json.ObjectMap, key: []const u8, default: u64) !u64 {
     const value = object.get(key) orelse return default;
     return switch (value) {

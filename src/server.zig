@@ -341,6 +341,7 @@ pub fn dispatchRequest(
     // they're not in this list.
     const known_ops = [_][]const u8{
         "snapshot",      "send_text",         "send_key",      "send_bytes_hex",
+        "send_mouse",
         "resize",        "wait_for_text",     "wait_for_idle", "wait_for_exit",
         "kill",          "delete",            "wait_and_snapshot",
     };
@@ -360,6 +361,7 @@ pub fn dispatchRequest(
     if (std.mem.eql(u8, op, "send_text")) return ops.handleSendText(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_key")) return ops.handleSendKey(arena, sess, object, id);
     if (std.mem.eql(u8, op, "send_bytes_hex")) return ops.handleSendBytesHex(arena, sess, object, id);
+    if (std.mem.eql(u8, op, "send_mouse")) return ops.handleSendMouse(arena, sess, object, id);
     if (std.mem.eql(u8, op, "resize")) return ops.handleResize(arena, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_text")) return ops.handleWaitForText(arena, registry, sess, object, id);
     if (std.mem.eql(u8, op, "wait_for_idle")) return ops.handleWaitForIdle(arena, registry, sess, object, id);
