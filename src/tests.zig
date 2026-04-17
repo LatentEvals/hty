@@ -20,7 +20,7 @@ const replayToTerminal = @import("commands/replay.zig").replayToTerminal;
 // Integration test helpers (drive the in-process dispatch without sockets)
 // ============================================================================
 
-fn testRequest(
+pub fn testRequest(
     registry: *SessionRegistry,
     value: anytype,
 ) !std.json.Parsed(std.json.Value) {
@@ -35,7 +35,7 @@ fn testRequest(
     return std.json.parseFromSlice(std.json.Value, alloc, response_line[0..newline], .{});
 }
 
-fn expectTestOk(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+pub fn expectTestOk(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
     const object = switch (parsed.value) {
         .object => |o| o,
         else => return error.InvalidResponse,
@@ -1043,7 +1043,7 @@ fn testRequestRaw(registry: *SessionRegistry, request_line: []const u8) !std.jso
 /// Assert the response envelope is `{ok: false, error: "..."}` and that the
 /// error string contains `needle`. Prints the actual message on mismatch so
 /// test output is useful. Pass an empty needle to accept any error.
-fn expectTestError(parsed: std.json.Parsed(std.json.Value), needle: []const u8) !void {
+pub fn expectTestError(parsed: std.json.Parsed(std.json.Value), needle: []const u8) !void {
     const obj = switch (parsed.value) {
         .object => |o| o,
         else => return error.InvalidResponse,
@@ -1123,7 +1123,7 @@ test "op with wrong-type field returns a structured error" {
 
 /// Spawn a single cat session and return its UUID (duped with
 /// `std.testing.allocator`). Caller must free.
-fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
+pub fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
     const alloc = std.testing.allocator;
     var parsed = if (name) |n|
         try testRequest(registry, .{
