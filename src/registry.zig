@@ -560,6 +560,11 @@ pub const SessionRegistry = struct {
                         }
                     },
                     .raw_bytes => |bytes| {
+                        // Sniff DEC private-mode toggles (CSI ? Pm h/l)
+                        // out of the output stream so `hty send --click`
+                        // knows which apps have opted into mouse input
+                        // and which encoding they prefer. See issue #24.
+                        session_mod.applyMouseModeTogglesFromOutput(&sess.mouse_state, bytes);
                         log_mod.logDrainedEvent(sess, now, event);
                         attach.broadcastRawBytesToAttach(sess, bytes);
                     },

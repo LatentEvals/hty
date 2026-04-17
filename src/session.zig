@@ -13,6 +13,157 @@ const Allocator = std.mem.Allocator;
 
 pub const SessionStatus = enum { running, exited, failed, killed };
 
+/// Per-session mouse-input mode state, inferred by sniffing the PTY output
+/// stream for DEC private mode toggles (`CSI ? Pm h/l`). Apps opt into
+/// mouse input with `?1000` / `?1002` / `?1003` (event sets) and `?1006`
+/// for SGR extended encoding. `hty send --click` consults this state to
+/// (a) refuse to send if nothing is enabled, and (b) pick the right
+/// encoding when it is.
+///
+/// Readers touch each field through atomics (acquire load), writers update
+/// with release store from inside `drainAll` under `registry.mutex`. No
+/// session-local lock exists for mouse state — the atomics are enough
+/// since each field is independent and a torn read across fields is
+/// harmless (the client would just see a momentarily-stale combination
+/// on the next snapshot).
+pub const MouseState = struct {
+    /// `CSI ?1000` — button-event mode (press/release only, no motion).
+    x10: std.atomic.Value(bool),
+    /// `CSI ?1002` — button-event + drag motion while pressed.
+    button_event: std.atomic.Value(bool),
+    /// `CSI ?1003` — any-event motion (even without a button pressed).
+    any_event: std.atomic.Value(bool),
+    /// `CSI ?1006` — SGR extended encoding. Independent of the event
+    /// mode — apps typically enable 1000/1002/1003 *and* 1006 together.
+    sgr: std.atomic.Value(bool),
+
+    pub fn init() MouseState {
+        return .{
+            .x10 = .init(false),
+            .button_event = .init(false),
+            .any_event = .init(false),
+            .sgr = .init(false),
+        };
+    }
+
+    /// True if any event-set mode is on (1000/1002/1003). This is the
+    /// gate `send --click` checks.
+    pub fn isEnabled(self: *const MouseState) bool {
+        return self.x10.load(.acquire) or
+            self.button_event.load(.acquire) or
+            self.any_event.load(.acquire);
+    }
+
+    /// Snapshot all four flags to a plain struct for serialization.
+    pub fn snapshot(self: *const MouseState) MouseStateSnapshot {
+        return .{
+            .x10 = self.x10.load(.acquire),
+            .button_event = self.button_event.load(.acquire),
+            .any_event = self.any_event.load(.acquire),
+            .sgr = self.sgr.load(.acquire),
+        };
+    }
+};
+
+pub const MouseStateSnapshot = struct {
+    x10: bool,
+    button_event: bool,
+    any_event: bool,
+    sgr: bool,
+
+    /// True when any event-set mode is enabled.
+    pub fn enabled(self: MouseStateSnapshot) bool {
+        return self.x10 or self.button_event or self.any_event;
+    }
+};
+
+/// Scan `bytes` (a chunk of PTY output) for DEC private mode toggles of
+/// the form `ESC [ ? Pm ; Pm ... h` (enable) or `... l` (disable) and
+/// apply the mouse-related ones to `mouse`. Non-matching bytes are
+/// ignored; this is a lenient sniffer, not a full VT parser (the real
+/// VT is Ghostty's job — we just tee a byte-level view to learn about
+/// mouse modes). Chunks that split a sequence mid-way are still picked
+/// up by the next raw_bytes drain event on the following drainAll pass.
+/// In practice apps emit the toggle as one write, so a split is rare.
+pub fn applyMouseModeTogglesFromOutput(mouse: *MouseState, bytes: []const u8) void {
+    var i: usize = 0;
+    while (i + 2 < bytes.len) {
+        // Look for ESC [ ? — a DEC private mode sequence.
+        if (bytes[i] != 0x1B) {
+            i += 1;
+            continue;
+        }
+        if (bytes[i + 1] != '[' or bytes[i + 2] != '?') {
+            i += 1;
+            continue;
+        }
+        // Walk forward collecting semicolon-separated decimal params
+        // until we hit the terminator 'h' or 'l'.
+        var p: usize = i + 3;
+        const params_start = p;
+        while (p < bytes.len) : (p += 1) {
+            const b = bytes[p];
+            if (b == 'h' or b == 'l') break;
+            // Only digits and ';' are valid inside a DEC private param
+            // list. Anything else means this wasn't a clean mode toggle;
+            // bail out and keep scanning from the next byte.
+            if (!(b >= '0' and b <= '9') and b != ';') {
+                p = bytes.len;
+                break;
+            }
+        }
+        if (p >= bytes.len) {
+            i += 1;
+            continue;
+        }
+        const enable = bytes[p] == 'h';
+        const params = bytes[params_start..p];
+        // Split on ';' and apply each numeric param.
+        var tok_it = std.mem.splitScalar(u8, params, ';');
+        while (tok_it.next()) |tok| {
+            if (tok.len == 0) continue;
+            const n = std.fmt.parseInt(u32, tok, 10) catch continue;
+            switch (n) {
+                1000 => mouse.x10.store(enable, .release),
+                1002 => mouse.button_event.store(enable, .release),
+                1003 => mouse.any_event.store(enable, .release),
+                1006 => mouse.sgr.store(enable, .release),
+                else => {},
+            }
+        }
+        i = p + 1;
+    }
+}
+
+test "applyMouseModeTogglesFromOutput: enable 1000 + 1006" {
+    var m = MouseState.init();
+    applyMouseModeTogglesFromOutput(&m, "\x1b[?1000h\x1b[?1006h");
+    try std.testing.expect(m.x10.load(.acquire));
+    try std.testing.expect(m.sgr.load(.acquire));
+    try std.testing.expect(!m.button_event.load(.acquire));
+}
+
+test "applyMouseModeTogglesFromOutput: disable 1002" {
+    var m = MouseState.init();
+    m.button_event.store(true, .release);
+    applyMouseModeTogglesFromOutput(&m, "junk \x1b[?1002l tail");
+    try std.testing.expect(!m.button_event.load(.acquire));
+}
+
+test "applyMouseModeTogglesFromOutput: combined params" {
+    var m = MouseState.init();
+    applyMouseModeTogglesFromOutput(&m, "\x1b[?1002;1006h");
+    try std.testing.expect(m.button_event.load(.acquire));
+    try std.testing.expect(m.sgr.load(.acquire));
+}
+
+test "applyMouseModeTogglesFromOutput: 1015 is ignored" {
+    var m = MouseState.init();
+    applyMouseModeTogglesFromOutput(&m, "\x1b[?1015h");
+    try std.testing.expect(!m.x10.load(.acquire));
+    try std.testing.expect(!m.sgr.load(.acquire));
+}
+
 pub fn statusName(status: SessionStatus) []const u8 {
     return switch (status) {
         .running => "running",
@@ -47,6 +198,17 @@ pub const Session = struct {
     last_screen_change_at_ms_atomic: std.atomic.Value(i64),
     status_atomic: std.atomic.Value(u8),
     exit_code_atomic: std.atomic.Value(i32),
+
+    /// Mouse-input mode flags inferred from the PTY output stream.
+    /// Mutated from `drainAll` when raw_bytes events arrive; read by
+    /// `handleSendMouse` (to gate on enable + pick an encoding) and by
+    /// `handleSnapshot` (to expose the state to clients).
+    mouse_state: MouseState = .{
+        .x10 = .{ .raw = false },
+        .button_event = .{ .raw = false },
+        .any_event = .{ .raw = false },
+        .sgr = .{ .raw = false },
+    },
 
     log_file: ?std.fs.File = null,
     /// Serializes writes to `log_file`. Held by every log helper in `log.zig`
