@@ -35,6 +35,7 @@ comptime {
     _ = @import("server_attach.zig");
     _ = @import("tests.zig");
     _ = @import("commands/help.zig");
+    _ = @import("commands/kill.zig");
     _ = @import("commands/send.zig");
     _ = @import("commands/logs.zig");
     _ = @import("commands/replay.zig");
