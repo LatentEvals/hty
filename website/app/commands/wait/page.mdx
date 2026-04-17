@@ -24,6 +24,20 @@ hty wait my-session --idle 500 --timeout 10000
 hty wait my-session --exit --timeout 30000
 ```
 
+## JSON output
+
+With `--json`, `wait` emits a structured result to stdout describing the match (or the timeout) instead of returning silently. This lets an agent know *why* the wait returned without a follow-up `snapshot`:
+
+```sh
+hty wait my-session --regex "error|ok" --timeout 5000 --json
+```
+
+```json
+{ "ok": true, "matched": true, "mode": "regex", "elapsed_ms": 284 }
+```
+
+On timeout you get `matched: false` and exit code 3 alongside the elapsed time.
+
 ## Exit codes
 
 | Code | Meaning |

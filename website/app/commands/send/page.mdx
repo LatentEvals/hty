@@ -30,6 +30,50 @@ hty send my-session --seq '"hello" 200ms enter'
 hty send my-session --bytes-hex "1b5b41"
 ```
 
+## `--text` vs. `--raw-text`
+
+`--text` processes C-style escapes — `\n` becomes a newline, `\t` a tab, `\e` the Escape byte, `\\` a literal backslash. That's what you usually want for typing commands, pressing Enter, etc.
+
+`--raw-text` sends the UTF-8 bytes verbatim with **no** escape processing. Use it when you want to type content that contains backslashes you don't want interpreted — for example, pasting source code, regex patterns, or shell snippets into an editor:
+
+```sh
+# With --text, the \n would be turned into a real newline
+hty send my-session --raw-text "const re = /\\n/;"
+```
+
+Prefer `--raw-text` whenever shell quoting of backslashes gets painful.
+
+## Fused send + wait + snapshot
+
+For agent workflows, the common pattern is "type something, wait for the program to settle, then read the screen." Instead of three round-trips (`send`, `wait`, `snapshot`), you can fuse them into one by combining `--snapshot` with a `--wait-*` flag:
+
+```sh
+# Type a command, wait for the screen to go idle for 200ms, read it back
+hty send my-session --text "git status\n" \
+  --snapshot --wait-until-idle 200 --json
+
+# Press Enter and wait for a specific string to appear
+hty send my-session --key enter \
+  --snapshot --wait-until-text "press any key" --timeout 5000
+
+# Submit and wait for a regex match, returning styled ANSI
+hty send my-session --text "help\n" \
+  --snapshot --wait-until-regex "^(ERROR|OK):" --ansi
+```
+
+The response format follows `hty snapshot` — plain buffer by default, JSON with `--json`, styled ANSI with `--ansi`. With `--json` you also get `matched`, `elapsed_ms`, and timeout info, so an agent can tell whether the wait succeeded without a second call.
+
+| Flag | Effect |
+|------|--------|
+| `--snapshot` | Include the post-action screen in the response. Required for any of the flags below. |
+| `--wait-duration DUR` | Sleep DUR after sending, then snapshot. Use for programs that don't produce observable output. |
+| `--wait-until-idle [MS]` | Wait until the screen has been quiet for MS ms (default 100). Idle is measured from when the op starts on the server, so a session that was already idle won't trip the check. |
+| `--wait-until-text STR` | Wait until STR appears in the rendered buffer. |
+| `--wait-until-regex RE` | Wait until RE (POSIX extended) matches. |
+| `--wait-until-exit` | Wait until the child process exits. |
+| `--timeout DUR` | Cap on any `--wait-until-*` (default 30s; 0 = no cap). |
+| `--json` / `--ansi` | Output format for the included snapshot. |
+
 <Callout type="info">
 Every input sent via `hty send` is recorded in the session log as an input event, making sessions fully reproducible and auditable.
 </Callout>

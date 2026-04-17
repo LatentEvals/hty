@@ -67,14 +67,14 @@ sudo cp zig-out/bin/hty /usr/local/bin/
 Drive `git add -p` — the interactive git workflow agents can't handle today:
 
 ```sh
-hty run --name review -- git add -p
-hty wait review --text "Stage this hunk" --timeout 5000
-hty snapshot review                       # read the screen
-hty send review --text "y\n"              # stage this hunk
-hty wait review --idle 200 --timeout 3000
-hty send review --text "n\n"              # skip the next one
-hty send review --text "q\n"
-hty wait review --exit --timeout 2000
+# Start the session and get the first screen in one call
+hty run --name review --snapshot --wait-until-text "Stage this hunk" \
+  --timeout 5000 -- git add -p
+
+# Each send fuses input + wait + snapshot into a single round-trip
+hty send review --text "y\n" --snapshot --wait-until-idle 200    # stage this hunk
+hty send review --text "n\n" --snapshot --wait-until-idle 200    # skip the next
+hty send review --text "q\n" --snapshot --wait-until-exit --timeout 2000
 ```
 
 The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls. Open a second terminal and run `hty watch review` while the session is live to see exactly what the agent sees.
@@ -103,7 +103,7 @@ The server auto-starts on first use and persists across invocations, so sessions
     </td>
     <td width="33%" valign="top">
       <strong>Wait primitives</strong><br />
-      <code>--text</code> for substring, <code>--idle</code> for output settling, <code>--exit</code> for process end. All with timeouts.
+      <code>--text</code>, <code>--regex</code>, <code>--idle</code>, <code>--exit</code>. Fuse them into <code>run</code> and <code>send</code> with <code>--snapshot</code> for one-round-trip agent loops.
     </td>
     <td width="33%" valign="top">
       <strong>Remote observation</strong><br />

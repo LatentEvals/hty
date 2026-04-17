@@ -28,6 +28,7 @@ With `--json`, the output includes structured metadata:
     "buffer": "hello world\n~\n~\n...",
     "screen_ansi": "\u001b[?25l\u001b[H...",
     "lines": ["hello world", "~", "~"],
+    "cells": [["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d", " ", "..."], ["~", " ", "..."]],
     "status": "running"
   }
 }
@@ -41,6 +42,7 @@ With `--json`, the output includes structured metadata:
 | `cursor_row`, `cursor_col` | Cursor position, 1-indexed. |
 | `title` | Window title set by the program, or `null`. |
 | `status` | Session status: `running`, `exited`, `failed`, or `killed`. |
+| `cells` | 2D array shaped `[rows][cols]`, where each entry is the glyph at that column. Lets you reason about column-accurate coordinates — wide characters (e.g. CJK) occupy their starting column and their trailing cell is reported separately, so you can map a visual position to an exact `(row, col)` without re-tokenizing `buffer`. |
 
 ## Parsing the output
 

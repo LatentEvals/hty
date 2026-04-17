@@ -1,0 +1,47 @@
+# hty info
+
+Show resolved filesystem paths and whether the server is running. Useful for locating the Unix socket when setting up SSH tunnels for [remote observation](/guides/remote-observation), and for scripts that need to know where session logs live on disk.
+
+## Reference
+
+<HelpBlock cmd="info" />
+
+## Default output
+
+```
+socket   /run/user/1000/hty.sock
+logs     /home/me/.local/state/hty/logs
+server   running (pid 12345)
+```
+
+If any of `$HTY_SOCKET`, `$XDG_RUNTIME_DIR`, or `$XDG_STATE_HOME` are set, they are listed below the main block so you can see why the paths resolved the way they did.
+
+## JSON output
+
+Use `--json` for machine-readable output:
+
+```sh
+hty info --json
+```
+
+```json
+{
+  "socket": "/run/user/1000/hty.sock",
+  "logs": "/home/me/.local/state/hty/logs",
+  "server": { "running": true, "pid": 12345 }
+}
+```
+
+## Examples
+
+```sh
+# Find the socket path to forward over SSH
+ssh -L "$(hty info --json | jq -r .socket):$(hty info --json | jq -r .socket)" remote-host
+
+# Check whether the server is up from a script
+hty info --json | jq -e '.server.running' >/dev/null
+```
+
+<Callout type="info">
+See [environment variables](/reference/environment-variables) for the full list of knobs that affect the paths `hty info` reports.
+</Callout>

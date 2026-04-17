@@ -1,0 +1,27 @@
+# hty export
+
+Convert a recorded session log into a share-ready artifact and write it to stdout. Currently supports [asciinema v2](https://docs.asciinema.org/manual/asciicast/v2/) `.cast` files, which can be rendered to a GIF with [`agg`](https://github.com/asciinema/agg) or [`vhs`](https://github.com/charmbracelet/vhs), played with `asciinema play`, or uploaded to asciinema.org.
+
+Unlike [`hty replay`](/commands/replay), which re-renders a session live in your terminal, `hty export` produces a portable file you can embed in docs, attach to a bug report, or hand to a reviewer who doesn't have `hty` installed.
+
+## Reference
+
+<HelpBlock cmd="export" />
+
+## Examples
+
+```sh
+# Export to asciinema .cast
+hty export my-session --format asciicast > run.cast
+
+# Render a GIF with agg
+hty export my-session --format asciicast | agg - run.gif
+
+# Upload to asciinema.org
+hty export my-session --format asciicast > run.cast
+asciinema upload run.cast
+```
+
+<Callout type="info">
+`hty export` reads the on-disk session log, so it works on exited sessions just like `hty logs` and `hty replay`. Use [`hty delete`](/commands/delete) to remove the log once you've exported what you need.
+</Callout>
