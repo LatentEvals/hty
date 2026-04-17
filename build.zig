@@ -19,7 +19,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const run_step = b.step("run", "Run the hty demo wrapper");
     const test_step = b.step("test", "Run Zig unit tests");
 
     // `-Dversion-string=STR` escape hatch for source-tarball / CI builds
@@ -109,20 +108,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    const exe = b.addExecutable(.{
-        .name = "hty-demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "hty", .module = lib_mod },
-            },
-        }),
-    });
-    b.installArtifact(exe);
-
     const headless = b.addExecutable(.{
         .name = "hty",
         .root_module = b.createModule(.{
@@ -138,12 +123,6 @@ pub fn build(b: *std.Build) void {
     headless.root_module.addCSourceFile(.{ .file = b.path("src/regex_helper.c") });
     headless.root_module.addOptions("build_info", build_info_options);
     b.installArtifact(headless);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.stdio = .inherit;
-    if (b.args) |args| run_cmd.addArgs(args);
-    run_step.dependOn(&run_cmd.step);
 
     const unit_tests = b.addTest(.{
         .root_module = lib_mod,

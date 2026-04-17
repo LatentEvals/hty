@@ -224,17 +224,6 @@ zig build test
 
 Coverage includes library spawn/snapshot/input/title, ANSI styling round-trip, UUIDv7 generation, session registry behavior, subcommand dispatch, and end-to-end integration against `/bin/cat`, `nano`, `emacs`, and `top` using the wait primitives.
 
-### Debug utilities
-
-`hty-demo` is a standalone framed wrapper that opens its own PTY in its own process — it does **not** talk to the session server. It's kept as a development aid for the VT engine. For normal use, prefer `hty run` + `hty watch`.
-
-```sh
-./zig-out/bin/hty-demo btop
-./zig-out/bin/hty-demo vim
-```
-
-`Ctrl-Q` kills the child and exits.
-
 ## License
 
 MIT License
