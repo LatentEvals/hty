@@ -40,8 +40,17 @@ hty delete create-next-app
 
 ## Get started in 30 seconds
 
+Install:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
+```
+
+[Other install options →](/get-started/installation)
+
+Then try it:
+
+```sh
 hty run --name demo -- top
 hty wait demo --text "PID" --timeout 5000
 hty snapshot demo
@@ -49,8 +58,6 @@ hty kill demo
 hty logs demo    # still works — the recording is preserved
 hty delete demo  # permanently remove the session and its log
 ```
-
-[Install hty →](/get-started/installation)
 
 [Quick Start →](/get-started/quickstart)
 
