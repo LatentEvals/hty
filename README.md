@@ -143,7 +143,7 @@ Commands:
   list      List running sessions
   watch     Observe a session's rendered screen in real time (read-only)
   send      Send text, a named key, raw hex bytes, or a mouse event
-            (click / drag / scroll) to a session
+            (click / scroll) to a session
   snapshot  Read the current rendered screen of a session
   wait      Block until the session matches a condition (text/idle/exit)
   kill      Terminate a session's process (the record stays for replay)

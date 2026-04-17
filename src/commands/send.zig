@@ -9,11 +9,10 @@ const common = @import("common.zig");
 pub fn helpText() []const u8 {
     return
     \\hty send [SESSION] --text "..." | --raw-text "..." | --key NAME | --seq "..." | --bytes-hex HEX
-    \\                   | --click ROW COL | --drag FROM_ROW FROM_COL TO_ROW TO_COL
-    \\                   | --scroll up|down
+    \\                   | --click ROW COL | --scroll up|down
     \\
     \\Send input to a session. Exactly one of --text, --raw-text, --key,
-    \\--seq, --bytes-hex, --click, --drag, --scroll is required.
+    \\--seq, --bytes-hex, --click, --scroll is required.
     \\
     \\Flags:
     \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
@@ -39,11 +38,9 @@ pub fn helpText() []const u8 {
     \\`hty snapshot --json`'s `mouse.enabled` to verify.
     \\  --click ROW COL      Click at ROW/COL. Defaults to left button;
     \\                       combine with --button to change.
-    \\  --drag FROM_ROW FROM_COL TO_ROW TO_COL
-    \\                       Press at the FROM cell, motion, release at TO.
     \\  --scroll up|down     Scroll at the cursor (or --at ROW COL); emits
     \\                       --amount N events (default 1).
-    \\  --button B           Button for --click / --drag: left (default),
+    \\  --button B           Button for --click: left (default),
     \\                       right, middle.
     \\  --at ROW COL         Row/col for --scroll. Defaults to 1 1.
     \\  --amount N           Repeat count for --scroll. Default 1.
@@ -90,14 +87,9 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var delay_char: ?[]const u8 = null;
 
     // Mouse input flags. Coordinate pairs are stored as parsed u32s;
-    // --click and --scroll consume 2 positional values each, --drag
-    // consumes 4. See issue #24.
+    // --click and --scroll consume 2 positional values each. See issue #24.
     var click_row: ?u32 = null;
     var click_col: ?u32 = null;
-    var drag_from_row: ?u32 = null;
-    var drag_from_col: ?u32 = null;
-    var drag_to_row: ?u32 = null;
-    var drag_to_col: ?u32 = null;
     var scroll_dir: ?[]const u8 = null;
     var scroll_at_row: u32 = 1;
     var scroll_at_col: u32 = 1;
@@ -188,13 +180,6 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             click_row = parseUInt(args[i + 1]) catch return common.printUsageAndExit("--click ROW must be a positive integer");
             click_col = parseUInt(args[i + 2]) catch return common.printUsageAndExit("--click COL must be a positive integer");
             i += 2;
-        } else if (std.mem.eql(u8, arg, "--drag")) {
-            if (i + 4 >= args.len) return common.printUsageAndExit("--drag requires FROM_ROW FROM_COL TO_ROW TO_COL");
-            drag_from_row = parseUInt(args[i + 1]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
-            drag_from_col = parseUInt(args[i + 2]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
-            drag_to_row = parseUInt(args[i + 3]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
-            drag_to_col = parseUInt(args[i + 4]) catch return common.printUsageAndExit("--drag coordinates must be positive integers");
-            i += 4;
         } else if (std.mem.eql(u8, arg, "--scroll")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--scroll requires up|down");
@@ -260,7 +245,6 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // the keyboard/text input modes and with each other.
     var mouse_mode_count: u8 = 0;
     if (click_row != null) mouse_mode_count += 1;
-    if (drag_from_row != null) mouse_mode_count += 1;
     if (scroll_dir != null) mouse_mode_count += 1;
 
     const kb_mode_count: u8 = blk: {
@@ -274,11 +258,11 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     };
 
     if (mouse_mode_count + kb_mode_count == 0) {
-        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq, --click, --drag, --scroll");
+        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq, --click, --scroll");
         std.process.exit(common.ExitCode.generic);
     }
     if (mouse_mode_count + kb_mode_count > 1) {
-        try common.printErr("hty send: --click, --drag, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive");
+        try common.printErr("hty send: --click, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive");
         std.process.exit(common.ExitCode.generic);
     }
 
@@ -290,10 +274,6 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         try runMouseMode(alloc, session_ref, .{
             .click_row = click_row,
             .click_col = click_col,
-            .drag_from_row = drag_from_row,
-            .drag_from_col = drag_from_col,
-            .drag_to_row = drag_to_row,
-            .drag_to_col = drag_to_col,
             .scroll_dir = scroll_dir,
             .scroll_at_row = scroll_at_row,
             .scroll_at_col = scroll_at_col,
@@ -537,10 +517,6 @@ fn parseUInt(s: []const u8) !u32 {
 const MouseModeParams = struct {
     click_row: ?u32,
     click_col: ?u32,
-    drag_from_row: ?u32,
-    drag_from_col: ?u32,
-    drag_to_row: ?u32,
-    drag_to_col: ?u32,
     scroll_dir: ?[]const u8,
     scroll_at_row: u32,
     scroll_at_col: u32,
@@ -551,11 +527,11 @@ const MouseModeParams = struct {
 };
 
 /// Execute the mouse-mode send. Issues one send_mouse RPC per underlying
-/// event: --click = press + release; --drag = press + motion + release;
-/// --scroll = N wheel presses. The server picks the wire encoding based
-/// on the session's observed mouse modes. The first RPC may fail with
-/// `MouseNotEnabled` — surface the error identically to other send ops
-/// and exit with the generic error code.
+/// event: --click = press + release; --scroll = N wheel presses. The
+/// server picks the wire encoding based on the session's observed mouse
+/// modes. The first RPC may fail with `MouseNotEnabled` — surface the
+/// error identically to other send ops and exit with the generic error
+/// code.
 fn runMouseMode(alloc: Allocator, session_ref: ?[]const u8, p: MouseModeParams) !void {
     if (p.delay_before_ms > 0) std.Thread.sleep(p.delay_before_ms * std.time.ns_per_ms);
 
@@ -563,13 +539,6 @@ fn runMouseMode(alloc: Allocator, session_ref: ?[]const u8, p: MouseModeParams) 
         const col = p.click_col.?;
         try sendMouseEvent(alloc, session_ref, "press", p.button, row, col);
         try sendMouseEvent(alloc, session_ref, "release", p.button, row, col);
-    } else if (p.drag_from_row) |fr| {
-        const fc = p.drag_from_col.?;
-        const tr = p.drag_to_row.?;
-        const tc = p.drag_to_col.?;
-        try sendMouseEvent(alloc, session_ref, "press", p.button, fr, fc);
-        try sendMouseEvent(alloc, session_ref, "motion", p.button, tr, tc);
-        try sendMouseEvent(alloc, session_ref, "release", p.button, tr, tc);
     } else if (p.scroll_dir) |dir| {
         const wheel_btn: []const u8 = if (std.mem.eql(u8, dir, "up")) "wheel_up" else "wheel_down";
         var n: u32 = 0;

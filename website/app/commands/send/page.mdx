@@ -45,7 +45,7 @@ Prefer `--raw-text` whenever shell quoting of backslashes gets painful.
 
 ## Mouse input
 
-For TUIs that opt into mouse tracking (btop, lazygit, k9s, tmux, many fzf layouts), `hty send` can deliver click, drag, and scroll events. Rows and columns are 1-indexed, matching `hty snapshot`.
+For TUIs that opt into mouse tracking (btop, lazygit, k9s, tmux, many fzf layouts), `hty send` can deliver click and scroll events. Rows and columns are 1-indexed, matching `hty snapshot`.
 
 ```sh
 # Left-click at row 5, column 12
@@ -54,9 +54,6 @@ hty send my-session --click 5 12
 # Right-click
 hty send my-session --click 5 12 --button right
 
-# Drag from (3,4) to (7,8) — useful for tmux copy-mode selection
-hty send my-session --drag 3 4 7 8
-
 # Scroll down three times at the default position
 hty send my-session --scroll down --amount 3
 
@@ -64,7 +61,7 @@ hty send my-session --scroll down --amount 3
 hty send my-session --scroll up --at 10 40
 ```
 
-`hty` sniffs the `CSI ?1000/1002/1003 h/l` (event set) and `?1006 h/l` (SGR extended) toggles out of the PTY output stream to track per-session mouse state. `send --click` picks the SGR encoding when the app has enabled `?1006` and falls back to legacy X10 otherwise — X10 also gets used automatically for the rare clicks past column/row 223 that would overflow the 1-byte X10 coordinate.
+`hty` sniffs the `CSI ?1000/1002/1003 h/l` (event set) and `?1006 h/l` (SGR extended) toggles out of the PTY output stream to track per-session mouse state. `send --click` uses SGR encoding when the app has enabled `?1006`, and legacy X10 otherwise. If an X10-only app receives coordinates past column/row 223 (past the 1-byte X10 range), the send fails with a clear error rather than silently truncating or upgrading the encoding to something the app can't parse.
 
 If the target app has not enabled any mouse-event mode, the command fails with `target app has not enabled mouse input`. Check `hty snapshot --json`'s `snapshot.mouse.enabled` field to verify before sending.
 

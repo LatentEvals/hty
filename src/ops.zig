@@ -249,11 +249,13 @@ pub fn handleSendBytesHex(arena: Allocator, sess: *Session, object: std.json.Obj
 }
 
 /// Encode a single mouse event into the bytes the target app expects,
-/// using whichever encoding it has negotiated on the output stream
-/// (SGR `?1006` preferred; falls back to legacy X10). Picks SGR whenever
-/// `?1006` is set *or* the coordinates exceed the X10 range (byte + 32,
-/// capped at 223), so we never silently truncate a click to the wrong
-/// cell.
+/// using whichever encoding it has negotiated on the output stream.
+/// SGR (`ESC [ < ... M/m`) is used only when the app enabled `?1006`;
+/// otherwise legacy X10 (`ESC [ M <btn+32> <col+32> <row+32>`) is used.
+/// If the coords exceed the X10 single-byte range (col/row > 223) and
+/// the app hasn't enabled SGR, we surface `error.MouseCoordOutOfRange`
+/// rather than silently sending SGR bytes to an X10-only app (which it
+/// couldn't parse) or truncating the click to the wrong cell.
 ///
 /// Wire shape: `{op: "send_mouse", event: "press"|"release"|"motion",
 /// button: "left"|"right"|"middle"|"wheel_up"|"wheel_down", row: N,
@@ -310,12 +312,12 @@ pub fn handleSendMouse(arena: Allocator, sess: *Session, object: std.json.Object
     var button_code = base;
     if (is_motion) button_code |= 32;
 
-    // Fall back to SGR if the app asked for it, or if legacy X10 would
-    // overflow its single-byte coordinate field (col/row > 223 once you
-    // add the +32 offset and cap at 0xFF). Cleaner than silently
-    // clipping — agents picking coords out of a large snapshot would
-    // otherwise click the wrong cell at the edge of a wide terminal.
-    const use_sgr = mouse.sgr or col > 223 or row > 223;
+    // SGR only when the target app negotiated `?1006`. If the app is
+    // X10-only and the coords don't fit (col/row > 223 once you add the
+    // +32 offset), surface an error rather than silently sending SGR
+    // bytes the app can't parse — or truncating to the wrong cell.
+    const use_sgr = mouse.sgr;
+    if (!use_sgr and (col > 223 or row > 223)) return error.MouseCoordOutOfRange;
 
     var buf = std.array_list.Managed(u8).init(arena);
     if (use_sgr) {

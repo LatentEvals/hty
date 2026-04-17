@@ -4279,7 +4279,7 @@ test "mouse: click emits SGR press+release when 1006 is enabled" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;10;5m") != null);
 }
 
-test "mouse: drag emits press + motion + release" {
+test "mouse: X10 coords out of range errors when SGR not negotiated" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();
@@ -4289,49 +4289,33 @@ test "mouse: drag emits press + motion + release" {
     std.fs.deleteFileAbsolute(rec) catch {};
     defer std.fs.deleteFileAbsolute(rec) catch {};
 
-    spawnMouseFixture(&registry, "mouse_drag", &.{ "1002", "1006" }, rec) catch |err| {
+    // Only ?1000 (X10-only), no ?1006 — SGR must not be used.
+    spawnMouseFixture(&registry, "mouse_oor", &.{"1000"}, rec) catch |err| {
         if (err == error.SkipZigTest) return err;
         return err;
     };
-    defer killMouseFixture(&registry, "mouse_drag") catch {};
+    defer killMouseFixture(&registry, "mouse_oor") catch {};
 
-    // Drag (3,4) -> (7,8): press at from, motion at to, release at to.
-    const events = [_]struct { ev: []const u8, r: u32, c: u32 }{
-        .{ .ev = "press", .r = 3, .c = 4 },
-        .{ .ev = "motion", .r = 7, .c = 8 },
-        .{ .ev = "release", .r = 7, .c = 8 },
-    };
-    for (events) |e| {
-        var p = try testRequest(&registry, .{
-            .op = "send_mouse",
-            .session = "mouse_drag",
-            .event = e.ev,
-            .button = "left",
-            .row = e.r,
-            .col = e.c,
-        });
-        defer p.deinit();
-        _ = try expectTestOk(p);
-    }
-
-    var idle = try testRequest(&registry, .{
-        .op = "wait_for_idle",
-        .session = "mouse_drag",
-        .idle_ms = 100,
-        .timeout_ms = 2_000,
+    var p = try testRequest(&registry, .{
+        .op = "send_mouse",
+        .session = "mouse_oor",
+        .event = "press",
+        .button = "left",
+        .row = 1,
+        .col = 224,
     });
-    defer idle.deinit();
-    _ = try expectTestOk(idle);
+    defer p.deinit();
 
-    const file = try std.fs.openFileAbsolute(rec, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 4096);
-    defer alloc.free(contents);
-
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;4;3M") != null); // press
-    // Motion encodes button+32 = 32 in SGR: ESC [ < 32 ; col ; row M
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<32;8;7M") != null);
-    try std.testing.expect(std.mem.indexOf(u8, contents, "\x1b[<0;8;7m") != null); // release
+    const object = switch (p.value) {
+        .object => |o| o,
+        else => return error.InvalidResponse,
+    };
+    const ok = object.get("ok") orelse return error.InvalidResponse;
+    try std.testing.expectEqual(false, ok.bool);
+    const err_val = object.get("error") orelse return error.InvalidResponse;
+    try std.testing.expect(err_val == .string);
+    try std.testing.expect(std.mem.indexOf(u8, err_val.string, "exceed X10 range") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_val.string, "?1006") != null);
 }
 
 test "mouse: X10 encoding when only 1000 is on (no SGR)" {

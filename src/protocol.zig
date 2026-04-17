@@ -156,6 +156,7 @@ pub fn requestErrorMessage(err: anyerror) []const u8 {
         error.UnknownOperation => "unknown op",
         error.InvalidRegex => "invalid regex pattern",
         error.MouseNotEnabled => "target app has not enabled mouse input",
+        error.MouseCoordOutOfRange => "coordinates exceed X10 range (col/row > 223); target app must enable SGR mouse encoding (?1006)",
         else => @errorName(err),
     };
 }

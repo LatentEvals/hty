@@ -6,7 +6,7 @@ bytes from stdin and appends them to the file path given by
 $HTY_MOUSE_RECORD. Exits when it reads a byte 0x04 (Ctrl-D / EOT) so
 the test can terminate the session deterministically.
 
-The test driver spawns this under `hty spawn`, drives `hty send --click`
+The test driver spawns this under `hty run`, drives `hty send --click`
 / `--drag` / `--scroll`, then reads the record file to assert the exact
 bytes the target app received.
 """
