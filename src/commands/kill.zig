@@ -7,7 +7,7 @@ const common = @import("common.zig");
 
 pub fn helpText() []const u8 {
     return
-    \\hty kill [--delete|-d] [SESSION]
+    \\hty kill [--delete] [SESSION]
     \\
     \\Terminate a session's underlying process. The session RECORD stays in
     \\place (same id, same name) so `hty list`, `hty logs` and `hty replay`
@@ -18,10 +18,10 @@ pub fn helpText() []const u8 {
     \\is killed.
     \\
     \\Flags:
-    \\  --delete, -d   After killing, also delete the session record and
-    \\                 log file (equivalent to `hty kill` followed by
-    \\                 `hty delete`). Useful for ad-hoc or test sessions
-    \\                 whose recording you don't need to keep.
+    \\  --delete   After killing, also delete the session record and log
+    \\             file (equivalent to `hty kill` followed by `hty
+    \\             delete`). Useful for ad-hoc or test sessions whose
+    \\             recording you don't need to keep.
     \\
     ;
 }
@@ -31,7 +31,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
 
     for (args) |a| {
-        if (std.mem.eql(u8, a, "--delete") or std.mem.eql(u8, a, "-d")) {
+        if (std.mem.eql(u8, a, "--delete")) {
             delete_after = true;
         } else if (std.mem.startsWith(u8, a, "-") and !std.mem.eql(u8, a, "-")) {
             try common.printErrFmt("hty kill: unknown flag: {s}", .{a});
@@ -103,7 +103,6 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 test "kill helpText documents --delete flag" {
     const text = helpText();
     try std.testing.expect(std.mem.indexOf(u8, text, "--delete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "-d") != null);
 }
 
 test "kill then delete removes the session record (end-to-end via ops)" {
