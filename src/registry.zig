@@ -29,6 +29,12 @@ const AttachClient = session_mod.AttachClient;
 /// yet) and the per-session log plumbing (nothing to log against until
 /// promotion). The reader thread's only job while parked is to detect EOF
 /// or client disconnect so the registry can reap the entry.
+///
+/// Wake-up uses a self-pipe rather than `shutdown(.recv)` because the
+/// same socket fd is handed off to the promoted `AttachClient`, and
+/// half-shutting the read side breaks *its* subsequent reads (EOF →
+/// `closed = true` on first drain tick, losing live output). The pipe
+/// lets us interrupt `poll()` without touching the real socket state.
 pub const PendingWatcher = struct {
     alloc: Allocator,
     stream: std.net.Stream,
@@ -37,48 +43,77 @@ pub const PendingWatcher = struct {
     name: []u8,
     closed: std.atomic.Value(bool) = .init(false),
     reader_thread: ?std.Thread = null,
+    /// Self-pipe used by `shutdown()` to wake the reader thread's
+    /// `poll()` without half-closing the client socket.
+    wake_r: std.posix.fd_t,
+    wake_w: std.posix.fd_t,
+    /// True while this struct owns `stream`. `promoteOnePendingWatcher`
+    /// transfers the stream to a freshly-constructed `AttachClient` and
+    /// flips this to false so `deinit()` skips `stream.close()`.
+    owns_stream: bool = true,
 
     pub fn isClosed(self: *const PendingWatcher) bool {
         return self.closed.load(.acquire);
     }
 
+    /// Wake the reader thread so it exits its poll loop. Does NOT touch
+    /// the socket's read/write halves — after promotion the socket is
+    /// reused by the AttachClient, and half-closing either side here
+    /// would break the new owner's first read/write. Idempotent via the
+    /// `closed` atomic.
     pub fn shutdown(self: *PendingWatcher) void {
         if (self.closed.swap(true, .acq_rel)) return;
-        // Only shut down the read half — the write half must survive so
-        // the AttachClient that takes ownership at promotion time can
-        // still send its initial snapshot and broadcast frames. If the
-        // watcher is being torn down because of client disconnect or
-        // registry deinit, the subsequent stream.close() will fully
-        // close both halves.
-        std.posix.shutdown(self.stream.handle, .recv) catch {};
+        // One byte is enough to wake poll(); write failures mean the
+        // pipe is already torn down, which is fine.
+        var byte: [1]u8 = .{0};
+        _ = std.posix.write(self.wake_w, &byte) catch {};
     }
 
-    /// Close the socket, join the reader thread, free owned storage, and
+    /// Join the reader thread, close owned fds, free owned storage, and
     /// destroy the struct. Must be called *after* the pending watcher has
-    /// been removed from the registry's bucket.
+    /// been removed from the registry's bucket. Skips `stream.close()`
+    /// when `owns_stream` is false (stream was transferred to an
+    /// AttachClient at promotion time).
     pub fn deinit(self: *PendingWatcher) void {
         self.shutdown();
         if (self.reader_thread) |t| t.join();
-        self.stream.close();
+        std.posix.close(self.wake_r);
+        std.posix.close(self.wake_w);
+        if (self.owns_stream) self.stream.close();
         self.alloc.free(self.name);
         self.alloc.destroy(self);
     }
 };
 
-/// Reader thread for a parked `PendingWatcher`. Blocks on socket reads
-/// solely to notice EOF / client Ctrl-C (which surfaces as a graceful
-/// shutdown from the watch client). Any read result ends the loop and
-/// flips `closed`; the registry's reap step picks it up on the next tick.
+/// Reader thread for a parked `PendingWatcher`. Polls the client socket
+/// and the wake pipe. Exits on: socket readable with 0 bytes (EOF /
+/// client disconnect), socket readable with an error, or wake pipe
+/// readable (promotion or registry tear-down). Any exit flips `closed`.
+/// Crucially, this loop does NOT close or shutdown the socket — the
+/// AttachClient that takes ownership at promotion time needs it intact.
 fn pendingWatcherReaderLoop(pw: *PendingWatcher) void {
     defer pw.closed.store(true, .release);
+
+    var pfds = [_]std.posix.pollfd{
+        .{ .fd = pw.stream.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = pw.wake_r, .events = std.posix.POLL.IN, .revents = 0 },
+    };
     var buf: [256]u8 = undefined;
     while (!pw.isClosed()) {
-        const n = pw.stream.read(&buf) catch break;
-        if (n == 0) break;
-        // The client has no reason to send bytes while parked — it's
-        // waiting on its own read(). Any input is either a leftover
-        // detach frame or protocol drift; either way just notice the
-        // socket still works and loop.
+        const rc = std.posix.poll(&pfds, -1) catch break;
+        if (rc == 0) continue;
+
+        // Wake pipe triggered — promoter or reaper signalled us.
+        if ((pfds[1].revents & std.posix.POLL.IN) != 0) break;
+
+        if ((pfds[0].revents & std.posix.POLL.IN) != 0) {
+            const n = pw.stream.read(&buf) catch break;
+            if (n == 0) break; // EOF from client.
+            // Ignore any bytes — a parked watcher isn't supposed to be
+            // sending input. Loop and keep polling.
+        }
+        // Socket error conditions (HUP/ERR/NVAL) are terminal.
+        if ((pfds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) break;
     }
 }
 
@@ -212,13 +247,14 @@ pub const SessionRegistry = struct {
     /// on `sess`. Called from `promotePendingWatchersLocked`; must be
     /// invoked while holding `self.mutex` so the session pointer can't
     /// be reaped underneath us. On any failure, tears down the pending
-    /// watcher (closes socket, frees storage).
+    /// watcher (closes socket, frees storage) via the regular deinit
+    /// path — `owns_stream` stays true until we've successfully handed
+    /// the stream off to an `AttachClient`.
     fn promoteOnePendingWatcher(self: *SessionRegistry, sess: *Session, pw: *PendingWatcher) void {
-        // Ask the pending reader thread to wind down so we can reclaim
-        // ownership of the socket fd for the AttachClient that will
-        // take its place. shutdown() is idempotent; calling it now
-        // unblocks pendingWatcherReaderLoop's read() so the join below
-        // returns promptly.
+        // Wake the reader thread via the self-pipe and join it so we
+        // can safely reuse the socket fd. shutdown() only writes a
+        // byte to the wake pipe — the real socket is untouched, so the
+        // new AttachClient's first read() and write() both succeed.
         pw.shutdown();
         if (pw.reader_thread) |t| t.join();
         pw.reader_thread = null;
@@ -229,21 +265,16 @@ pub const SessionRegistry = struct {
         var uuid_buf: [36]u8 = undefined;
         uuid_mod.generateUuidV7(&uuid_buf);
         const client_id = std.fmt.allocPrint(self.alloc, "attach-{s}", .{uuid_buf[0..]}) catch {
-            tearDownPromotionFailure(pw);
+            pw.deinit();
             return;
         };
         errdefer self.alloc.free(client_id);
 
         const client = self.alloc.create(AttachClient) catch {
             self.alloc.free(client_id);
-            tearDownPromotionFailure(pw);
+            pw.deinit();
             return;
         };
-        // Reset the closed flag on the watcher's stream by re-opening? No —
-        // shutdown() only half-closes the socket at the OS level. A fresh
-        // AttachClient owns the same fd and calls shutdown(.both) again at
-        // its own deinit; this is fine because we never call close() on
-        // the pending watcher's stream (the AttachClient now owns it).
         client.* = .{
             .alloc = self.alloc,
             .session = sess,
@@ -257,14 +288,16 @@ pub const SessionRegistry = struct {
             sess.attach_mutex.unlock();
             self.alloc.free(client.client_id);
             self.alloc.destroy(client);
-            // The socket fd has already been half-shutdown; explicitly
-            // close it and free the name slice before destroying.
-            pw.stream.close();
-            self.alloc.free(pw.name);
-            self.alloc.destroy(pw);
+            // Promotion failed before stream ownership transferred — let
+            // the normal deinit path close the socket.
+            pw.deinit();
             return;
         };
         sess.attach_mutex.unlock();
+
+        // Stream ownership has now transferred to `client`. Mark the
+        // pending watcher so its deinit won't double-close.
+        pw.owns_stream = false;
 
         // Log the connect event and send the started+snapshot frames.
         // Use a local arena so failures here don't leak.
@@ -310,21 +343,10 @@ pub const SessionRegistry = struct {
             }
         }
 
-        // The AttachClient now owns the socket fd. Free the pending
-        // watcher's owned storage but NOT the stream (aliased into
-        // `client.stream`).
-        self.alloc.free(pw.name);
-        self.alloc.destroy(pw);
-    }
-
-    /// Cleanup a pending watcher when promotion fails before the socket
-    /// is handed off to an AttachClient. Closes the stream and frees the
-    /// struct.
-    fn tearDownPromotionFailure(pw: *PendingWatcher) void {
-        pw.stream.close();
-        const a = pw.alloc;
-        a.free(pw.name);
-        a.destroy(pw);
+        // Free the pending watcher (its reader thread is already joined
+        // and owns_stream=false ensures deinit doesn't double-close the
+        // socket the AttachClient now owns).
+        pw.deinit();
     }
 
     /// Park a pre-creation watcher on the `name` bucket. Takes ownership
@@ -340,12 +362,23 @@ pub const SessionRegistry = struct {
         const name_owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(name_owned);
 
+        // Self-pipe for waking the reader thread without disturbing the
+        // real client socket (which may be reused by a promoted
+        // AttachClient).
+        const pipe_fds = try std.posix.pipe();
+        errdefer {
+            std.posix.close(pipe_fds[0]);
+            std.posix.close(pipe_fds[1]);
+        }
+
         const pw = try self.alloc.create(PendingWatcher);
         errdefer self.alloc.destroy(pw);
         pw.* = .{
             .alloc = self.alloc,
             .stream = stream,
             .name = name_owned,
+            .wake_r = pipe_fds[0],
+            .wake_w = pipe_fds[1],
         };
 
         self.mutex.lock();

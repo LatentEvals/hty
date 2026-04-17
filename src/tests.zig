@@ -3033,6 +3033,7 @@ const uuid_mod_tests = @import("uuid.zig");
 const log_mod_tests = @import("log.zig");
 const replay_mod = @import("commands/replay.zig");
 const logs_cmd = @import("commands/logs.zig");
+const hex = @import("hex.zig");
 
 /// Set up a hermetic log dir under /tmp for an attach test. Returns the
 /// absolute log_dir path (owned by the caller; free with `alloc.free`).
@@ -3809,6 +3810,162 @@ test "issue #29: watch pre-creation promotes on spawn" {
 
     {
         var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "ghostname" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+/// Background ticker that mimics the real server's accept loop calling
+/// `registry.drainAll()` every ~25ms. Tests use this when they need PTY
+/// events to flow to attach/watch subscribers without driving RPCs.
+const RegistryTicker = struct {
+    registry: *SessionRegistry,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *RegistryTicker) !void {
+        self.thread = try std.Thread.spawn(.{}, RegistryTicker.loop, .{self});
+    }
+
+    fn stopAndJoin(self: *RegistryTicker) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn loop(self: *RegistryTicker) void {
+        while (!self.stop.load(.acquire)) {
+            self.registry.drainAll();
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+};
+
+test "issue #29: promoted watcher streams live output (regression: post-promotion read EOF)" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "watch-stream");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // Park a watcher on a name that doesn't exist yet.
+    const pair = try makeSocketPair();
+    // Close explicitly at end (not via defer — avoids double close).
+
+    var conn: std.net.Server.Connection = .{
+        .stream = pair.local,
+        .address = undefined,
+    };
+    const watch_line = "{\"op\":\"watch\",\"session\":\"streamfoo\"}";
+    const result = try server_attach_mod.handleAttachConnection(
+        alloc,
+        &registry,
+        &conn,
+        watch_line,
+        true,
+    );
+    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
+
+    var reader = LineReader.init(alloc, pair.peer);
+    defer reader.deinit();
+
+    // Consume the waiting ack.
+    const ack = try reader.readLine(1000);
+    defer alloc.free(ack);
+
+    // Spawn the session running a shell that prints three lines with a
+    // short sleep between each. The spec's repro used 0.4s; we shrink to
+    // 0.1s to keep the test fast while still guaranteeing each line
+    // reaches the PTY as a separate output event.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "streamfoo",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "for i in 1 2 3; do echo L$i; sleep 0.1; done" },
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Start the drain ticker so PTY events reach the attach broadcast.
+    var ticker = RegistryTicker{ .registry = &registry };
+    try ticker.start();
+    defer ticker.stopAndJoin();
+
+    // Expect: `started` frame, then output frames containing L1/L2/L3.
+    // The first `output` frame is the initial snapshot (possibly blank);
+    // subsequent ones carry live PTY bytes. Rather than assume a precise
+    // frame count we drain frames until we've seen all three markers or
+    // the timeout expires.
+    const started = try reader.readLine(2000);
+    defer alloc.free(started);
+    {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, started, .{});
+        defer parsed.deinit();
+        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
+        try std.testing.expectEqualStrings("started", kind.string);
+    }
+
+    var saw_l1 = false;
+    var saw_l2 = false;
+    var saw_l3 = false;
+    // Generous per-frame timeout to tolerate loaded CI machines; the
+    // shell script takes ~0.3s to run to completion.
+    const total_deadline_ns = std.time.nanoTimestamp() + @as(i128, 3_000) * std.time.ns_per_ms;
+    while (!(saw_l1 and saw_l2 and saw_l3)) {
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns >= total_deadline_ns) break;
+        const remaining_ms: u64 = @intCast(@divTrunc(total_deadline_ns - now_ns, std.time.ns_per_ms));
+        const line = reader.readLine(@max(50, remaining_ms)) catch break;
+        defer alloc.free(line);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => continue,
+        };
+        const kind = obj.get("kind") orelse continue;
+        if (kind != .string) continue;
+        if (!std.mem.eql(u8, kind.string, "output")) continue;
+        const hex_val = obj.get("bytes_hex") orelse continue;
+        if (hex_val != .string) continue;
+        const bytes = hex.decodeHex(alloc, hex_val.string) catch continue;
+        defer alloc.free(bytes);
+        if (std.mem.indexOf(u8, bytes, "L1") != null) saw_l1 = true;
+        if (std.mem.indexOf(u8, bytes, "L2") != null) saw_l2 = true;
+        if (std.mem.indexOf(u8, bytes, "L3") != null) saw_l3 = true;
+    }
+
+    try std.testing.expect(saw_l1);
+    try std.testing.expect(saw_l2);
+    try std.testing.expect(saw_l3);
+
+    // Tear down.
+    pair.peer.close();
+    const sess = try sessionByName(&registry, "streamfoo");
+    var waited_ms: u32 = 0;
+    while (waited_ms < 1000) {
+        var any_open = false;
+        sess.attach_mutex.lock();
+        for (sess.attach_clients.items) |client| {
+            if (!client.isClosed()) any_open = true;
+        }
+        sess.attach_mutex.unlock();
+        if (!any_open) break;
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        waited_ms += 10;
+    }
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "streamfoo" });
         defer kill_parsed.deinit();
         _ = try expectTestOk(kill_parsed);
     }
