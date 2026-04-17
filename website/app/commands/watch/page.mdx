@@ -4,6 +4,8 @@ Connect to a running session and render its terminal screen in real time inside 
 
 Multiple terminals can watch the same session simultaneously without any coordination required.
 
+If you pass a `--name` that doesn't exist yet, `watch` will block and start streaming the moment a later `hty run --name <that-name>` spawns the session. This makes "launch a watcher first, then kick off the command" scripts reliable without polling.
+
 ## Reference
 
 <HelpBlock cmd="watch" />
@@ -16,6 +18,10 @@ hty run --name demo -- vim /tmp/notes.txt
 
 # Terminal B: observe it live
 hty watch demo
+
+# Or the other way around — start the watcher first, then spawn
+hty watch demo &          # blocks until "demo" exists
+hty run --name demo -- vim /tmp/notes.txt
 ```
 
 <Callout type="info">

@@ -30,6 +30,29 @@ hty replay abc12345
 
 The replay renders at roughly the same speed as the original session. Press `Ctrl+C` to stop at any point. The replay has no side effects — no programs are re-run, and no files are modified.
 
+## Exporting to asciinema, GIF, or MP4
+
+`hty replay` is the right tool for re-watching a session locally. When you want a **portable artifact** — something you can attach to a bug report, embed in docs, or hand to someone who doesn't have hty installed — use `hty export`:
+
+```sh
+# Asciinema v2 .cast (the native asciinema format)
+hty export my-session --format asciicast > run.cast
+
+# Play it back with asciinema
+asciinema play run.cast
+
+# Render to a GIF with agg (reads .cast directly)
+agg run.cast run.gif
+
+# Convert the GIF to MP4 with ffmpeg
+ffmpeg -i run.gif run.mp4
+
+# Upload to asciinema.org
+asciinema upload run.cast
+```
+
+A `.cast` is an exact transcription of the session's output and resize events. Input keystrokes are included as `"i"` frames with bursts coalesced — most players ignore them during playback (spec-correct), but any downstream tool that wants to surface agent keystrokes has the data. Because export reads the on-disk log, it works on exited sessions just as well as running ones.
+
 ## Inspecting the event log
 
 `hty logs` prints the raw JSONL event stream for a session. Each line is a self-contained JSON object with a `t` field (Unix timestamp in milliseconds) and a `kind` field:

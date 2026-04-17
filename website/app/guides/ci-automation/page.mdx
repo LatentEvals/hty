@@ -4,51 +4,43 @@ Some programs require interactive input even in CI — they prompt for confirmat
 
 ## Basic CI pattern
 
-Run the program, wait for each prompt, send the expected input, confirm success, and clean up:
+A CI script that drives an interactive program is a sequence of "wait for this prompt, type that response." hty's fused `--snapshot --wait-until-*` flags collapse each pair into a single command, which keeps the script linear and easy to read:
 
 ```sh
 #!/usr/bin/env bash
 set -e
 
 # Clean up the session when the script exits (success or failure)
-trap 'hty delete auth-flow 2>/dev/null || true' EXIT
+trap 'hty kill auth-flow --delete 2>/dev/null || true' EXIT
 
-# Start the interactive program
-hty run --name auth-flow -- gh auth login
+# Launch gh auth login and wait for the first prompt
+hty run --name auth-flow --snapshot \
+  --wait-until-text "What account" --timeout 10000 \
+  -- gh auth login
 
-# Wait for the "What account do you want to log into?" prompt
-hty wait auth-flow --text "What account" --timeout 10000
+# Select GitHub.com (Enter), wait for the authentication method prompt
+hty send auth-flow --key enter --snapshot \
+  --wait-until-text "How would you like to authenticate" --timeout 5000
 
-# Select GitHub.com (send Enter to accept the default)
-hty send auth-flow --text "\n"
+# Choose "Paste an authentication token", wait for the token prompt
+hty send auth-flow --text "2\n" --snapshot \
+  --wait-until-text "Paste your authentication token" --timeout 5000
 
-# Wait for the authentication method prompt
-hty wait auth-flow --text "How would you like to authenticate" --timeout 5000
-
-# Choose "Paste an authentication token"
-hty send auth-flow --text "2\n"
-
-# Wait for the token prompt
-hty wait auth-flow --text "Paste your authentication token" --timeout 5000
-
-# Send the token
-hty send auth-flow --text "${GITHUB_TOKEN}\n"
-
-# Wait for the program to exit
-hty wait auth-flow --exit --timeout 15000
+# Send the token and wait for the program to exit
+hty send auth-flow --text "${GITHUB_TOKEN}\n" --wait-until-exit --timeout 15000
 ```
 
-The `trap` at the top ensures the session is always cleaned up, even if the script exits early due to `set -e`.
+The `trap` at the top ensures the session is always cleaned up, even if the script exits early due to `set -e`. `hty kill --delete` terminates the process **and** removes the record + log in one shot, which is almost always what you want in CI.
 
 ## Handling failures
 
-When a wait times out, `hty wait` exits with code `3`. Capture the screen at that moment so you have a record of what the program was showing:
+When a wait times out, `hty wait` (and the fused form) exits with code `3`. Capture the screen at that moment so you have a record of what the program was showing:
 
 ```sh
 if ! hty wait session --text "Success" --timeout 30000; then
   echo "=== Session screen at failure ==="
-  hty snapshot session | jq -r '.snapshot.buffer'
-  hty delete session
+  hty snapshot session --json | jq -r '.snapshot.buffer'
+  hty kill session --delete
   exit 1
 fi
 ```
@@ -62,26 +54,38 @@ Always delete sessions when you're done in CI. Sessions persist in the hty serve
 Use a `trap` to guarantee cleanup regardless of how the script exits:
 
 ```sh
-trap 'hty delete my-session 2>/dev/null || true' EXIT
+trap 'hty kill my-session --delete 2>/dev/null || true' EXIT
 hty run --name my-session -- my-interactive-program
 ```
 
 <Callout type="info">
 The hty server auto-shuts-down 10 seconds after all running sessions end. You don't need to stop or clean up the server daemon in CI — it exits on its own once your sessions are gone.
 </Callout>
-## Capturing logs for debugging
 
-Every hty session is automatically logged. Save the log as a CI artifact for a complete record:
+## Capturing artifacts for debugging
+
+Every hty session is recorded. You can save that recording in two complementary formats depending on what you need.
+
+**Raw event log.** The JSONL log is the canonical source of truth — every byte in, every byte out, with timestamps. Best for programmatic post-mortems:
 
 ```sh
 hty logs my-session > session.jsonl
+
+# Find the exit code
+hty logs my-session | jq 'select(.kind == "exited")'
 ```
 
-Filter with `jq` to find specific events:
+**Asciinema `.cast`.** For a human-watchable artifact, export to asciinema v2:
 
 ```sh
-# Find when the program exited and what code it returned
-hty logs my-session | jq 'select(.kind == "exited")'
+hty export my-session --format asciicast > session.cast
+```
+
+A `.cast` file plays back in `asciinema play`, renders to a GIF with [`agg`](https://github.com/asciinema/agg), and embeds inline in tools that support asciinema — including PR comments via `asciinema upload`. Uploading the `.cast` as a CI artifact lets reviewers *watch* what happened, which is dramatically more useful than scrolling JSONL when triaging a flaky interactive test.
+
+```sh
+# GIF for a PR comment or a dashboard
+hty export my-session --format asciicast | agg - run.gif
 ```
 
 <Callout type="info">

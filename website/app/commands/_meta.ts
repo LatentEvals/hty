@@ -10,5 +10,7 @@ export default {
   replay: 'replay',
   watch: 'watch',
   attach: 'attach',
-  keys: 'keys'
+  keys: 'keys',
+  info: 'info',
+  export: 'export',
 }

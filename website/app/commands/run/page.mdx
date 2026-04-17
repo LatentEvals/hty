@@ -19,6 +19,38 @@ hty run --name my-vim --rows 40 --cols 120 -- vim /tmp/notes.txt
 hty run --name build --cwd /my/project -- npm test
 ```
 
+## Fused run + wait + snapshot
+
+For agent workflows that want "start the program, wait until it's ready, give me the first screen" in a single call, combine `--snapshot` with a `--wait-*` flag:
+
+```sh
+# Launch create-next-app, wait for it to settle, and return the first prompt
+hty run --name app --snapshot --wait-until-idle -- \
+  npx create-next-app my-app
+
+# Launch a script and wait for a specific line before reading
+hty run --name install --snapshot --wait-until-text "Finished" --timeout 60000 -- \
+  ./install.sh
+
+# Launch a quick command and wait for it to exit
+hty run --snapshot --wait-until-exit -- echo hello
+```
+
+| Flag | Effect |
+|------|--------|
+| `--snapshot` | Include the post-spawn screen in the response. Requires one of the `--wait-*` flags below. |
+| `--wait-duration DUR` | Sleep DUR after spawn, then snapshot. |
+| `--wait-until-idle [MS]` | Wait until the screen has been quiet for MS ms (default 100). |
+| `--wait-until-text STR` | Wait until STR appears in the rendered buffer. |
+| `--wait-until-regex RE` | Wait until RE (POSIX extended) matches. |
+| `--wait-until-exit` | Wait until the child exits. |
+| `--timeout DUR` | Cap on any `--wait-until-*` (default 30s; 0 = no cap). |
+| `--ansi` | With `--snapshot`, return the styled ANSI rendering instead of plain text. |
+
 <Callout type="info">
 The `--` separator is required when passing arguments to the program. Without it, hty cannot distinguish its own flags from the program's arguments.
+</Callout>
+
+<Callout type="info">
+`-d` / `--detach` is accepted as a no-op — every `hty run` session is detached by default. Use `hty attach` for an interactive view.
 </Callout>

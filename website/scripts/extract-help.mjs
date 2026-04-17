@@ -33,6 +33,7 @@ const websiteCommands = new Set([
   'attach',
   'keys',
   'info',
+  'export',
 ])
 
 function extractHelp(source) {
