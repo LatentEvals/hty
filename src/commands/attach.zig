@@ -48,9 +48,17 @@ fn attachSigwinchHandler(_: i32) callconv(.c) void {
 /// Shared state between the attach main thread and its reader thread.
 /// The reader owns the socket read half; the main thread owns the write
 /// half and the stdin loop.
+///
+/// `waiting` / `started` implement the pre-creation handshake: when the
+/// server acks with `waiting:true`, the main thread stays out of raw
+/// mode and the reader flips `started` as soon as it sees the
+/// `{"kind":"started"}` frame. Once that happens, the main thread
+/// installs raw mode / SIGWINCH and falls into the regular input loop.
 const AttachClientState = struct {
     stream: std.net.Stream,
     done: std.atomic.Value(bool) = .init(false),
+    waiting: std.atomic.Value(bool) = .init(false),
+    started: std.atomic.Value(bool) = .init(false),
 };
 
 pub fn run(alloc: Allocator, args: []const []const u8) !void {
@@ -121,6 +129,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     }
     const nl = std.mem.indexOfScalar(u8, ack_buf.items, '\n').?;
     const ack_line = ack_buf.items[0..nl];
+    var is_waiting = false;
     {
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, ack_line, .{}) catch {
             stream.close();
@@ -150,6 +159,9 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             try common.printErrFmt("hty attach: {s}", .{err_msg});
             std.process.exit(common.ExitCode.not_found);
         }
+        if (obj.get("waiting")) |w| {
+            if (w == .bool) is_waiting = w.bool;
+        }
     }
 
     // Any bytes that arrived on the socket after the ack's '\n' are early
@@ -160,7 +172,71 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         &[_]u8{};
     defer if (preload.len > 0) alloc.free(preload);
 
-    // Setup alt-screen + raw mode.
+    // Shared state + reader thread. The reader owns the socket read half
+    // from this point on, both during the pre-creation waiting phase (if
+    // any) and during the full interactive phase below.
+    var shared = AttachClientState{ .stream = stream };
+    if (is_waiting) shared.waiting.store(true, .release);
+    const reader_thread = std.Thread.spawn(.{}, attachClientReaderLoop, .{ alloc, &shared, preload }) catch {
+        stream.close();
+        try common.printErr("hty attach: failed to spawn reader thread");
+        std.process.exit(common.ExitCode.generic);
+    };
+
+    // Waiting phase: the server parked us pending session creation. Stay
+    // out of raw mode and SIGWINCH so accidental keys don't wind up
+    // anywhere interesting, and so the terminal isn't stranded if the
+    // user Ctrl-Cs out. Paint a status line and poll stdin for Ctrl-C.
+    // When the reader observes `{"kind":"started"}` it flips
+    // `shared.started` and the loop below drops through to the
+    // interactive setup.
+    if (is_waiting) {
+        const display = session_ref orelse "";
+        watch.paintWaitingFrame(stdout_fd, display);
+
+        var wbuf: [32]u8 = undefined;
+        while (!shared.done.load(.acquire) and !shared.started.load(.acquire)) {
+            if (stdin_is_tty) {
+                var pfd: c.pollfd = .{ .fd = stdin_fd, .events = c.POLLIN, .revents = 0 };
+                const nr = c.poll(&pfd, 1, 25);
+                if (nr > 0 and (pfd.revents & c.POLLIN) != 0) {
+                    const n = std.posix.read(stdin_fd, &wbuf) catch 0;
+                    var cancel = false;
+                    for (wbuf[0..n]) |b| {
+                        if (b == 0x03) { // Ctrl-C
+                            cancel = true;
+                            break;
+                        }
+                    }
+                    if (cancel) {
+                        shared.done.store(true, .release);
+                        _ = stream.writeAll("{\"op\":\"detach\"}\n") catch {};
+                        std.posix.shutdown(stream.handle, .both) catch {};
+                        reader_thread.join();
+                        stream.close();
+                        return;
+                    }
+                }
+            } else {
+                std.Thread.sleep(25 * std.time.ns_per_ms);
+            }
+        }
+
+        // If the reader flipped done without started, the socket died
+        // during the wait (server hung up, etc.). Bail cleanly.
+        if (!shared.started.load(.acquire)) {
+            reader_thread.join();
+            stream.close();
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Interactive phase begins here. Either we skipped the waiting phase
+    // (normal attach to an existing session) or we just got promoted.
+    // Flip the terminal into raw mode and install SIGWINCH.
+    // ------------------------------------------------------------------
+
     try watch.enterAltScreen(stdout_fd);
     defer watch.leaveAltScreen(stdout_fd);
 
@@ -201,13 +277,23 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         std.posix.sigaction(std.c.SIG.WINCH, &sa_reset, null);
     }
 
-    // Shared state + reader thread.
-    var shared = AttachClientState{ .stream = stream };
-    const reader_thread = std.Thread.spawn(.{}, attachClientReaderLoop, .{ alloc, &shared, preload }) catch {
-        stream.close();
-        try common.printErr("hty attach: failed to spawn reader thread");
-        std.process.exit(common.ExitCode.generic);
-    };
+    // If we came through the waiting phase, the server's PTY is the size
+    // it was spawned with, not our terminal's. Send an initial resize so
+    // the session matches what the user sees. Also read our current
+    // dimensions in case the user resized during the wait.
+    if (is_waiting) {
+        var ws = std.mem.zeroes(c.winsize);
+        if (stdin_is_tty) _ = c.ioctl(stdout_fd, c.TIOCGWINSZ, &ws);
+        const r: u16 = if (ws.ws_row > 0) ws.ws_row else init_rows;
+        const co: u16 = if (ws.ws_col > 0) ws.ws_col else init_cols;
+        const frame = std.fmt.allocPrint(
+            alloc,
+            "{{\"op\":\"resize\",\"rows\":{d},\"cols\":{d}}}\n",
+            .{ r, co },
+        ) catch "";
+        defer if (frame.len > 0) alloc.free(frame);
+        if (frame.len > 0) stream.writeAll(frame) catch {};
+    }
 
     // Main loop: forward stdin into input frames with a Ctrl-A detach state
     // machine, watch for SIGWINCH to emit resize frames, and bail out if
@@ -349,6 +435,17 @@ fn handleAttachServerFrame(
     const kind_val = obj.get("kind") orelse return;
     if (kind_val != .string) return;
     const kind = kind_val.string;
+
+    if (std.mem.eql(u8, kind, "started")) {
+        // Promotion signal. Clear the "Waiting…" paint so the main
+        // thread's alt-screen enter lands on a blank canvas.
+        shared.started.store(true, .release);
+        if (shared.waiting.load(.acquire)) {
+            shared.waiting.store(false, .release);
+            _ = std.posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
+        }
+        return;
+    }
 
     if (std.mem.eql(u8, kind, "output")) {
         const hex_val = obj.get("bytes_hex") orelse return;

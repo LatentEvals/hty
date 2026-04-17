@@ -269,12 +269,14 @@ pub fn handleConnection(
         return .done;
     }
 
-    // Peek at the op without consuming arena state; attach needs a
-    // different lifecycle (keep the connection open, spawn a reader
-    // thread) so we branch here before the normal RPC dispatch.
-    const is_attach = detectAttachOp(alloc, line);
-    if (is_attach) {
-        return handleAttachConnection(alloc, registry, conn, line);
+    // Peek at the op without consuming arena state; attach and watch
+    // need a different lifecycle (keep the connection open, spawn a
+    // reader thread) so we branch here before the normal RPC dispatch.
+    // Watch is the read-only variant; both share handleAttachConnection.
+    switch (detectAttachOp(alloc, line)) {
+        .attach => return handleAttachConnection(alloc, registry, conn, line, false),
+        .watch => return handleAttachConnection(alloc, registry, conn, line, true),
+        .none => {},
     }
 
     const response = try processRequestLine(alloc, registry, line);
