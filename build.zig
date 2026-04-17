@@ -124,8 +124,17 @@ pub fn build(b: *std.Build) void {
     headless.root_module.addOptions("build_info", build_info_options);
     b.installArtifact(headless);
 
+    // Custom test runner filters `.stream`-scoped warn logs from the
+    // bundled ghostty-vt parser (see #6). Identical to Zig's default
+    // runner in all other respects.
+    const test_runner: std.Build.Step.Compile.TestRunner = .{
+        .path = b.path("src/test_runner.zig"),
+        .mode = .server,
+    };
+
     const unit_tests = b.addTest(.{
         .root_module = lib_mod,
+        .test_runner = test_runner,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
@@ -140,6 +149,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "hty", .module = lib_mod },
             },
         }),
+        .test_runner = test_runner,
     });
     headless_tests.root_module.addCSourceFile(.{ .file = b.path("src/regex_helper.c") });
     headless_tests.root_module.addOptions("build_info", build_info_options);
@@ -159,6 +169,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "hty", .module = lib_mod },
             },
         }),
+        .test_runner = test_runner,
     });
     const run_golden_tests = b.addRunArtifact(golden_tests);
     run_golden_tests.setCwd(b.path("."));
@@ -178,6 +189,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "hty", .module = lib_mod },
             },
         }),
+        .test_runner = test_runner,
     });
     const run_fixture_tests = b.addRunArtifact(fixture_tests);
     run_fixture_tests.setCwd(b.path("."));
