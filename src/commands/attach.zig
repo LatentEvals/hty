@@ -64,6 +64,16 @@ const AttachClientState = struct {
     /// exit code. Unset (null) means we detached cleanly or the server
     /// hung up without reporting an exit.
     exit_code: std.atomic.Value(i32) = .init(std.math.minInt(i32)),
+    /// If true, the reader loop drops the very first `output` frame it
+    /// sees (the server's initial screen snapshot). Subsequent output
+    /// frames carrying actual child output are streamed normally. Used
+    /// by `hty run --attach` on non-TTY stdout so captured pipelines
+    /// don't start with a screenful of ANSI-styled blank rows.
+    suppress_initial_snapshot: bool = false,
+    /// Mutable flag tracked alongside `suppress_initial_snapshot`. Once
+    /// the first output frame has been observed (and dropped), this
+    /// flips to false and subsequent output frames pass through.
+    initial_snapshot_pending: std.atomic.Value(bool) = .init(false),
 
     pub fn getExitCode(self: *AttachClientState) ?i32 {
         const v = self.exit_code.load(.acquire);
@@ -461,6 +471,13 @@ fn handleAttachServerFrame(
     if (std.mem.eql(u8, kind, "output")) {
         const hex_val = obj.get("bytes_hex") orelse return;
         if (hex_val != .string) return;
+        // Drop the server's initial screen snapshot for callers that
+        // opted in (e.g. `hty run --attach` on non-TTY stdout). The
+        // snapshot is always the first output frame emitted right after
+        // the ack; every frame after it is real child output.
+        if (shared.initial_snapshot_pending.swap(false, .acq_rel)) {
+            return;
+        }
         const bytes = hex.decodeHex(alloc, hex_val.string) catch return;
         defer alloc.free(bytes);
         _ = std.posix.write(stdout_fd, bytes) catch {};
@@ -503,6 +520,11 @@ pub const InteractiveOptions = struct {
     /// in-loop SIGWINCH comparison.
     init_rows: u16 = 24,
     init_cols: u16 = 80,
+    /// If true, the reader loop drops the server's initial screen
+    /// snapshot (emitted right after the attach ack). `run --attach`
+    /// sets this on non-TTY stdout so piped output isn't prefixed with
+    /// a screenful of ANSI-styled blank rows.
+    suppress_initial_snapshot: bool = false,
 };
 
 /// Run the interactive phase of an attach on an already-ack'd stream.
@@ -524,6 +546,11 @@ pub fn runInteractive(
     const stdin_is_tty = std.posix.isatty(stdin_fd);
     const stdout_is_tty = std.posix.isatty(stdout_fd);
     const use_alt = opts.use_alt_screen and stdout_is_tty;
+
+    if (opts.suppress_initial_snapshot) {
+        shared.suppress_initial_snapshot = true;
+        shared.initial_snapshot_pending.store(true, .release);
+    }
 
     const reader_thread = std.Thread.spawn(
         .{},
@@ -760,12 +787,14 @@ pub fn attachToExistingSession(
     defer if (preload.len > 0) alloc.free(preload);
 
     var shared = AttachClientState{ .stream = stream };
+    const stdout_is_tty = std.posix.isatty(std.posix.STDOUT_FILENO);
     try runInteractive(alloc, &shared, .{
         .preload = preload,
         .send_initial_resize = false,
         .use_alt_screen = true,
         .init_rows = init_rows,
         .init_cols = init_cols,
+        .suppress_initial_snapshot = !stdout_is_tty,
     });
 
     const code = shared.getExitCode();
