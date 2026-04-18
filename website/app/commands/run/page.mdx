@@ -54,3 +54,31 @@ The `--` separator is required when passing arguments to the program. Without it
 <Callout type="info">
 `-d` / `--detach` is accepted as a no-op — every `hty run` session is detached by default. Use `hty attach` for an interactive view.
 </Callout>
+
+## Auto-cleanup with `--remove`
+
+By default, an exited `hty run` session lingers in the registry as a "zombie" record so `hty list`, `hty logs`, and `hty replay` keep working on it until you run `hty delete`. That's the right behavior for sessions you want to inspect after the fact — but it's a leak for one-shot invocations (migrations, test scripts, throwaway agent calls) where you will never look at the record again.
+
+Pass `--remove` to tie the session's lifetime to the child process. The moment the child exits — whether it succeeded, failed, was signalled, or was terminated by `hty kill` — the session is automatically deleted from the registry and its log file is removed from disk. No zombies, no follow-up `hty delete`.
+
+```sh
+# One-shot migration: session disappears from `hty list` as soon as the script ends.
+hty run --remove -- ./migrate.sh
+
+# Combine with --wait-until-exit to block until the child exits; on return the
+# session is already gone. Exit code propagates from the child.
+hty run --remove --wait-until-exit -- sh -c 'exit 7'
+echo $?  # 7
+
+# While the child is still running, `hty list` shows the session normally —
+# auto-removal only fires after the child exits.
+hty run --remove --name long -- sleep 60
+hty list        # shows "long" while sleep is running
+# …sleep exits after 60s, then a subsequent `hty list` is empty.
+```
+
+Running `hty kill` on a `--remove` session still works as expected: the session terminates, the auto-remove sweep reaps the record shortly after, and the two paths don't race.
+
+<Callout type="info">
+`--remove` is especially useful in AI agent workflows. Agents routinely forget to `hty kill` sessions once they've finished reading the last screen; over time the registry fills with stale entries. Adding `--remove` to every `hty run` the agent issues makes the leak structurally impossible.
+</Callout>

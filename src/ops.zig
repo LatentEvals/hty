@@ -70,6 +70,11 @@ pub fn handleSpawn(
     const emit_raw_bytes = true;
     const emit_screen_updates = try readOptionalBool(object, "emit_screen_updates", true);
     const name = try readOptionalString(object, "name");
+    // Opt-in: when true, the drain-loop auto-removes this session once
+    // its child exits (success, failure, or signal). Wired up by
+    // `hty run --remove`. Default false preserves the historical
+    // "sessions linger after exit until `hty delete`" behavior.
+    const remove_on_exit = try readOptionalBool(object, "remove", false);
 
     const terminal = try hty.InteractiveTerminal.spawn(
         registry.alloc,
@@ -99,6 +104,7 @@ pub fn handleSpawn(
     errdefer if (name_owned) |n| registry.alloc.free(n);
 
     const sess = try registry.create(terminal, program_owned, args_joined_owned, name_owned);
+    sess.remove_on_exit = remove_on_exit;
 
     openSessionLog(arena, registry.log_dir, sess, program, args, rows, cols);
 
@@ -739,6 +745,10 @@ pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, 
         closeLogFile(sess);
         sess.terminal.kill() catch {};
         sess.setStatus(.killed);
+        // Stamp the terminal timestamp so the drain-loop auto-remove
+        // sweep can reap this session if it was spawned with `--remove`.
+        // A no-op for sessions without `remove_on_exit`.
+        sess.markTerminal(std.time.milliTimestamp());
         // Name stays reserved — the session record is still browsable and
         // replayable until explicitly removed with `hty delete`.
     }
