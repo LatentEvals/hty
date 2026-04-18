@@ -52,8 +52,30 @@ The `--` separator is required when passing arguments to the program. Without it
 </Callout>
 
 <Callout type="info">
-`-d` / `--detach` is accepted as a no-op — every `hty run` session is detached by default. Use `hty attach` for an interactive view.
+`--detach` is accepted as a no-op — every `hty run` session is detached by default. The old `-d` short form was removed; use the long `--detach`, or pass [`--attach`](#foreground-with---attach) to spawn and attach in one go.
 </Callout>
+
+## Foreground with `--attach`
+
+`--attach` spawns the session and immediately attaches to it, just like `hty attach` would — your terminal goes into raw mode, stdin is forwarded into the PTY, output streams back to stdout, and `Ctrl-A d` detaches. On clean exit, the child's exit status becomes the `hty run` exit status.
+
+```sh
+# One-shot: edit a file interactively. Ctrl-A d detaches, session persists.
+hty run --attach -- vim /tmp/notes.txt
+
+# One-shot with auto-cleanup: run, print output, remove the session when done.
+hty run --attach --remove -- bash -c 'echo hello'
+
+# Handy for agents with background-process support (Claude Code, etc.):
+# background the invocation and read the harness's streaming stdout — no
+# polling, no `hty snapshot` loop, and `--remove` ties the session's
+# lifetime to the backgrounded shell.
+hty run --attach --remove -- npm test &
+```
+
+`--attach` is mutually exclusive with `--snapshot` and every `--wait-until-*` flag (including `--wait-duration`) — the fused wait/snapshot path and the interactive attach loop have no meaningful combination. Pass one or the other.
+
+See [`hty attach`](/commands/attach) for the detach keybinds and multi-client behavior. All of that applies to `run --attach` too.
 
 ## Auto-cleanup with `--remove`
 

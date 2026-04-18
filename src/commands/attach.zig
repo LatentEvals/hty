@@ -59,6 +59,17 @@ const AttachClientState = struct {
     done: std.atomic.Value(bool) = .init(false),
     waiting: std.atomic.Value(bool) = .init(false),
     started: std.atomic.Value(bool) = .init(false),
+    /// Set when a `{"kind":"exited","code":N}` frame is observed. Allows
+    /// `hty run --attach` to propagate the child's status as its own
+    /// exit code. Unset (null) means we detached cleanly or the server
+    /// hung up without reporting an exit.
+    exit_code: std.atomic.Value(i32) = .init(std.math.minInt(i32)),
+
+    pub fn getExitCode(self: *AttachClientState) ?i32 {
+        const v = self.exit_code.load(.acquire);
+        if (v == std.math.minInt(i32)) return null;
+        return v;
+    }
 };
 
 pub fn run(alloc: Allocator, args: []const []const u8) !void {
@@ -457,7 +468,307 @@ fn handleAttachServerFrame(
     }
 
     if (std.mem.eql(u8, kind, "exited")) {
+        if (obj.get("code")) |cv| {
+            if (cv == .integer) {
+                const code: i32 = @intCast(cv.integer);
+                shared.exit_code.store(code, .release);
+            }
+        }
         shared.done.store(true, .release);
         return;
     }
+}
+
+/// Options for the interactive attach phase when an attach ack has
+/// already been received on `stream` and the server is streaming
+/// frames. Used by both `hty attach` (after its own waiting-phase
+/// handshake) and `hty run --attach` (which hands off a fresh session).
+pub const InteractiveOptions = struct {
+    /// Any bytes that arrived on the socket between the ack's '\n' and
+    /// our handoff point. Ownership is transferred to the reader thread
+    /// (freed via alloc.free once consumed). Pass &[_]u8{} if none.
+    preload: []const u8 = &[_]u8{},
+    /// If true, send an initial resize frame using the caller's current
+    /// terminal dimensions. `hty attach` uses this after being promoted
+    /// out of a waiting-phase handshake; `run --attach` sets it to false
+    /// because the spawn request already pinned the PTY dimensions.
+    send_initial_resize: bool = false,
+    /// If true, use the alt-screen for the interactive session (saves
+    /// the user's scrollback). `hty attach` always uses alt-screen;
+    /// `run --attach` skips it on non-TTY stdout so captured output
+    /// (tests, pipes) contains just the raw program output.
+    use_alt_screen: bool = true,
+    /// Initial rows/cols used for the first resize frame if
+    /// `send_initial_resize` is set. Also used as the baseline for the
+    /// in-loop SIGWINCH comparison.
+    init_rows: u16 = 24,
+    init_cols: u16 = 80,
+};
+
+/// Run the interactive phase of an attach on an already-ack'd stream.
+/// This is shared by `hty attach` (normal path and waiting-promotion
+/// path) and `hty run --attach`. On return, the caller owns
+/// `shared.exit_code` (null = detached, i32 = child exit code) and is
+/// responsible for closing the stream / joining any reader thread.
+///
+/// The function spawns the reader thread internally, joins it before
+/// returning, and does NOT close the stream (the caller may still want
+/// to send a final `detach` op).
+pub fn runInteractive(
+    alloc: Allocator,
+    shared: *AttachClientState,
+    opts: InteractiveOptions,
+) !void {
+    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdout_fd = std.posix.STDOUT_FILENO;
+    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    const stdout_is_tty = std.posix.isatty(stdout_fd);
+    const use_alt = opts.use_alt_screen and stdout_is_tty;
+
+    const reader_thread = std.Thread.spawn(
+        .{},
+        attachClientReaderLoop,
+        .{ alloc, shared, opts.preload },
+    ) catch {
+        try common.printErr("hty attach: failed to spawn reader thread");
+        std.process.exit(common.ExitCode.generic);
+    };
+
+    if (use_alt) {
+        try watch.enterAltScreen(stdout_fd);
+    }
+    defer if (use_alt) watch.leaveAltScreen(stdout_fd);
+
+    const saved_termios: ?std.posix.termios = if (stdin_is_tty)
+        std.posix.tcgetattr(stdin_fd) catch null
+    else
+        null;
+    if (saved_termios) |st| {
+        var raw = st;
+        raw.iflag.BRKINT = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.INPCK = false;
+        raw.iflag.ISTRIP = false;
+        raw.iflag.IXON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.IEXTEN = false;
+        raw.lflag.ISIG = false;
+        raw.cc[@intFromEnum(std.c.V.MIN)] = 0;
+        raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
+        std.posix.tcsetattr(stdin_fd, .FLUSH, raw) catch {};
+    }
+    defer if (saved_termios) |st| std.posix.tcsetattr(stdin_fd, .FLUSH, st) catch {};
+
+    var sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = attachSigwinchHandler },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.c.SIG.WINCH, &sa, null);
+    defer {
+        var sa_reset: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.mem.zeroes(std.posix.sigset_t),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.c.SIG.WINCH, &sa_reset, null);
+    }
+
+    if (opts.send_initial_resize) {
+        var ws = std.mem.zeroes(c.winsize);
+        if (stdin_is_tty) _ = c.ioctl(stdout_fd, c.TIOCGWINSZ, &ws);
+        const r: u16 = if (ws.ws_row > 0) ws.ws_row else opts.init_rows;
+        const co: u16 = if (ws.ws_col > 0) ws.ws_col else opts.init_cols;
+        const frame = std.fmt.allocPrint(
+            alloc,
+            "{{\"op\":\"resize\",\"rows\":{d},\"cols\":{d}}}\n",
+            .{ r, co },
+        ) catch "";
+        defer if (frame.len > 0) alloc.free(frame);
+        if (frame.len > 0) shared.stream.writeAll(frame) catch {};
+    }
+
+    var ctrl_a_pending = false;
+    var input_buf: [4096]u8 = undefined;
+    var cur_rows = opts.init_rows;
+    var cur_cols = opts.init_cols;
+
+    while (!shared.done.load(.acquire)) {
+        if (attach_resized.swap(false, .acq_rel)) {
+            var ws = std.mem.zeroes(c.winsize);
+            if (stdin_is_tty) _ = c.ioctl(stdout_fd, c.TIOCGWINSZ, &ws);
+            const new_rows: u16 = if (ws.ws_row > 0) ws.ws_row else cur_rows;
+            const new_cols: u16 = if (ws.ws_col > 0) ws.ws_col else cur_cols;
+            if (new_rows != cur_rows or new_cols != cur_cols) {
+                cur_rows = new_rows;
+                cur_cols = new_cols;
+                const frame = std.fmt.allocPrint(
+                    alloc,
+                    "{{\"op\":\"resize\",\"rows\":{d},\"cols\":{d}}}\n",
+                    .{ new_rows, new_cols },
+                ) catch continue;
+                defer alloc.free(frame);
+                shared.stream.writeAll(frame) catch break;
+            }
+        }
+
+        if (!stdin_is_tty) {
+            // No stdin to forward — just wait for the reader thread.
+            std.Thread.sleep(25 * std.time.ns_per_ms);
+            continue;
+        }
+
+        var pfd: c.pollfd = .{ .fd = stdin_fd, .events = c.POLLIN, .revents = 0 };
+        const nr = c.poll(&pfd, 1, 25);
+        if (nr <= 0) continue;
+        if ((pfd.revents & c.POLLIN) == 0) continue;
+
+        const n = std.posix.read(stdin_fd, &input_buf) catch break;
+        if (n == 0) break;
+
+        var passthrough = std.array_list.Managed(u8).init(alloc);
+        defer passthrough.deinit();
+        var detach = false;
+        for (input_buf[0..n]) |b| {
+            if (ctrl_a_pending) {
+                ctrl_a_pending = false;
+                if (b == 'd') {
+                    detach = true;
+                    break;
+                }
+                if (b == 0x01) {
+                    passthrough.append(0x01) catch break;
+                    continue;
+                }
+                passthrough.append(0x01) catch break;
+                passthrough.append(b) catch break;
+                continue;
+            }
+            if (b == 0x01) {
+                ctrl_a_pending = true;
+                continue;
+            }
+            passthrough.append(b) catch break;
+        }
+
+        if (passthrough.items.len > 0) {
+            const hex_str = hex.encodeHex(alloc, passthrough.items) catch continue;
+            defer alloc.free(hex_str);
+            const frame = std.fmt.allocPrint(
+                alloc,
+                "{{\"op\":\"input\",\"bytes_hex\":\"{s}\"}}\n",
+                .{hex_str},
+            ) catch continue;
+            defer alloc.free(frame);
+            shared.stream.writeAll(frame) catch break;
+        }
+
+        if (detach) break;
+    }
+
+    shared.done.store(true, .release);
+    _ = shared.stream.writeAll("{\"op\":\"detach\"}\n") catch {};
+    std.posix.shutdown(shared.stream.handle, .both) catch {};
+    reader_thread.join();
+}
+
+/// Helper for `hty run --attach`: given a freshly-spawned session's id,
+/// open a new server connection, send an attach request, read the ack,
+/// and run the interactive phase. Returns the child's exit code if the
+/// session exited while attached, null if the user detached.
+pub fn attachToExistingSession(
+    alloc: Allocator,
+    session_id: []const u8,
+    init_rows: u16,
+    init_cols: u16,
+) !?i32 {
+    const socket_path = try paths.resolveSocketPath(alloc);
+    defer alloc.free(socket_path);
+
+    var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {
+        try common.printErr("hty run --attach: cannot connect to server");
+        std.process.exit(common.ExitCode.generic);
+    };
+
+    var request_buf = std.array_list.Managed(u8).init(alloc);
+    defer request_buf.deinit();
+    try request_buf.appendSlice("{\"op\":\"attach\",\"session\":");
+    try common.writeJsonString(request_buf.writer().any(), session_id);
+    try request_buf.writer().any().print(",\"rows\":{d},\"cols\":{d}}}\n", .{ init_rows, init_cols });
+    stream.writeAll(request_buf.items) catch {
+        stream.close();
+        try common.printErr("hty run --attach: failed to send attach request");
+        std.process.exit(common.ExitCode.generic);
+    };
+
+    // Read the attach ack line.
+    var ack_buf = std.array_list.Managed(u8).init(alloc);
+    defer ack_buf.deinit();
+    var ack_chunk: [512]u8 = undefined;
+    while (true) {
+        const n = stream.read(&ack_chunk) catch {
+            stream.close();
+            try common.printErr("hty run --attach: server hung up before ack");
+            std.process.exit(common.ExitCode.generic);
+        };
+        if (n == 0) {
+            stream.close();
+            try common.printErr("hty run --attach: server closed connection before ack");
+            std.process.exit(common.ExitCode.generic);
+        }
+        try ack_buf.appendSlice(ack_chunk[0..n]);
+        if (std.mem.indexOfScalar(u8, ack_buf.items, '\n') != null) break;
+    }
+    const nl = std.mem.indexOfScalar(u8, ack_buf.items, '\n').?;
+    const ack_line = ack_buf.items[0..nl];
+    {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, ack_line, .{}) catch {
+            stream.close();
+            try common.printErr("hty run --attach: malformed ack");
+            std.process.exit(common.ExitCode.generic);
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => {
+                stream.close();
+                try common.printErr("hty run --attach: malformed ack");
+                std.process.exit(common.ExitCode.generic);
+            },
+        };
+        const ok = obj.get("ok") orelse {
+            stream.close();
+            try common.printErr("hty run --attach: ack missing ok field");
+            std.process.exit(common.ExitCode.generic);
+        };
+        if (ok != .bool or !ok.bool) {
+            // Most likely SessionNotFound because --remove reaped a
+            // very short-lived child before we could attach. That's OK
+            // for `run --attach --remove -- echo hello` because the
+            // immediate `run` response already confirmed the spawn
+            // succeeded; just surface exit 0 and return.
+            stream.close();
+            return 0;
+        }
+    }
+
+    const preload: []u8 = if (nl + 1 < ack_buf.items.len)
+        try alloc.dupe(u8, ack_buf.items[nl + 1 ..])
+    else
+        &[_]u8{};
+    defer if (preload.len > 0) alloc.free(preload);
+
+    var shared = AttachClientState{ .stream = stream };
+    try runInteractive(alloc, &shared, .{
+        .preload = preload,
+        .send_initial_resize = false,
+        .use_alt_screen = true,
+        .init_rows = init_rows,
+        .init_cols = init_cols,
+    });
+
+    const code = shared.getExitCode();
+    stream.close();
+    return code;
 }

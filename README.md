@@ -81,6 +81,8 @@ The server auto-starts on first use and persists across invocations, so sessions
 
 For one-shot invocations where you don't want the session record to linger, pass `hty run --remove`: the session is automatically deleted from the registry the moment the child process exits (success, failure, or signal). Handy for migration scripts, test runs, and agent-driven wizards where "fire and forget" is the whole point.
 
+Want to spawn and attach in one call? `hty run --attach -- vim foo.txt` drops you straight into the session (streams output to stdout, forwards stdin with raw mode and SIGWINCH, `Ctrl-A d` to detach). Combine with `--remove` for a fully self-cleaning one-shot: `hty run --attach --remove -- npm test`.
+
 ## Features
 
 <table>

@@ -161,3 +161,17 @@ hty run --remove --name app --snapshot --wait-until-text "Ready" \
 ```
 
 With `--remove`, every short-lived tool call the agent makes cleans up after itself. Pair it with `--wait-until-exit` for the common "launch, wait for it to finish, read the final screen, move on" pattern — the agent gets the exit code and the last snapshot in one round-trip, and the session is gone by the time the next step runs. Keep sessions *without* `--remove` when you genuinely want the record to survive for later `hty replay` or `hty logs` inspection.
+
+## Streaming output with `run --attach`
+
+Harnesses that support backgrounded processes (Claude Code, Cursor, and friends) stream the background process's stdout straight to the model as it arrives — no polling, no missed frames. `hty run --attach` pairs naturally with that: it spawns a session, attaches to it, and writes the PTY's live output to stdout until the child exits.
+
+```sh
+# One-shot: foreground a command in a fresh PTY, tie the session's lifetime
+# to it, and block until it exits. Output streams live to the harness.
+hty run --attach --remove -- npm test
+```
+
+This is the recommended shape for agents that want to "watch a long command run" without writing a snapshot loop. Dropping `--remove` leaves the session in `hty list` afterwards so you can `hty replay` it; adding it makes the whole invocation fully self-cleaning.
+
+`--attach` is mutually exclusive with `--snapshot` / `--wait-until-*`; use one style or the other per call. Use fused `--snapshot` for "I want the final screen as JSON"; use `--attach` when you want the stream.

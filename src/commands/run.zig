@@ -5,10 +5,11 @@ const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
 const send_cmd = @import("send.zig");
+const attach_cmd = @import("attach.zig");
 
 pub fn helpText() []const u8 {
     return
-    \\hty run [--name NAME] [--rows N] [--cols N] [--cwd PATH] [--scrollback N] -- program [args...]
+    \\hty run [--name NAME] [--rows N] [--cols N] [--cwd PATH] [--scrollback N] [--attach] -- program [args...]
     \\
     \\Create a new session and start `program` inside a fresh PTY. The session
     \\is detached from your terminal; observe it with `hty watch` and drive it
@@ -20,11 +21,19 @@ pub fn helpText() []const u8 {
     \\  --cols N          Initial column count (default 80)
     \\  --cwd PATH        Child's working directory
     \\  --scrollback N    Scrollback buffer size (default 10000)
+    \\  --attach          Spawn + attach in one invocation. Streams PTY
+    \\                    output to stdout and forwards stdin into the
+    \\                    session, just like `hty attach`. Ctrl-A d
+    \\                    detaches (session persists unless --remove is
+    \\                    also set). Mutually exclusive with --snapshot
+    \\                    and any --wait-until-* flag.
     \\  --remove          Automatically remove the session from the registry
     \\                    once the child process exits (success, failure, or
     \\                    signal). Tied to child lifetime; off by default so
     \\                    sessions persist for `hty list` / `hty logs` /
-    \\                    `hty replay` until `hty delete`.
+    \\                    `hty replay` until `hty delete`. Pairs naturally
+    \\                    with --attach: `hty run --attach --remove -- ...`
+    \\                    is a one-shot "foreground a command in a PTY".
     \\
     \\Wait + snapshot flags (let `run` block until the program is ready and
     \\return the initial render in one round-trip):
@@ -39,12 +48,14 @@ pub fn helpText() []const u8 {
     \\  --timeout DUR             Cap on any --wait-until-* (default 30s; 0 = none).
     \\  --ansi                    With --snapshot, print styled ANSI rendering.
     \\
-    \\`-d` / `--detach` is accepted as a no-op — every `hty run` session is
-    \\detached by default. Use `hty attach` for an interactive view.
+    \\`--detach` is accepted as a no-op — every `hty run` session is
+    \\detached by default. Use `hty attach` afterwards, or `--attach`
+    \\on this invocation, for an interactive view.
     \\
     \\Example:
     \\  hty run --name debug-vim -- vim /tmp/foo.txt
     \\  hty run --name app --snapshot --wait-until-idle -- create-next-app my-app
+    \\  hty run --attach --remove -- bash -c 'echo hi'
     \\
     ;
 }
@@ -67,6 +78,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var wait_until_exit = false;
     var timeout_str: ?[]const u8 = null;
     var remove_on_exit = false;
+    var attach_flag = false;
 
     var i: usize = 0;
     var program_args_start: ?usize = null;
@@ -79,10 +91,13 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--name requires a value");
             name = args[i];
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--detach")) {
+        } else if (std.mem.eql(u8, arg, "--detach")) {
             // Accepted as a no-op — every `hty run` session is detached by
-            // default; use `hty attach` afterwards for an interactive
-            // bidirectional view.
+            // default; use `hty attach` afterwards (or `--attach` on the
+            // same invocation) for an interactive bidirectional view. The
+            // `-d` short form was removed in LatentEvals/hty#51.
+        } else if (std.mem.eql(u8, arg, "--attach")) {
+            attach_flag = true;
         } else if (std.mem.eql(u8, arg, "--rows")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--rows requires a value");
@@ -137,6 +152,13 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
+        } else if (std.mem.eql(u8, arg, "-d")) {
+            // Explicit rejection: the `-d` short form for `--detach` was
+            // removed in LatentEvals/hty#51. Without this branch, `-d`
+            // would be accepted as the program name. Point the user at
+            // the long form (which is still accepted as a no-op).
+            try common.printErr("unknown flag: -d (use --detach; the short form was removed)");
+            std.process.exit(common.ExitCode.generic);
         } else {
             // First positional = program, rest = args
             program_args_start = i;
@@ -150,6 +172,30 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     if (wait_until_text != null) wait_kind_count += 1;
     if (wait_until_regex != null) wait_kind_count += 1;
     if (wait_until_exit) wait_kind_count += 1;
+
+    // --attach is mutually exclusive with --snapshot and every --wait-until-*
+    // variant (including --wait-duration). Check these first so the user sees
+    // the "--attach conflicts with X" message instead of a downstream hint
+    // like "--snapshot almost always wants --wait-until-idle". See
+    // LatentEvals/hty#51.
+    if (attach_flag) {
+        if (snapshot_flag) {
+            try common.printErr("--attach is incompatible with --snapshot");
+            std.process.exit(common.ExitCode.generic);
+        }
+        if (wait_kind_count > 0) {
+            try common.printErr("--attach is incompatible with --wait-until-idle/--wait-until-text/--wait-until-regex/--wait-until-exit");
+            std.process.exit(common.ExitCode.generic);
+        }
+        if (wait_duration_str != null) {
+            try common.printErr("--attach is incompatible with --wait-duration");
+            std.process.exit(common.ExitCode.generic);
+        }
+        if (json_output) {
+            try common.printErr("--attach streams PTY output; --json has no meaning here");
+            std.process.exit(common.ExitCode.generic);
+        }
+    }
     if (wait_kind_count > 1) {
         try common.printErr("at most one of --wait-until-idle, --wait-until-text, --wait-until-regex, --wait-until-exit may be supplied");
         std.process.exit(common.ExitCode.generic);
@@ -317,6 +363,37 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             try common.printErr("timed out");
             std.process.exit(common.ExitCode.wait_timeout);
         }
+        return;
+    }
+
+    if (attach_flag) {
+        const sid = id_str orelse {
+            try common.printErr("server did not return a session id");
+            std.process.exit(common.ExitCode.generic);
+        };
+        // Attach to the just-spawned session. The spawn RPC above
+        // already created the session (and its PTY) synchronously, so
+        // there is no pre-creation wait — just a second RPC that
+        // parks on the streaming broadcast path. If `--remove` is set
+        // and the child exited within the 100ms auto-remove grace
+        // window, attach may come back as SessionNotFound; that path
+        // is handled inside `attachToExistingSession` by exiting 0.
+        const maybe_code = attach_cmd.attachToExistingSession(alloc, sid, rows, cols) catch |err| {
+            try common.printErrFmt("hty run --attach: {s}", .{@errorName(err)});
+            std.process.exit(common.ExitCode.generic);
+        };
+        if (maybe_code) |code| {
+            // Child exited while attached. Clamp to 0..255 for exit().
+            // Negative codes (signal-terminated) map to 128 + signal.
+            const exit_byte: u8 = if (code >= 0 and code <= 255)
+                @intCast(code)
+            else if (code < 0 and code > -256)
+                @intCast(128 + (-code))
+            else
+                1;
+            std.process.exit(exit_byte);
+        }
+        // User detached cleanly — exit 0.
         return;
     }
 
