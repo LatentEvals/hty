@@ -20,6 +20,11 @@ pub fn helpText() []const u8 {
     \\  --cols N          Initial column count (default 80)
     \\  --cwd PATH        Child's working directory
     \\  --scrollback N    Scrollback buffer size (default 10000)
+    \\  --remove          Automatically remove the session from the registry
+    \\                    once the child process exits (success, failure, or
+    \\                    signal). Tied to child lifetime; off by default so
+    \\                    sessions persist for `hty list` / `hty logs` /
+    \\                    `hty replay` until `hty delete`.
     \\
     \\Wait + snapshot flags (let `run` block until the program is ready and
     \\return the initial render in one round-trip):
@@ -61,6 +66,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     var wait_until_regex: ?[]const u8 = null;
     var wait_until_exit = false;
     var timeout_str: ?[]const u8 = null;
+    var remove_on_exit = false;
 
     var i: usize = 0;
     var program_args_start: ?usize = null;
@@ -122,6 +128,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             wait_until_regex = args[i];
         } else if (std.mem.eql(u8, arg, "--wait-until-exit")) {
             wait_until_exit = true;
+        } else if (std.mem.eql(u8, arg, "--remove")) {
+            remove_on_exit = true;
         } else if (std.mem.eql(u8, arg, "--timeout")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--timeout requires a value");
@@ -194,6 +202,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         try common.writeJsonString(writer.any(), n);
     }
     try writer.print(",\"rows\":{d},\"cols\":{d},\"scrollback\":{d}", .{ rows, cols, scrollback });
+    if (remove_on_exit) try writer.writeAll(",\"remove\":true");
     if (cwd) |c_val| {
         try writer.writeAll(",\"cwd\":");
         try common.writeJsonString(writer.any(), c_val);

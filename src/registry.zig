@@ -117,6 +117,13 @@ fn pendingWatcherReaderLoop(pw: *PendingWatcher) void {
     }
 }
 
+/// Delay between observing a `--remove` session's terminal transition and
+/// actually freeing the session in `drainAll`. Gives in-flight wait /
+/// snapshot handlers that saw the transition on the same tick a window to
+/// finish touching the session pointer before it goes away. The accept
+/// loop's drain period is 25ms, so 100ms = ~4 ticks of slack.
+pub const auto_remove_grace_ms: i64 = 100;
+
 pub const SessionRegistry = struct {
     alloc: Allocator,
     by_id: std.StringHashMapUnmanaged(*Session) = .{},
@@ -508,6 +515,14 @@ pub const SessionRegistry = struct {
     pub fn remove(self: *SessionRegistry, sess: *Session) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        self.removeLocked(sess);
+    }
+
+    /// Caller must hold `self.mutex`. Drops the session from both maps,
+    /// tears down the Session struct, and frees its storage. Used by the
+    /// locked auto-remove sweep in `drainAll` and by the public `remove`
+    /// (which takes the lock first).
+    pub fn removeLocked(self: *SessionRegistry, sess: *Session) void {
         _ = self.by_id.remove(&sess.id);
         if (sess.name) |n| _ = self.name_index.remove(n);
         sess.deinit();
@@ -545,6 +560,7 @@ pub const SessionRegistry = struct {
                             // store on status publishes both atomically.
                             sess.setExitCode(code orelse Session.no_exit_code);
                             sess.setStatus(.exited);
+                            sess.markTerminal(now);
                             log_mod.logDrainedEvent(sess, now, event);
                             attach.broadcastExitedToAttach(sess, code);
                             log_mod.closeLogFile(sess);
@@ -555,6 +571,7 @@ pub const SessionRegistry = struct {
                     .failure => {
                         if (sess.getStatus() == .running) {
                             sess.setStatus(.failed);
+                            sess.markTerminal(now);
                             log_mod.logDrainedEvent(sess, now, event);
                             log_mod.closeLogFile(sess);
                         }
@@ -576,6 +593,53 @@ pub const SessionRegistry = struct {
             }
             // Reap any attach clients whose reader thread has exited.
             attach.reapClosedAttachClients(sess);
+        }
+
+        // Auto-remove sweep for `--remove` sessions whose child has
+        // exited. We defer by a short grace window (`auto_remove_grace_ms`)
+        // so any in-flight wait/snapshot handler that observed the
+        // terminal transition on this same tick has time to finish
+        // touching the session pointer before we free it. The sweep runs
+        // under `self.mutex`, same lock the maps + session teardown need,
+        // so racing `hty kill` / `hty delete` can't double-free: whichever
+        // path wins the mutex observes the other's state change.
+        const sweep_now = std.time.milliTimestamp();
+        var to_remove: std.ArrayListUnmanaged(*Session) = .{};
+        defer to_remove.deinit(self.alloc);
+        var sweep_it = self.by_id.valueIterator();
+        while (sweep_it.next()) |sess_ptr| {
+            const sess = sess_ptr.*;
+            if (!sess.remove_on_exit) continue;
+            const terminal_at = sess.getTerminalAt();
+            if (terminal_at == 0) continue;
+            if (sweep_now - terminal_at < auto_remove_grace_ms) continue;
+            to_remove.append(self.alloc, sess) catch break;
+        }
+        for (to_remove.items) |sess| {
+            // Best-effort log cleanup — mirrors `handleDelete`. A failure
+            // here (missing file, permissions) is logged-and-ignored: the
+            // registry removal below is the primary contract and must
+            // still proceed so `hty list` no longer shows the session.
+            if (self.log_dir) |log_dir| {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (std.fmt.bufPrint(
+                    &path_buf,
+                    "{s}/{s}.jsonl",
+                    .{ log_dir, &sess.id },
+                )) |p| {
+                    std.fs.deleteFileAbsolute(p) catch {};
+                } else |_| {}
+                if (sess.name) |name| {
+                    if (std.fmt.bufPrint(
+                        &path_buf,
+                        "{s}/by-name/{s}.jsonl",
+                        .{ log_dir, name },
+                    )) |p| {
+                        std.fs.deleteFileAbsolute(p) catch {};
+                    } else |_| {}
+                }
+            }
+            self.removeLocked(sess);
         }
 
         // Reap pending watchers (pre-creation subscribers) whose socket

@@ -148,3 +148,16 @@ hty works with any program that runs in a terminal. A few common ones:
 <Callout type="info">
 Use `--name` to give sessions descriptive names. Your agent code is much easier to debug when sessions are named `review`, `psql-prod`, or `auth-flow` rather than identified by a UUID prefix.
 </Callout>
+
+## Avoiding session leaks with `--remove`
+
+Long-running agents often forget to `hty kill` sessions once they've finished with them. The registry then fills with dozens of zombie `exited` entries, each holding a log file on disk, and `hty list` becomes useless as a live-state view. The fix is opt-in on `hty run`:
+
+```sh
+# Tie session lifetime to the child. The record is auto-deleted when the
+# child exits, no matter how (success, failure, signal, or hty kill).
+hty run --remove --name app --snapshot --wait-until-text "Ready" \
+  --timeout 30000 -- ./migrate.sh
+```
+
+With `--remove`, every short-lived tool call the agent makes cleans up after itself. Pair it with `--wait-until-exit` for the common "launch, wait for it to finish, read the final screen, move on" pattern — the agent gets the exit code and the last snapshot in one round-trip, and the session is gone by the time the next step runs. Keep sessions *without* `--remove` when you genuinely want the record to survive for later `hty replay` or `hty logs` inspection.

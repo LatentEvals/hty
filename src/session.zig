@@ -199,6 +199,21 @@ pub const Session = struct {
     status_atomic: std.atomic.Value(u8),
     exit_code_atomic: std.atomic.Value(i32),
 
+    /// When true, the registry automatically removes this session shortly
+    /// after the child process exits (success, failure, signal, or `hty
+    /// kill`). Opt-in via `hty run --remove`. The auto-removal path in
+    /// `SessionRegistry.drainAll` treats this identically to `hty delete`
+    /// — same teardown, same filesystem cleanup — but defers the removal
+    /// by a short grace window so in-flight wait/snapshot handlers can
+    /// finish touching the session pointer before it's freed.
+    remove_on_exit: bool = false,
+    /// Unix-epoch milliseconds at which this session was first observed in
+    /// a non-`running` state. `0` means "still running / not yet stamped."
+    /// Set by the drain loop on exit/failure transitions and by
+    /// `handleKill` when it flips status to `.killed`. Read by the drain
+    /// loop's auto-remove sweep to enforce the grace window.
+    terminal_at_ms_atomic: std.atomic.Value(i64) = .init(0),
+
     /// Mouse-input mode flags inferred from the PTY output stream.
     /// Mutated from `drainAll` when raw_bytes events arrive; read by
     /// `handleSendMouse` (to gate on enable + pick an encoding) and by
@@ -259,6 +274,18 @@ pub const Session = struct {
 
     pub fn touchLastScreenChange(self: *Session, now_ms: i64) void {
         self.last_screen_change_at_ms_atomic.store(now_ms, .release);
+    }
+
+    /// Stamp `terminal_at_ms_atomic` the first time the session leaves the
+    /// running state. Idempotent: subsequent calls are no-ops so the grace
+    /// window is measured from the first observed transition, not from a
+    /// later `hty kill` racing against an already-exited session.
+    pub fn markTerminal(self: *Session, now_ms: i64) void {
+        _ = self.terminal_at_ms_atomic.cmpxchgStrong(0, now_ms, .release, .monotonic);
+    }
+
+    pub fn getTerminalAt(self: *const Session) i64 {
+        return self.terminal_at_ms_atomic.load(.acquire);
     }
 
     pub fn deinit(self: *Session) void {

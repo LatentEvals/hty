@@ -79,6 +79,8 @@ hty send review --text "q\n" --snapshot --wait-until-exit --timeout 2000
 
 The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls. Open a second terminal and run `hty watch review` while the session is live to see exactly what the agent sees.
 
+For one-shot invocations where you don't want the session record to linger, pass `hty run --remove`: the session is automatically deleted from the registry the moment the child process exits (success, failure, or signal). Handy for migration scripts, test runs, and agent-driven wizards where "fire and forget" is the whole point.
+
 ## Features
 
 <table>

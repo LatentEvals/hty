@@ -4365,3 +4365,243 @@ test "mouse: X10 encoding when only 1000 is on (no SGR)" {
     const expected = [_]u8{ 0x1b, '[', 'M', 32, 35, 34 };
     try std.testing.expect(std.mem.indexOf(u8, contents, &expected) != null);
 }
+
+// ============================================================================
+// `hty run --remove` — auto-delete session from registry once the child exits.
+// ============================================================================
+
+/// Drive the registry's drain loop until `predicate` returns true or the
+/// deadline passes. Mirrors what the server's accept loop does every 25ms
+/// in production — tests exercise the same sweep without spinning up the
+/// real socket server.
+fn waitForDrainCondition(
+    registry: *SessionRegistry,
+    deadline_ms: i64,
+    ctx: anytype,
+    predicate: *const fn (@TypeOf(ctx)) bool,
+) bool {
+    const start = std.time.milliTimestamp();
+    while (std.time.milliTimestamp() - start < deadline_ms) {
+        registry.drainAll();
+        if (predicate(ctx)) return true;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+fn sessionCount(registry: *SessionRegistry) usize {
+    registry.mutex.lock();
+    defer registry.mutex.unlock();
+    return registry.by_id.count();
+}
+
+test "run --remove: session is auto-removed after child exits" {
+    const alloc = std.testing.allocator;
+    const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
+    defer alloc.free(true_path);
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-remove-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = true_path,
+            .name = "auto-remove-true",
+            .rows = 8,
+            .cols = 24,
+            .remove = true,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Child exits almost immediately; drain + grace window (100ms) should
+    // reap it within a second at most. Give ample headroom for CI.
+    const Ctx = struct { r: *SessionRegistry };
+    const ctx = Ctx{ .r = &registry };
+    const Pred = struct {
+        fn f(c: Ctx) bool {
+            return sessionCount(c.r) == 0;
+        }
+    };
+    const removed = waitForDrainCondition(&registry, 3000, ctx, Pred.f);
+    try std.testing.expect(removed);
+}
+
+test "run --remove: session persists while child is alive" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-remove-live-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // Spawn /bin/cat with --remove; cat sits waiting on stdin so the
+    // session must still be listed until we kill it.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "auto-remove-cat",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+            .remove = true,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Drain a few ticks to let the auto-remove sweep run; session should
+    // stay because cat is still running.
+    registry.drainAll();
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+    registry.drainAll();
+    try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
+
+    // Kill the session — handleKill marks it .killed + stamps terminal_at.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "auto-remove-cat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // After kill + grace window, the session must be gone.
+    const Ctx = struct { r: *SessionRegistry };
+    const ctx = Ctx{ .r = &registry };
+    const Pred = struct {
+        fn f(c: Ctx) bool {
+            return sessionCount(c.r) == 0;
+        }
+    };
+    const removed = waitForDrainCondition(&registry, 3000, ctx, Pred.f);
+    try std.testing.expect(removed);
+}
+
+test "run --remove: manual hty kill races cleanly with auto-remove (no crash)" {
+    const alloc = std.testing.allocator;
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-remove-race-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "race",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+            .remove = true,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Issue kill immediately — then a second kill while the auto-remove
+    // sweep is also eligible to fire. Both should succeed (kill is
+    // idempotent) and the session eventually vanishes exactly once.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "race" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "race" });
+        defer parsed.deinit();
+        // Second kill on the same now-killed session is still ok — the
+        // handler short-circuits when status != .running.
+        _ = try expectTestOk(parsed);
+    }
+
+    const Ctx = struct { r: *SessionRegistry };
+    const ctx = Ctx{ .r = &registry };
+    const Pred = struct {
+        fn f(c: Ctx) bool {
+            return sessionCount(c.r) == 0;
+        }
+    };
+    const removed = waitForDrainCondition(&registry, 3000, ctx, Pred.f);
+    try std.testing.expect(removed);
+}
+
+test "spawn without --remove keeps the session after exit" {
+    const alloc = std.testing.allocator;
+    const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
+    defer alloc.free(true_path);
+
+    var log_dir_buf: [256]u8 = undefined;
+    const log_dir = try std.fmt.bufPrint(
+        &log_dir_buf,
+        "/tmp/hty-noremove-test-{d}",
+        .{std.time.nanoTimestamp()},
+    );
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = true_path,
+            .name = "no-remove",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Drain through several ticks past the auto-remove grace window to
+    // prove the zombie lingers because `--remove` was *not* set.
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        registry.drainAll();
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
+}
