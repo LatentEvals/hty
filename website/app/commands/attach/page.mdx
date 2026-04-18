@@ -14,6 +14,10 @@ Multiple attach clients can be connected to the same session at the same time. A
 hty attach my-session
 ```
 
+<Callout type="info">
+For the common "spawn + attach in one go" case — e.g. `hty run --name x -- vim foo && hty attach x` — use [`hty run --attach`](/commands/run#foreground-with---attach) instead. It fuses the two calls and avoids the tiny race window where the session could exit before attach lands.
+</Callout>
+
 <Callout type="warning">
 When multiple people are attached simultaneously, every keystroke from every client is sent to the program. There is no turn-taking or locking — if two people type at the same time, the program receives both streams interleaved.
 </Callout>
