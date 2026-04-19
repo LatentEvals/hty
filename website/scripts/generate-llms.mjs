@@ -375,12 +375,15 @@ for (const section of sections) {
   llmsLines.push('')
 }
 // Per llmstxt.org convention: an "Optional" section at the end for supplementary
-// resources. We use it to point at llms-full.txt, which bundles every page into
-// a single fetch for agents that want the whole corpus at once.
+// resources. We use it to point at llms-full.txt (the whole corpus) and the
+// agent skill (install target for Claude Code, Codex, Cursor, Gemini, etc.).
 llmsLines.push('## Optional')
 llmsLines.push('')
 llmsLines.push(
   `- [Full documentation](${origin}/llms-full.txt): every page above concatenated into a single file.`
+)
+llmsLines.push(
+  `- [Agent skill](${origin}/skill.md): AgentSkills-format skill that teaches agents when and how to use hty. Install with \`npx skills add LatentEvals/hty --skill hty\` or point your agent at ${origin}/skill.md.`
 )
 llmsLines.push('')
 writeToBoth('llms.txt', llmsLines.join('\n'))

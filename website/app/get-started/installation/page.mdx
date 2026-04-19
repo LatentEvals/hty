@@ -2,6 +2,18 @@
 
 You can install hty in three ways: a one-line shell script that auto-detects your platform, a Homebrew tap, or building from source with Zig. All three produce the same single binary with no runtime dependencies.
 
+## For AI agents
+
+If you're driving hty from an agent (Claude Code, Codex, Cursor, Gemini, etc.), install the [agent skill](https://hty.sh/skill.md) — it teaches the agent when and how to use hty, and installs the CLI as part of its bootstrap:
+
+```sh
+npx skills add LatentEvals/hty --skill hty
+```
+
+Or tell your agent: `Install hty using this skill: https://hty.sh/skill.md`.
+
+The rest of this page covers installing the `hty` binary directly for human use or scripting.
+
 ## Install script (macOS and Linux)
 
 Run the install script with `curl`:
