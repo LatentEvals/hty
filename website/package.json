@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "node scripts/extract-help.mjs && node scripts/generate-llms.mjs && next dev",
-    "build": "node scripts/extract-help.mjs && next build && node scripts/generate-llms.mjs && pagefind --site out --output-path out/_pagefind",
+    "build": "node scripts/extract-help.mjs && next build && node scripts/generate-llms.mjs && node scripts/bundle-skill.mjs && pagefind --site out --output-path out/_pagefind",
     "start": "next start"
   },
   "dependencies": {
