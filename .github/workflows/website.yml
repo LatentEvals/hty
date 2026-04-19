@@ -6,10 +6,12 @@ on:
     paths:
       - website/**
       - src/commands/**
+      - skills/**
   pull_request:
     paths:
       - website/**
       - src/commands/**
+      - skills/**
   workflow_dispatch:
 
 permissions:
