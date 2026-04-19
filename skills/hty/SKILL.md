@@ -17,24 +17,23 @@ metadata:
 
 ## Install this skill
 
-If you are reading this file via `WebFetch` or similar (e.g. the user said "use this skill: https://hty.sh/skill.md"), persist the full skill directory so it's auto-loaded on future sessions. Pick the path for your agent:
+If you are reading this file via `WebFetch` or similar (e.g. the user said "use this skill: https://hty.sh/skill.md"), persist the full skill directory so it's auto-loaded on future sessions.
 
-| Agent | Skill path |
-|---|---|
-| Claude Code (global) | `~/.claude/skills/hty/` |
-| Claude Code (project) | `<repo>/.claude/skills/hty/` |
-| Cursor | `<repo>/.cursor/rules/` (convert to `.mdc`) |
-| Codex / Gemini / other | Consult your agent's skill-loading docs; the SKILL.md format is portable |
-
-One-liner install (Claude Code, global) — downloads SKILL.md + references/ from the published release:
+**Preferred — the [skills CLI](https://skills.sh):**
 
 ```sh
-curl -fsSL https://hty.sh/skill.tar.gz | tar -xz -C ~/.claude/skills/
+npx skills add LatentEvals/hty --skill hty
 ```
 
-Or explicit per-file (transparent, easier to audit):
+Handles per-agent paths automatically (Claude Code, Codex, Cursor, Gemini, and others).
+
+**Fallback — direct install for Claude Code:**
 
 ```sh
+# One-liner (tarball)
+curl -fsSL https://hty.sh/skill.tar.gz | tar -xz -C ~/.claude/skills/
+
+# Or explicit per-file
 mkdir -p ~/.claude/skills/hty/references
 curl -fsSL -o ~/.claude/skills/hty/SKILL.md                    https://hty.sh/skills/hty/SKILL.md
 curl -fsSL -o ~/.claude/skills/hty/references/REFERENCE.md     https://hty.sh/skills/hty/references/REFERENCE.md
