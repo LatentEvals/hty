@@ -42,6 +42,14 @@ curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/instal
 
 Auto-detects OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target. Or grab a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
 
+**Using an AI agent?** Install the [hty agent skill](https://hty.sh/skill.md) so Claude Code, Codex, Cursor, Gemini, and others know when and how to reach for `hty`:
+
+```sh
+npx skills add LatentEvals/hty --skill hty
+```
+
+Or point your agent at `https://hty.sh/skill.md` directly.
+
 <details>
 <summary>Other install methods</summary>
 
