@@ -1,6 +1,6 @@
 ---
 name: hty
-description: "Drive any interactive terminal program from an AI agent. Use when the user needs to run, script, or automate programs with interactive prompts like `git add -p`, `gh auth login`, `create-next-app`, `npm init`, `vim`, `psql`, `htop`, `k9s`, or any curses/TUI app. Also use when plain bash fails because a command expects a TTY, waits for a keystroke, redraws the screen, or can't proceed without reading the output first."
+description: "Drive any interactive terminal program. Use when you need to run, script, or automate programs with interactive prompts like `git add -p`, `gh auth login`, `create-next-app`, `npm init`, `vim`, `psql`, `htop`, `k9s`, or any curses/TUI app. Also use when plain bash fails because a command expects a TTY, waits for a keystroke, redraws the screen, or can't proceed without reading the output first."
 license: MIT
 compatibility: Requires the hty CLI (v0.7.0+) on macOS or Linux.
 metadata:
