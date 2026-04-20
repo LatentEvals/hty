@@ -1,50 +1,83 @@
 # hty
 
-**Puppeteer for the terminal.** Let AI agents drive any interactive CLI — editors, REPLs, auth flows, scaffolding wizards — by reading the screen and sending keys.
+**Puppeteer for the terminal.** Drive any interactive CLI with AI.
+
+Your agent writes great code. Then it hits `git add -p`, `gh auth login`, or `create-next-app` — programs that expect a human at the keyboard — and walls out. **hty puts a keyboard under its hands.**
+
+`hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would.
+
+{/* demo: side-by-side of Claude driving nethack via hty */}
 
 ---
 
 ## Install
 
-Point your AI agent at the skill:
+**Driving hty from an agent?** (Claude Code, Codex, Cursor, Gemini — any agent that loads [skills](https://skills.sh))
+
+Paste this into your agent:
 
 > Install hty using this skill: https://hty.sh/skill.md
 
-It teaches the agent when to reach for hty, how to drive sessions, and handles installing the hty CLI itself.
+The agent fetches the skill, installs the `hty` CLI, and learns when and how to reach for it.
 
-Or install the skill directly via the [skills CLI](https://skills.sh):
+**Driving it yourself?**
 
 ```sh
-npx skills add LatentEvals/hty --skill hty
+curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
-[Installing hty yourself? See all methods →](/get-started/installation)
+[All install methods →](/get-started/installation)
 
 ---
 
-## Why hty exists
-
-Unlock a world of TUI and CLI software for your AI agent.
-
-If you've used agents, you've seen them struggle with things like `create-next-app`, or watched them try to stage a sprawling diff by shuffling files into `/tmp`, `rm`-ing changes, and getting hopelessly confused. If only they could use `git add -p`. Well, now they can.
-
-`hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would.
+## Try it: driving `create-next-app`
 
 ```sh
-# agent decides to use hty to create its terminal
-hty run --name create-next-app -- create-next-app my-app
+# Launch and wait for the first prompt
+hty run --name app --snapshot \
+  --wait-until-text "What is your project named?" --timeout 30000 \
+  -- npx create-next-app
 
-# agent looks at the terminal to see what to do
-hty snapshot create-next-app
+# Answer "my-app" + Enter, wait for the next prompt
+hty send app --text "my-app\n" --snapshot \
+  --wait-until-text "TypeScript?" --timeout 10000
 
-# agent sees: "Would you like to use TypeScript? (Y/n)"
-hty send create-next-app --text "y\n"
+# Accept TypeScript (Enter) and wait for the next
+hty send app --key enter --snapshot \
+  --wait-until-text "ESLint?" --timeout 5000
 
-# ...repeat for each remaining prompt...
-
-# delete the terminal session
-hty delete create-next-app
+# …and so on, until the scaffolder exits
+hty send app --key enter --snapshot --wait-until-exit --timeout 120000
 ```
+
+Every call fuses input, wait, and snapshot into one round-trip, so the agent always has the current screen before deciding what to type next.
+
+[Quick Start →](/get-started/quickstart) · [AI agent guide →](/guides/ai-agents)
+
+---
+
+## What you unlock
+
+Anything that runs in a terminal. A few common wins:
+
+|  |  |  |
+| :--: | :--: | :--: |
+| `git add -p` | `git rebase -i` | `gh auth login` |
+| `create-next-app` | `npm init` | `ssh-keygen` |
+| `vim` / `neovim` | `psql` | `redis-cli` |
+| `htop` / `btop` | `k9s` | `lazygit` |
+
+If a human can use it, an agent can too.
+
+---
+
+## Why not `expect` or `tmux send-keys`?
+
+- **`expect` reads raw PTY bytes.** hty reads the **rendered screen** — the same thing a human sees. Cursor position, wide characters, and every escape sequence are handled correctly via [Ghostty](https://ghostty.org)'s VT engine.
+- **`tmux send-keys` fires and hopes.** hty waits on conditions the agent can *read* before sending the next key — text, regex, idle, exit — each with a configurable timeout.
+- **`asciinema-exec` records for humans.** hty is built to be read *by the agent, while running* — and every session is still recorded for later replay.
+
+---
 
 ## What you get
 
@@ -56,20 +89,32 @@ hty delete create-next-app
 - **Remote observation.** SSH tunnel to a remote machine and `watch` or `attach` to sessions running there. No protocol changes needed.
 - **Single binary, zero dependencies.** One `curl | sh` and you're running. Built on Ghostty's production-grade VT engine in Zig.
 
-## Get started in 30 seconds
+---
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
-hty run --name demo -- top
-hty wait demo --text "PID" --timeout 5000
-hty snapshot demo
-hty kill demo
-hty logs demo    # still works — the recording is preserved
-hty delete demo  # permanently remove the session and its log
-```
+## FAQ
 
-[Install hty →](/get-started/installation)
+**Which AI agents work with hty?**
+Any agent that can run shell commands. The [agent skill](https://hty.sh/skill.md) is wired up for Claude Code, Codex, Cursor, Gemini, and anything else the [skills CLI](https://skills.sh) supports. For everything else, point your agent at [llms.txt](https://hty.sh/llms.txt) and tell it to use `hty`.
 
-[Quick Start →](/get-started/quickstart)
+**Does it work on Windows?**
+Not natively — hty uses Unix PTYs. It works fine inside WSL.
 
-[GitHub →](https://github.com/LatentEvals/hty)
+**What happens to a session if my agent crashes?**
+Nothing. Sessions live in the background server, not the agent's shell. Your next `hty` invocation finds the session exactly where it was.
+
+**Can multiple tools drive the same session?**
+Yes. The server is multi-writer: an agent can send keys while you `hty watch` from another terminal (read-only) or even `hty attach` (interactive, bidirectional).
+
+**Does it play with MCP?**
+hty is complementary to MCP. It's a single-binary CLI that any MCP server, slash command, or skill can shell out to. The subcommands themselves are already a clean, composable protocol.
+
+**Can I drive a session on a remote machine?**
+Yes — point `$HTY_SOCKET` at an SSH-tunneled Unix socket. See [remote observation](/guides/remote-observation).
+
+---
+
+## Built by
+
+[**LatentEvals**](https://latentevals.com) — we build tools for AI agents to drive real software. hty is MIT-licensed and open source on [GitHub](https://github.com/LatentEvals/hty).
+
+[Quick Start →](/get-started/quickstart) · [GitHub →](https://github.com/LatentEvals/hty) · [Install the skill in your agent →](https://hty.sh/skill.md)

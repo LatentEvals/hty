@@ -17,46 +17,53 @@
 </p>
 
 <p align="center">
-  <a href="#quickstart">Quickstart</a> ·
   <a href="#install">Install</a> ·
-  <a href="#commands">Commands</a> ·
+  <a href="#try-it-git-add--p-in-6-lines">Try it</a> ·
+  <a href="#what-you-unlock">Programs</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="https://hty.sh">Docs</a> ·
   <a href="https://hty.sh/llms.txt">llms.txt</a>
 </p>
 
 ---
 
-## Why hty exists
-
-Unlock a world of TUI and CLI software for your AI agent.
-
-If you've used agents, you've seen them struggle with things like `create-next-app`, or watched them try to stage a sprawling diff by shuffling files into `/tmp`, `rm`-ing changes, and getting hopelessly confused. If only they could use `git add -p`. Well, now they can.
+Your agent writes great code. Then it hits `git add -p`, `gh auth login`, or `create-next-app` — programs that expect a human at the keyboard — and walls out. **hty puts a keyboard under its hands.**
 
 `hty` wraps any interactive program in a persistent PTY session. Your agent reads the rendered terminal the way you do and types the way you would.
 
+<!-- demo: side-by-side of Claude driving nethack via hty -->
+
 ## Install
+
+**Driving hty from an agent?** (Claude Code, Codex, Cursor, Gemini — any agent that loads [skills](https://skills.sh))
+
+Paste this into your agent:
+
+> Install hty using this skill: https://hty.sh/skill.md
+
+The agent fetches the skill, installs the `hty` CLI, and learns when and how to reach for it.
+
+**Driving it yourself?**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/LatentEvals/hty/main/scripts/install.sh | sh
 ```
 
-Auto-detects OS and architecture, downloads the latest release binary, verifies the checksum, and installs to `~/.local/bin`. Use `--install-dir` or `HTY_INSTALL_DIR` to change the target. Or grab a specific platform from the [releases page](https://github.com/LatentEvals/hty/releases/latest).
-
-**Using an AI agent?** Install the [hty agent skill](https://hty.sh/skill.md) so Claude Code, Codex, Cursor, Gemini, and others know when and how to reach for `hty`:
-
-```sh
-npx skills add LatentEvals/hty --skill hty
-```
-
-Or point your agent at `https://hty.sh/skill.md` directly.
+Auto-detects OS and architecture, verifies the checksum, and installs to `~/.local/bin`.
 
 <details>
-<summary>Other install methods</summary>
+<summary>Homebrew, from source, skills CLI</summary>
 
 **Homebrew**
 
 ```sh
 brew install LatentEvals/tap/hty
+```
+
+**Skills CLI directly** (skips the agent prompt step)
+
+```sh
+npx skills add LatentEvals/hty --skill hty
 ```
 
 **From source** — requires [Zig](https://ziglang.org) 0.15+.
@@ -68,14 +75,16 @@ zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/hty /usr/local/bin/
 ```
 
+Prebuilt binaries for macOS (arm64, x86_64) and Linux (arm64, x86_64) are on the [releases page](https://github.com/LatentEvals/hty/releases/latest).
+
 </details>
 
-## Quickstart
+## Try it: `git add -p` in 6 lines
 
-Drive `git add -p` — the interactive git workflow agents can't handle today:
+The interactive git workflow agents can't handle today:
 
 ```sh
-# Start the session and get the first screen in one call
+# Start the session and wait for the first prompt in one call
 hty run --name review --snapshot --wait-until-text "Stage this hunk" \
   --timeout 5000 -- git add -p
 
@@ -87,18 +96,33 @@ hty send review --text "q\n" --snapshot --wait-until-exit --timeout 2000
 
 The server auto-starts on first use and persists across invocations, so sessions outlive individual `hty` calls. Open a second terminal and run `hty watch review` while the session is live to see exactly what the agent sees.
 
-For one-shot invocations where you don't want the session record to linger, pass `hty run --remove`: the session is automatically deleted from the registry the moment the child process exits (success, failure, or signal). Handy for migration scripts, test runs, and agent-driven wizards where "fire and forget" is the whole point.
+`hty run --remove` ties the session's lifetime to the child process — handy for one-shots like `hty run --attach --remove -- npm test` that should clean up after themselves.
 
-Want to spawn and attach in one call? `hty run --attach -- vim foo.txt` drops you straight into the session (streams output to stdout, forwards stdin with raw mode and SIGWINCH, `Ctrl-A d` to detach). Combine with `--remove` for a fully self-cleaning one-shot: `hty run --attach --remove -- npm test`.
+Full walkthrough: [**hty.sh/get-started/quickstart**](https://hty.sh/get-started/quickstart). Agent-loop patterns: [**hty.sh/guides/ai-agents**](https://hty.sh/guides/ai-agents).
+
+## What you unlock
+
+Anything that runs in a terminal. A few common wins:
+
+| | | |
+| :--: | :--: | :--: |
+| `git add -p` | `git rebase -i` | `gh auth login` |
+| `create-next-app` | `npm init` | `ssh-keygen` |
+| `vim` / `neovim` | `psql` | `redis-cli` |
+| `htop` / `btop` | `k9s` | `lazygit` |
+
+If a human can use it, an agent can too.
+
+## Why not `expect` or `tmux send-keys`?
+
+- **`expect` reads raw PTY bytes.** hty reads the **rendered screen** — the same thing a human sees. Cursor position, wide characters, and every escape sequence are handled correctly via [Ghostty](https://ghostty.org)'s VT engine.
+- **`tmux send-keys` fires and hopes.** hty waits on conditions the agent can *read* before sending the next key — text, regex, idle, exit — each with a configurable timeout.
+- **`asciinema-exec` records for humans.** hty is built to be read *by the agent, while running* — and every session is still recorded for later replay.
 
 ## Features
 
 <table>
   <tr>
-    <td width="33%" valign="top">
-      <strong>Any interactive program</strong><br />
-      <code>vim</code>, <code>psql</code>, <code>btop</code>, <code>git add -p</code>, <code>gh auth login</code>, <code>create-next-app</code>. If a human can use it, an agent can.
-    </td>
     <td width="33%" valign="top">
       <strong>Sessions persist</strong><br />
       The server auto-starts and keeps sessions alive across invocations. Multiple tools can drive one session concurrently.
@@ -107,12 +131,12 @@ Want to spawn and attach in one call? `hty run --attach -- vim foo.txt` drops yo
       <strong>Watch live</strong><br />
       Run <code>hty watch</code> from another terminal to see exactly what the agent sees, in real time. Read-only, no interference.
     </td>
-  </tr>
-  <tr>
     <td width="33%" valign="top">
       <strong>Full replay</strong><br />
       Every session is recorded to an append-only JSONL log. <code>hty replay</code> plays it back through a fresh VT engine.
     </td>
+  </tr>
+  <tr>
     <td width="33%" valign="top">
       <strong>Wait primitives</strong><br />
       <code>--text</code>, <code>--regex</code>, <code>--idle</code>, <code>--exit</code>. Fuse them into <code>run</code> and <code>send</code> with <code>--snapshot</code> for one-round-trip agent loops.
@@ -121,28 +145,32 @@ Want to spawn and attach in one call? `hty run --attach -- vim foo.txt` drops yo
       <strong>Remote observation</strong><br />
       Point <code>$HTY_SOCKET</code> at an SSH-tunneled remote server. <code>watch</code> or <code>attach</code> with zero protocol changes.
     </td>
-  </tr>
-  <tr>
     <td width="33%" valign="top">
       <strong>Single binary</strong><br />
       One <code>curl | sh</code> and you're running. Zero runtime dependencies. Fast startup, easy distribution.
     </td>
-    <td width="33%" valign="top">
-      <strong>Production VT engine</strong><br />
-      Powered by <a href="https://ghostty.org">Ghostty</a>. Accurate color, cursor, wide characters, and every escape sequence.
-    </td>
-    <td width="33%" valign="top">
-      <strong>AI-readable docs</strong><br />
-      The <a href="https://hty.sh">docs site</a> serves <a href="https://hty.sh/llms.txt">llms.txt</a> and a <code>.md</code> of every page for agent ingestion.
-    </td>
   </tr>
 </table>
 
-## Concepts
+## FAQ
 
-- **[Sessions](https://hty.sh/concepts/sessions)** — a session is a real PTY running your program, identified by a UUID or a human-friendly `--name`. Sessions are isolated from each other and from your terminal.
-- **[Background server](https://hty.sh/concepts/server)** — a persistent process that owns all session state. It auto-starts on first use, talks to clients over a Unix socket, and keeps sessions alive across individual `hty` commands.
-- **[Session logs](https://hty.sh/concepts/session-logs)** — every input and output byte is written to a per-session append-only JSONL log. `hty logs` streams raw events; `hty replay` feeds them back through a fresh VT engine long after the session has ended.
+**Which AI agents work with hty?**
+Any agent that can run shell commands. The [agent skill](https://hty.sh/skill.md) is wired up for Claude Code, Codex, Cursor, Gemini, and anything else the [skills CLI](https://skills.sh) supports. For everything else, point your agent at [`llms.txt`](https://hty.sh/llms.txt) and tell it to use `hty`.
+
+**Does it work on Windows?**
+Not natively — hty uses Unix PTYs. It works fine inside WSL.
+
+**What happens to a session if my agent crashes?**
+Nothing. Sessions live in the background server, not the agent's shell. Your next `hty` invocation finds the session exactly where it was.
+
+**Can multiple tools drive the same session?**
+Yes. The server is multi-writer: an agent can send keys while you `hty watch` from another terminal (read-only) or even `hty attach` (interactive, bidirectional).
+
+**Does it play with MCP?**
+hty is complementary to MCP. It's a single-binary CLI that any MCP server, slash command, or skill can shell out to. There's no hty MCP server because the subcommands themselves are already a clean, composable protocol.
+
+**Can I drive a session on a remote machine?**
+Yes — point `$HTY_SOCKET` at an SSH-tunneled Unix socket. See [remote observation](https://hty.sh/guides/remote-observation).
 
 ## Commands
 
@@ -175,7 +203,7 @@ human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
 ```
 
-Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
+Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples: [**hty.sh/commands**](https://hty.sh/commands/run).
 
 ### Exit codes
 
@@ -188,48 +216,12 @@ Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the 
 | 4    | session prefix matched multiple sessions (ambiguous) |
 | 5    | a session with that name already exists |
 
-## Export to GIF / MP4
-
-Every session is recorded to a JSONL log. `hty export --format asciicast` converts that log into an [asciinema v2 cast](https://docs.asciinema.org/manual/asciicast/v2/), which plugs straight into the existing asciicast ecosystem:
-
-```sh
-hty export my-session --format asciicast > run.cast
-
-# GIF — agg reads asciicast directly
-agg run.cast run.gif
-
-# MP4 — convert the GIF with ffmpeg
-agg run.cast run.gif && ffmpeg -i run.gif run.mp4
-
-# Share on asciinema.org
-asciinema upload run.cast
-```
-
-Output and resize events are emitted faithfully. Input keystrokes are also included as `"i"` events with bursts coalesced (e.g. `hty send --text "hello"` becomes a single `"i"` frame). Most asciicast players ignore input frames during playback, which is the spec-correct behavior; any downstream renderer that wants to surface agent keystrokes has the data.
-
-## Remote observation
-
-The client's socket path can be overridden with `$HTY_SOCKET`, which makes it straightforward to watch, attach to, or drive a session running on another machine via an SSH tunnel:
-
-```sh
-# on the remote machine — find the socket path
-hty info
-
-# on your laptop — tunnel the remote socket locally
-ssh -L ~/.local/state/hty/remote.sock:<socket-from-hty-info> user@remote
-HTY_SOCKET=~/.local/state/hty/remote.sock hty attach foo
-```
-
-When `$HTY_SOCKET` is set, the client never auto-spawns a local server — if the endpoint isn't reachable it fails fast, so a broken tunnel is obvious instead of silently shadowed by a fresh local server.
-
 ## Built with
 
 - **[Ghostty](https://ghostty.org)** — production-grade VT engine for accurate terminal emulation.
 - **[Zig](https://ziglang.org)** — fast startup, single-binary distribution, no runtime.
 
 ## Development
-
-### Tests
 
 ```sh
 zig build test
