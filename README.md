@@ -170,12 +170,16 @@ Commands:
   info      Show resolved paths and server status
   help      Print help. Pass a subcommand for details.
 
+Global flags:
+  --version, -v   Print the hty version and exit.
+  --help, -h      Print this help text. `hty help <command>` for details.
+
 Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
 human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
 ```
 
-Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
+Run `hty --version` to print the installed version, `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
 
 ### Exit codes
 
