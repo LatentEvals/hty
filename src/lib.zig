@@ -155,6 +155,19 @@ pub const InteractiveTerminal = struct {
             c._exit(127);
         }
 
+        // On the success path `deinit` (via `kill`) closes the fd and
+        // reaps the child. These errdefers mirror that cleanup for any
+        // parent-side failure below. Order matters: errdefers run in
+        // reverse, so kill+reap must be registered *after* close so it
+        // runs *before* close — we want the child gone before we drop
+        // the master end.
+        const child_pid: std.posix.pid_t = @intCast(pid);
+        errdefer std.posix.close(master);
+        errdefer {
+            _ = c.kill(child_pid, c.SIGKILL);
+            _ = std.posix.waitpid(child_pid, 0);
+        }
+
         var self = try alloc.create(InteractiveTerminal);
         errdefer alloc.destroy(self);
 
@@ -169,7 +182,7 @@ pub const InteractiveTerminal = struct {
             .stream = undefined,
             .config = config,
             .master_fd = master,
-            .child_pid = @intCast(pid),
+            .child_pid = child_pid,
         };
         errdefer self.terminal.deinit(alloc);
 
@@ -871,6 +884,60 @@ test "snapshot preserves ansi styling" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "38;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "48;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hi") != null);
+}
+
+test "spawn: parent-side alloc failure reaps child and does not leak zombies" {
+    // Reap anything the OS has queued for us from prior tests before we
+    // start, so a later `waitpid(-1, ..., WNOHANG)` only sees children
+    // this test itself produced.
+    while (true) {
+        var drain_status: c_int = 0;
+        const drained = c.waitpid(-1, &drain_status, c.WNOHANG);
+        if (drained <= 0) break;
+    }
+
+    // Count of successful allocations made *before* forkpty returns for
+    // a `{ program: "/bin/sh", args: { "-c", "true" } }` spawn with an
+    // empty env (buildEnv adds TERM since it's missing):
+    //   buildArgv: argv slice + dupeZ("/bin/sh") + dupeZ("-c") + dupeZ("true") = 4
+    //   buildEnv:  entries slice + dupeZ("TERM") + dupeZ("xterm-256color") = 3
+    // fail_index = 7 lets forkpty run and then trips the very next
+    // alloc, which is `alloc.create(InteractiveTerminal)` on the parent
+    // side. That path is exactly what the new errdefers guard.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 7,
+    });
+    const alloc = failing.allocator();
+
+    const result = InteractiveTerminal.spawn(alloc, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "true" },
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+        .emit_screen_updates = false,
+    });
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    // If the errdefer kill+waitpid ran, the child has already been
+    // reaped and the OS reports ECHILD (waitpid returns -1). If the
+    // errdefer *didn't* run, the child either (a) is still alive
+    // (waitpid returns 0 with WNOHANG) or (b) has become a zombie
+    // (waitpid returns pid > 0). Poll briefly so we don't race a
+    // not-yet-dead child, but any positive return at all means we
+    // leaked — we should never see the kernel hand us a reapable
+    // child, because the errdefer should have already consumed it
+    // inside `spawn`.
+    const deadline = std.time.milliTimestamp() + 500;
+    while (std.time.milliTimestamp() < deadline) {
+        var status: c_int = 0;
+        const waited = c.waitpid(-1, &status, c.WNOHANG);
+        if (waited > 0) return error.ChildLeaked;
+        if (waited == -1) return; // ECHILD — clean. Test passes.
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    return error.ChildNotReaped;
 }
 
 // ---------------------------------------------------------------------------
