@@ -179,7 +179,7 @@ human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
 ```
 
-Run `hty --version` to print the installed version, `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
+Run `hty help <command>` for per-subcommand flag details, or `hty keys` for the supported `--key` names. Full reference with examples lives at **[hty.sh/commands](https://hty.sh/commands/run)**.
 
 ### Exit codes
 
