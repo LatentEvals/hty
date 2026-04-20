@@ -362,6 +362,7 @@ pub const InteractiveTerminal = struct {
         var index: usize = 0;
         while (index < bytes.len) {
             const written = try std.posix.write(self.master_fd, bytes[index..]);
+            if (written == 0) return error.ShortWrite;
             index += written;
         }
     }
