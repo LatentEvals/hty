@@ -170,6 +170,10 @@ Commands:
   info      Show resolved paths and server status
   help      Print help. Pass a subcommand for details.
 
+Global flags:
+  --version, -v   Print the hty version and exit.
+  --help, -h      Print this help text. `hty help <command>` for details.
+
 Sessions are identified by a UUIDv7 (shown as its first 8 chars) or by a
 human-friendly `--name`. Any unambiguous prefix resolves to a full ID.
 If only one session is running, the session argument can be omitted.
