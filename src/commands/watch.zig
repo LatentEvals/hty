@@ -110,7 +110,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     const stdout_fd = std.posix.STDOUT_FILENO;
     const stdin_is_tty = std.posix.isatty(stdin_fd);
 
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
     // Connect and send the subscribe op before flipping the terminal into

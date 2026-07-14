@@ -21,13 +21,38 @@ pub const ExitCode = struct {
     pub const name_exists: u8 = 5;
 };
 
+/// Resolve the socket path, exiting with a one-line message when the state
+/// directory cannot be prepared (read-only $HOME, sandboxed shell, ...).
+/// Without this the raw error unwinds out of main() as a Zig stack trace.
+pub fn resolveSocketPathOrExit(alloc: Allocator) []u8 {
+    return paths.resolveSocketPath(alloc) catch |err| {
+        const dir: []const u8 = paths.resolveRuntimeDir(alloc) catch "<unresolved>";
+        printErrFmt("error: cannot prepare hty state dir {s} ({s})\n" ++
+            "Fix its permissions or set XDG_STATE_HOME to a writable location.", .{ dir, @errorName(err) }) catch {};
+        std.process.exit(ExitCode.generic);
+    };
+}
+
+/// Connect via ensureServer, exiting cleanly on the failures it has already
+/// diagnosed on stderr; anything unexpected still propagates.
+pub fn connectOrExit(alloc: Allocator, socket_path: []const u8) !std.net.Stream {
+    return ensure.ensureServer(alloc, socket_path, .{}) catch |err| switch (err) {
+        error.ServerUnreachable,
+        error.ServerStartupFailed,
+        error.StateDirNotWritable,
+        error.SocketPathTooLong,
+        => std.process.exit(ExitCode.generic),
+        else => return err,
+    };
+}
+
 /// Send a structured request value to the server; return the parsed JSON
 /// response. The caller owns the Parsed value.
 pub fn sendRequest(alloc: Allocator, request_value: anytype) !std.json.Parsed(std.json.Value) {
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = try ensure.ensureServer(alloc, socket_path, .{});
+    var stream = try connectOrExit(alloc, socket_path);
     defer stream.close();
 
     const payload = try std.json.Stringify.valueAlloc(alloc, request_value, .{});
@@ -54,10 +79,10 @@ pub fn sendRequest(alloc: Allocator, request_value: anytype) !std.json.Parsed(st
 /// Low-level: send a pre-built JSON string to the server; return raw response.
 /// Caller owns the returned slice.
 pub fn sendRawRequest(alloc: Allocator, request_json: []const u8) ![]u8 {
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = try ensure.ensureServer(alloc, socket_path, .{});
+    var stream = try connectOrExit(alloc, socket_path);
     defer stream.close();
 
     try stream.writeAll(request_json);

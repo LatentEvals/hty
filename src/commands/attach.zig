@@ -108,7 +108,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 
     // Connect and issue the attach request before flipping the terminal
     // into raw mode so errors land on the user's normal terminal.
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
     var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {
@@ -710,7 +710,7 @@ pub fn attachToExistingSession(
     init_rows: u16,
     init_cols: u16,
 ) !?i32 {
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
     var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {

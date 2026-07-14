@@ -29,6 +29,7 @@ const commands = struct {
 // Force Zig's test discovery to walk the extracted modules even when this
 // root file only references `runServer` and the command `run()` fns.
 comptime {
+    _ = @import("ensure.zig");
     _ = @import("keys.zig");
     _ = @import("uuid.zig");
     _ = @import("ops.zig");
