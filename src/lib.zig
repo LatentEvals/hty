@@ -119,6 +119,10 @@ pub const InteractiveTerminal = struct {
     closed: bool = false,
     exit_code: ?i32 = null,
     last_title: ?[]u8 = null,
+    /// Number of screen snapshots taken, full (`snapshot`) and plain
+    /// (`plainSnapshot`) alike. Test-visible: the wait-loop tests assert
+    /// that poll iterations with an unchanged screen take no snapshot.
+    snapshot_count: std.atomic.Value(u64) = .init(0),
 
     pub fn spawn(
         alloc: std.mem.Allocator,
@@ -250,9 +254,27 @@ pub const InteractiveTerminal = struct {
         }
     }
 
+    /// Cheap snapshot for wait-loop polling: just the plain-text buffer —
+    /// no ANSI render, no cells grid, no line splitting, no title dupe, no
+    /// Unicode-normalizer init. The full `snapshot()` heap-allocates
+    /// ~rows*cols cell strings per call; a poll only needs the text to run
+    /// one substring/regex search. Caller owns the returned buffer.
+    pub fn plainSnapshot(self: *InteractiveTerminal) ![]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.snapshot_count.fetchAdd(1, .monotonic);
+        return try self.terminal.plainString(self.alloc);
+    }
+
+    /// Test-visible count of snapshots taken (full and plain combined).
+    pub fn snapshotCount(self: *const InteractiveTerminal) u64 {
+        return self.snapshot_count.load(.monotonic);
+    }
+
     pub fn snapshot(self: *InteractiveTerminal) !ScreenSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
+        _ = self.snapshot_count.fetchAdd(1, .monotonic);
 
         const buffer = try self.terminal.plainString(self.alloc);
         errdefer self.alloc.free(buffer);
@@ -896,6 +918,33 @@ test "spawn captures snapshot and exit" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.buffer, "hello from zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hello from zig") != null);
     try waitForExit(terminal, 2_000);
+}
+
+test "plainSnapshot returns the text buffer and both snapshot kinds bump the counter" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf 'plain text only'" },
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "plain text only", 2_000);
+    const before = terminal.snapshotCount();
+
+    const buffer = try terminal.plainSnapshot();
+    defer std.heap.c_allocator.free(buffer);
+    try std.testing.expect(std.mem.indexOf(u8, buffer, "plain text only") != null);
+    // Plain text only: no ANSI escapes in the cheap snapshot.
+    try std.testing.expect(std.mem.indexOf(u8, buffer, "\x1b[") == null);
+    try std.testing.expectEqual(before + 1, terminal.snapshotCount());
+
+    var full = try terminal.snapshot();
+    defer full.deinit(std.heap.c_allocator);
+    try std.testing.expectEqualStrings(buffer, full.buffer);
+    try std.testing.expectEqual(before + 2, terminal.snapshotCount());
 }
 
 test "send forwards bytes through the pty" {

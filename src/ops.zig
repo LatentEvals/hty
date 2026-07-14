@@ -441,6 +441,16 @@ fn runWait(
         };
     }
 
+    // Screen-change stamp observed by the most recent text scan. Snapshots
+    // are the expensive part of a text poll, and the screen usually hasn't
+    // changed between 25ms ticks — re-scan only when the stamp moved since
+    // the previous scan (the drainAll below is what bumps it). Null means
+    // "never scanned", so the first iteration always scans. Sessions
+    // spawned with `emit_screen_updates: false` never bump the stamp, so
+    // for those we scan every tick as before.
+    var last_scanned_change: ?i64 = null;
+    const track_screen_changes = sess.terminal.config.emit_screen_updates;
+
     while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
 
@@ -460,27 +470,42 @@ fn runWait(
                 }
             },
             .text => |cfg| {
-                var snapshot = try sess.terminal.snapshot();
-                defer snapshot.deinit(sess.alloc);
+                // Read the stamp *before* snapshotting: output that lands
+                // in between is scanned now with an older stamp recorded,
+                // so the next drain's newer stamp forces a re-scan — we
+                // may scan once redundantly, but never miss a change.
+                const change_stamp = sess.getLastScreenChange();
+                const unchanged = track_screen_changes and
+                    last_scanned_change != null and
+                    last_scanned_change.? == change_stamp;
+                if (!unchanged) {
+                    last_scanned_change = change_stamp;
 
-                // Capture the byte offset of the match during the first
-                // (and only) scan so regex callers get a uniform
-                // `text.offset` field. The regex helper returns the offset
-                // directly from `regexec`'s pmatch[0], so this doesn't
-                // cost a second pattern execution — it's the same call
-                // that decides match-vs-no-match.
-                const offset: ?i64 = if (cfg.regex) |re| blk: {
-                    break :blk try regexFindHaystack(sess.alloc, re, snapshot.buffer);
-                } else blk: {
-                    const idx = std.mem.indexOf(u8, snapshot.buffer, cfg.needle);
-                    break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
-                };
-                if (offset) |off| {
-                    return .{
-                        .matched = cfg.matched_label,
-                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
-                        .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
+                    // Polling uses the cheap plain-text snapshot; the full
+                    // snapshot (ANSI render, cells grid, normalizer) is
+                    // built once by the response formatter on completion.
+                    const buffer = try sess.terminal.plainSnapshot();
+                    defer sess.alloc.free(buffer);
+
+                    // Capture the byte offset of the match during the first
+                    // (and only) scan so regex callers get a uniform
+                    // `text.offset` field. The regex helper returns the offset
+                    // directly from `regexec`'s pmatch[0], so this doesn't
+                    // cost a second pattern execution — it's the same call
+                    // that decides match-vs-no-match.
+                    const offset: ?i64 = if (cfg.regex) |re| blk: {
+                        break :blk try regexFindHaystack(sess.alloc, re, buffer);
+                    } else blk: {
+                        const idx = std.mem.indexOf(u8, buffer, cfg.needle);
+                        break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
                     };
+                    if (offset) |off| {
+                        return .{
+                            .matched = cfg.matched_label,
+                            .elapsed_ms = std.time.milliTimestamp() - start_ms,
+                            .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
+                        };
+                    }
                 }
             },
             .exit => {
