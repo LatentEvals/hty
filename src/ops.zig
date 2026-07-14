@@ -493,6 +493,17 @@ fn runWait(
                 }
             },
         }
+
+        // A concurrent `hty delete` (or the `--remove` sweep inside the
+        // drainAll above) unpublished this session while we were waiting.
+        // Our borrow keeps the memory valid, but the session is gone for
+        // every observable purpose — surface the same structured error a
+        // fresh resolve would, instead of polling a corpse until timeout.
+        // Checked *after* the condition so a wait that was satisfied on
+        // the same drain tick that doomed the session (e.g. wait_for_exit
+        // on a `--remove` session) still reports its success.
+        if (sess.isDoomed()) return error.SessionNotFound;
+
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
     return .{
