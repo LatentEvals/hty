@@ -200,7 +200,7 @@ fn appendServerSessions(
 /// one. Returns null (owned by the caller) if the server is not
 /// currently running.
 fn querySeverListIfLive(alloc: Allocator) !?[]u8 {
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
     var stream = ensure.tryConnect(socket_path) catch return null;

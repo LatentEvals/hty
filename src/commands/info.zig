@@ -102,7 +102,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         }
     }
 
-    const socket_path = try paths.resolveSocketPath(alloc);
+    const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
     const log_dir = try paths.resolveLogDir(alloc);
     defer alloc.free(log_dir);
