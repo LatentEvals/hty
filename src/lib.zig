@@ -131,8 +131,16 @@ pub const InteractiveTerminal = struct {
         const cwd_z = if (config.cwd) |cwd| try alloc.dupeZ(u8, cwd) else null;
         defer if (cwd_z) |cwd| alloc.free(cwd);
 
-        const env_z = try buildEnv(alloc, config.env);
-        defer freeEnv(alloc, env_z);
+        // Everything the child needs is prepared before forking: the full
+        // envp block and the PATH-resolved program path. The parent may be
+        // multithreaded (the server), so between fork and execve the child
+        // is only allowed async-signal-safe calls — no malloc (setenv) and
+        // no PATH search (execvp).
+        const envp = try buildEnvp(alloc, config.env);
+        defer freeEnvp(alloc, envp);
+
+        const exec_path = try resolveProgram(alloc, command.program, envp);
+        defer alloc.free(exec_path);
 
         var winsize = std.mem.zeroes(c.winsize);
         winsize.ws_row = config.rows;
@@ -145,14 +153,26 @@ pub const InteractiveTerminal = struct {
         if (pid < 0) return error.ForkPtyFailed;
 
         if (pid == 0) {
+            // Child: async-signal-safe calls only (chdir/execve/_exit) —
+            // another thread of the parent may hold the malloc lock at
+            // fork time, so anything that allocates can deadlock here.
             if (cwd_z) |cwd| {
                 _ = c.chdir(cwd.ptr);
             }
-            for (env_z) |entry| {
-                _ = c.setenv(entry.key.ptr, entry.value.ptr, 1);
-            }
-            _ = c.execvp(argv[0].?, @ptrCast(argv.ptr));
+            _ = c.execve(exec_path.ptr, @ptrCast(argv.ptr), @ptrCast(envp.ptr));
             c._exit(127);
+        }
+
+        // On the success path `deinit` (via `kill`) closes the master fd
+        // and the reader thread reaps the child. These errdefers mirror
+        // that cleanup for every parent-side failure below (issue #59).
+        // errdefers run in reverse order: kill+reap fires before close so
+        // the child is gone before we drop the master end of its pty.
+        const child_pid: std.posix.pid_t = @intCast(pid);
+        errdefer std.posix.close(master);
+        errdefer {
+            _ = c.kill(child_pid, c.SIGKILL);
+            _ = std.posix.waitpid(child_pid, 0);
         }
 
         var self = try alloc.create(InteractiveTerminal);
@@ -169,12 +189,14 @@ pub const InteractiveTerminal = struct {
             .stream = undefined,
             .config = config,
             .master_fd = master,
-            .child_pid = @intCast(pid),
+            .child_pid = child_pid,
         };
         errdefer self.terminal.deinit(alloc);
+        errdefer self.events.deinit(alloc);
 
         self.handler = self.terminal.vtHandler();
         self.stream = .initAlloc(alloc, self.handler);
+        errdefer self.stream.deinit();
 
         self.pushEvent(.started);
         self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
@@ -399,11 +421,6 @@ pub const InteractiveTerminal = struct {
     }
 };
 
-const SpawnEnv = struct {
-    key: [:0]u8,
-    value: [:0]u8,
-};
-
 fn buildArgv(
     alloc: std.mem.Allocator,
     command: CommandSpec,
@@ -442,47 +459,60 @@ fn freeArgv(alloc: std.mem.Allocator, argv: []?[*:0]u8) void {
     alloc.free(argv);
 }
 
-fn buildEnv(
+/// Build the null-terminated `envp` block for `execve`, entirely in the
+/// parent so the forked child never allocates. Reproduces what the old
+/// fork-then-setenv dance produced: the parent's environment, with
+/// `env` entries overriding parent values, plus `TERM=xterm-256color`
+/// forced in unless `env` supplies its own TERM. When `env` repeats a
+/// key the last occurrence wins, matching sequential setenv calls.
+fn buildEnvp(
     alloc: std.mem.Allocator,
     env: []const EnvVar,
-) ![]SpawnEnv {
+) ![]?[*:0]u8 {
     const has_term = hasEnvKey(env, "TERM");
-    const extra_entries: usize = if (has_term) 0 else 1;
-    const entries = try alloc.alloc(SpawnEnv, env.len + extra_entries);
-    errdefer alloc.free(entries);
 
-    var built: usize = 0;
+    var list: std.ArrayListUnmanaged(?[*:0]u8) = .{};
     errdefer {
-        for (entries[0..built]) |entry| {
-            alloc.free(entry.key);
-            alloc.free(entry.value);
+        for (list.items) |maybe_ptr| {
+            if (maybe_ptr) |ptr| alloc.free(std.mem.span(ptr));
         }
+        list.deinit(alloc);
     }
 
-    for (env, 0..) |entry, i| {
-        entries[i] = .{
-            .key = try alloc.dupeZ(u8, entry.key),
-            .value = try alloc.dupeZ(u8, entry.value),
-        };
-        built += 1;
+    var i: usize = 0;
+    while (std.c.environ[i]) |parent_entry| : (i += 1) {
+        const entry = std.mem.span(parent_entry);
+        const key_len = std.mem.indexOfScalar(u8, entry, '=') orelse entry.len;
+        const key = entry[0..key_len];
+        if (hasEnvKey(env, key)) continue;
+        if (!has_term and std.mem.eql(u8, key, "TERM")) continue;
+        try list.ensureUnusedCapacity(alloc, 1);
+        const duped = try alloc.dupeZ(u8, entry);
+        list.appendAssumeCapacity(duped.ptr);
+    }
+
+    for (env, 0..) |entry, idx| {
+        if (hasEnvKey(env[idx + 1 ..], entry.key)) continue;
+        try list.ensureUnusedCapacity(alloc, 1);
+        const joined = try std.fmt.allocPrintSentinel(alloc, "{s}={s}", .{ entry.key, entry.value }, 0);
+        list.appendAssumeCapacity(joined.ptr);
     }
 
     if (!has_term) {
-        entries[built] = .{
-            .key = try alloc.dupeZ(u8, "TERM"),
-            .value = try alloc.dupeZ(u8, "xterm-256color"),
-        };
-        built += 1;
+        try list.ensureUnusedCapacity(alloc, 1);
+        const term = try alloc.dupeZ(u8, "TERM=xterm-256color");
+        list.appendAssumeCapacity(term.ptr);
     }
-    return entries;
+
+    try list.append(alloc, null);
+    return list.toOwnedSlice(alloc);
 }
 
-fn freeEnv(alloc: std.mem.Allocator, env: []SpawnEnv) void {
-    for (env) |entry| {
-        alloc.free(entry.key);
-        alloc.free(entry.value);
+fn freeEnvp(alloc: std.mem.Allocator, envp: []?[*:0]u8) void {
+    for (envp) |maybe_ptr| {
+        if (maybe_ptr) |ptr| alloc.free(std.mem.span(ptr));
     }
-    alloc.free(env);
+    alloc.free(envp);
 }
 
 fn hasEnvKey(env: []const EnvVar, needle: []const u8) bool {
@@ -490,6 +520,49 @@ fn hasEnvKey(env: []const EnvVar, needle: []const u8) bool {
         if (std.mem.eql(u8, entry.key, needle)) return true;
     }
     return false;
+}
+
+/// Look up `key` in an envp block built by `buildEnvp`.
+fn envpGet(envp: []const ?[*:0]u8, key: []const u8) ?[]const u8 {
+    for (envp) |maybe_ptr| {
+        const entry = std.mem.span(maybe_ptr orelse continue);
+        if (entry.len > key.len and entry[key.len] == '=' and
+            std.mem.eql(u8, entry[0..key.len], key))
+        {
+            return entry[key.len + 1 ..];
+        }
+    }
+    return null;
+}
+
+/// Resolve `program` against PATH the way execvp would, but in the parent
+/// before forking, so the child can call execve directly. PATH is taken
+/// from the merged envp (an `env` override of PATH is honored, exactly as
+/// setenv-then-execvp honored it). If nothing matches, the bare name is
+/// returned unchanged: the child's execve then fails and it exits 127,
+/// preserving the old execvp failure behavior. Caller frees the result.
+fn resolveProgram(
+    alloc: std.mem.Allocator,
+    program: []const u8,
+    envp: []const ?[*:0]u8,
+) ![:0]u8 {
+    if (std.mem.indexOfScalar(u8, program, '/') != null or program.len == 0) {
+        return alloc.dupeZ(u8, program);
+    }
+
+    const path = envpGet(envp, "PATH") orelse "/usr/bin:/bin";
+    var it = std.mem.splitScalar(u8, path, ':');
+    while (it.next()) |dir| {
+        // POSIX: an empty PATH component means the current directory.
+        const base = if (dir.len == 0) "." else dir;
+        const candidate = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ base, program }, 0);
+        std.posix.accessZ(candidate, std.posix.X_OK) catch {
+            alloc.free(candidate);
+            continue;
+        };
+        return candidate;
+    }
+    return alloc.dupeZ(u8, program);
 }
 
 /// Build a column-accurate `rows x cols` grid of UTF-8 grapheme strings.
@@ -872,6 +945,206 @@ test "snapshot preserves ansi styling" {
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "38;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "48;2;") != null);
     try std.testing.expect(std.mem.indexOf(u8, snapshot.screen_ansi, "hi") != null);
+}
+
+test "buildEnvp merges parent environ, applies overrides, injects TERM" {
+    const alloc = std.testing.allocator;
+
+    _ = c.setenv("HTY_ENVP_TEST_PARENT", "from-parent", 1);
+    defer _ = c.unsetenv("HTY_ENVP_TEST_PARENT");
+    _ = c.setenv("HTY_ENVP_TEST_OVERRIDE", "parent-value", 1);
+    defer _ = c.unsetenv("HTY_ENVP_TEST_OVERRIDE");
+
+    const envp = try buildEnvp(alloc, &.{
+        .{ .key = "HTY_ENVP_TEST_OVERRIDE", .value = "stale" },
+        .{ .key = "HTY_ENVP_TEST_OVERRIDE", .value = "child-value" },
+    });
+    defer freeEnvp(alloc, envp);
+
+    // Terminated by exactly one null, and nothing before it is null.
+    try std.testing.expect(envp[envp.len - 1] == null);
+    for (envp[0 .. envp.len - 1]) |entry| try std.testing.expect(entry != null);
+
+    // Parent entries survive; overridden keys appear exactly once with the
+    // last duplicate winning; TERM is injected since no override set it.
+    try std.testing.expectEqualStrings("from-parent", envpGet(envp, "HTY_ENVP_TEST_PARENT").?);
+    try std.testing.expectEqualStrings("child-value", envpGet(envp, "HTY_ENVP_TEST_OVERRIDE").?);
+    try std.testing.expectEqualStrings("xterm-256color", envpGet(envp, "TERM").?);
+
+    var override_count: usize = 0;
+    for (envp) |maybe_ptr| {
+        const entry = std.mem.span(maybe_ptr orelse continue);
+        if (std.mem.startsWith(u8, entry, "HTY_ENVP_TEST_OVERRIDE=")) override_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), override_count);
+}
+
+test "buildEnvp keeps a caller-supplied TERM instead of the default" {
+    const alloc = std.testing.allocator;
+    const envp = try buildEnvp(alloc, &.{
+        .{ .key = "TERM", .value = "vt100" },
+    });
+    defer freeEnvp(alloc, envp);
+    try std.testing.expectEqualStrings("vt100", envpGet(envp, "TERM").?);
+}
+
+test "resolveProgram searches PATH pre-fork and passes through paths and misses" {
+    const alloc = std.testing.allocator;
+
+    // A program containing '/' is used verbatim, no PATH search.
+    const absolute = try resolveProgram(alloc, "/bin/sh", &.{null});
+    defer alloc.free(absolute);
+    try std.testing.expectEqualStrings("/bin/sh", absolute);
+
+    // A bare name resolves against PATH from the envp.
+    var path_entry = "PATH=/nonexistent-dir:/bin".*;
+    const envp = [_]?[*:0]u8{ @ptrCast(&path_entry), null };
+    const resolved = try resolveProgram(alloc, "sh", &envp);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualStrings("/bin/sh", resolved);
+
+    // A miss returns the bare name so the child still exits 127 via execve.
+    const missing = try resolveProgram(alloc, "hty-no-such-program", &envp);
+    defer alloc.free(missing);
+    try std.testing.expectEqualStrings("hty-no-such-program", missing);
+}
+
+test "spawn: child inherits parent env and gets the TERM default" {
+    _ = c.setenv("HTY_SPAWN_ENV_TEST", "inherited-ok", 1);
+    defer _ = c.unsetenv("HTY_SPAWN_ENV_TEST");
+
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf \"var=$HTY_SPAWN_ENV_TEST term=$TERM\"" },
+    }, .{
+        .rows = 10,
+        .cols = 60,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "var=inherited-ok term=xterm-256color", 2_000);
+}
+
+test "spawn: config env overrides parent env and TERM" {
+    _ = c.setenv("HTY_SPAWN_ENV_TEST", "parent-value", 1);
+    defer _ = c.unsetenv("HTY_SPAWN_ENV_TEST");
+
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sh",
+        .args = &.{ "-c", "printf \"var=$HTY_SPAWN_ENV_TEST term=$TERM\"" },
+    }, .{
+        .rows = 10,
+        .cols = 60,
+        .emit_raw_bytes = false,
+        .env = &.{
+            .{ .key = "HTY_SPAWN_ENV_TEST", .value = "override" },
+            .{ .key = "TERM", .value = "vt100" },
+        },
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "var=override term=vt100", 2_000);
+}
+
+test "spawn: bare program name resolves against PATH" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "sh",
+        .args = &.{ "-c", "printf 'resolved-via-path'" },
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    try waitForText(terminal, "resolved-via-path", 2_000);
+}
+
+test "spawn: nonexistent program still exits 127" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "hty-definitely-not-a-real-program",
+    }, .{
+        .rows = 10,
+        .cols = 40,
+        .emit_raw_bytes = false,
+    });
+    defer terminal.deinit();
+
+    const deadline = std.time.milliTimestamp() + 2_000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (terminal.pollEvent()) |event| {
+            defer {
+                var owned = event;
+                owned.deinit(std.heap.c_allocator);
+            }
+            switch (event) {
+                .exited => |code| {
+                    try std.testing.expectEqual(@as(?i32, 127), code);
+                    return;
+                },
+                else => {},
+            }
+        }
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return error.Timeout;
+}
+
+test "spawn: failure on any parent-side error path leaks no memory, fd, or child" {
+    // Drain zombies left by earlier tests so the ECHILD check below only
+    // sees children created here.
+    while (c.waitpid(-1, null, c.WNOHANG) > 0) {}
+
+    const fds_before = try countOpenFds();
+
+    // Walk the failure through every allocation spawn makes, from the
+    // first (pre-fork argv/envp building) to the last (post-fork terminal
+    // setup, the paths issue #59 is about), until a spawn finally
+    // succeeds. After each induced failure the child must already be
+    // killed and reaped (waitpid reports ECHILD) and, at the end, no fd
+    // or memory may have leaked. Backed by std.testing.allocator so any
+    // leak on any path fails the test.
+    var spawned = false;
+    var fail_index: usize = 0;
+    while (fail_index < 10_000) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        if (InteractiveTerminal.spawn(failing.allocator(), .{
+            .program = "/bin/sh",
+            .args = &.{ "-c", "sleep 5" },
+        }, .{
+            .rows = 4,
+            .cols = 20,
+            .scrollback = 0,
+            .emit_raw_bytes = false,
+            .emit_screen_updates = false,
+        })) |terminal| {
+            terminal.deinit();
+            spawned = true;
+            break;
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            // spawn's errdefer reaps the child synchronously before the
+            // error is returned, so the kernel must report no children at
+            // all. 0 (a live child) or a pid (a zombie) means we leaked.
+            try std.testing.expectEqual(@as(c.pid_t, -1), c.waitpid(-1, null, c.WNOHANG));
+        }
+    }
+    try std.testing.expect(spawned);
+
+    const fds_after = try countOpenFds();
+    try std.testing.expectEqual(fds_before, fds_after);
+}
+
+fn countOpenFds() !usize {
+    var dir = try std.fs.openDirAbsolute("/dev/fd", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+    return count;
 }
 
 // ---------------------------------------------------------------------------
