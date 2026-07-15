@@ -378,7 +378,21 @@ pub const InteractiveTerminal = struct {
             const n = std.posix.read(self.master_fd, &buffer) catch |err| switch (err) {
                 error.InputOutput => break,
                 error.NotOpenForReading => break,
-                error.WouldBlock => continue,
+                error.WouldBlock => {
+                    // The server flips the master fd non-blocking (its
+                    // event loop writes queued input to it and must never
+                    // block). Wait for readability instead of spinning; a
+                    // closed fd reports POLLNVAL and the retried read
+                    // surfaces the terminal error above. Library users
+                    // keep a blocking fd and never land here.
+                    var pfds = [_]std.posix.pollfd{.{
+                        .fd = self.master_fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    _ = std.posix.poll(&pfds, 250) catch {};
+                    continue;
+                },
                 else => return err,
             };
             if (n == 0) break;
