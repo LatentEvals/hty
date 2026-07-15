@@ -4819,3 +4819,121 @@ test "refcount: removeLocked defers free while borrowed; last release frees" {
     // fails the test if it leaks instead.
     registry.release(sess);
 }
+
+// ============================================================================
+// Wait-poll snapshot gating (hardening: skip redundant snapshots)
+// ============================================================================
+
+// A timing-out `wait_for_text` polls ~every 25ms. With the screen static,
+// the unified wait loop must snapshot only on its first iteration — the
+// change stamp gating skips every subsequent poll — and the gate must not
+// stop a genuine screen change from being scanned and matched.
+test "wait polls skip snapshots while the screen is unchanged" {
+    var registry = SessionRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "quiet",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 40,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Push some output through and let the screen settle so no straggling
+    // PTY echo bumps the change stamp mid-measurement.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "quiet",
+            .text = "settle marker\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "quiet",
+            .text = "settle marker",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "quiet",
+            .idle_ms = 300,
+            .timeout_ms = 5_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const sess = (try registry.resolve("quiet")) orelse return error.SessionNotFound;
+    const before = sess.terminal.snapshotCount();
+
+    // ~24 poll iterations at 25ms. The needle never appears and the screen
+    // never changes, so the loop must scan exactly once (first iteration);
+    // the timeout response carries no snapshot payload, so the counter
+    // delta is 1 in the steady state. Allow one extra in case a late drain
+    // bumps the stamp once early in the wait — the point is that ~24
+    // iterations must not take ~24 snapshots.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "quiet",
+            .text = "never appears",
+            .timeout_ms = 600,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const to_val = object.get("timed_out") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(true, to_val.bool);
+    }
+    const idle_polls_delta = sess.terminal.snapshotCount() - before;
+    try std.testing.expect(idle_polls_delta <= 2);
+
+    // The gate must not suppress a real change: fresh output bumps the
+    // stamp, the next poll re-scans, and the wait resolves with a match.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "quiet",
+            .text = "now it appears\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "quiet",
+            .text = "now it appears",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const snapshot = object.get("snapshot") orelse return error.InvalidResponse;
+        const snapshot_object = switch (snapshot) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+        const buffer = snapshot_object.get("buffer") orelse return error.InvalidResponse;
+        try std.testing.expect(buffer == .string);
+        try std.testing.expect(std.mem.indexOf(u8, buffer.string, "now it appears") != null);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "quiet" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+}
