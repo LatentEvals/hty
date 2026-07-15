@@ -181,6 +181,13 @@ pub const Session = struct {
     /// without checking status first.
     pub const no_exit_code: i32 = std.math.minInt(i32);
 
+    /// Upper bound on unflushed input bytes queued for the PTY master
+    /// (raw bytes, post hex-decode). Interactive input is human-scale;
+    /// once a child has 64 KiB of unconsumed input it has stopped reading
+    /// its tty and further input is dropped rather than buffered without
+    /// bound (PRD: drop with a debug-level note, never stall the server).
+    pub const max_pending_input_bytes: usize = 64 * 1024;
+
     alloc: Allocator,
     id: [36]u8,
     name: ?[]u8,
@@ -243,14 +250,21 @@ pub const Session = struct {
 
     log_file: ?std.fs.File = null,
     /// Serializes writes to `log_file`. Held by every log helper in `log.zig`
-    /// since multiple threads (drain, attach reader, RPC workers) call into
-    /// the log writers concurrently once the server becomes multi-threaded.
+    /// since multiple threads (drain, PTY readers) call into the log writers
+    /// concurrently until phase 3 puts PTY fds on the loop.
     log_mutex: std.Thread.Mutex = .{},
 
     /// Active `hty attach` clients subscribed to this session's output.
+    /// Only ever touched from the server's event-loop thread (broadcasts,
+    /// attach setup, reaping) — no lock needed.
     attach_clients: std.ArrayListUnmanaged(*AttachClient) = .{},
-    /// Protects attach_clients against concurrent broadcast and remove.
-    attach_mutex: std.Thread.Mutex = .{},
+
+    /// Input bytes accepted for the PTY that the master fd wouldn't take
+    /// without blocking, waiting to be flushed on writability. Bounded by
+    /// `max_pending_input_bytes`; overflow is dropped (a child that has
+    /// stopped reading its tty with 64 KiB of unconsumed input is wedged
+    /// anyway, and input must never stall the event loop).
+    pending_input: std.ArrayListUnmanaged(u8) = .{},
 
     pub fn initAtomics(now_ms: i64) struct {
         last_screen_change_at_ms_atomic: std.atomic.Value(i64),
@@ -312,30 +326,105 @@ pub const Session = struct {
         return self.doomed_atomic.load(.acquire);
     }
 
+    /// Queue raw input bytes for the PTY. This is the single fan-in point
+    /// for every input source (RPC `send_*` ops and attach `input` frames):
+    /// whole frames are appended in call order, so concurrent clients
+    /// interleave at frame granularity, never mid-frame. Bytes the master
+    /// fd accepts immediately go straight out (the fd is non-blocking on
+    /// the server path); the remainder lands in `pending_input`, flushed
+    /// by the event loop on master-fd writability. When the buffer is at
+    /// `max_pending_input_bytes` the frame is dropped without error — a
+    /// wedged child must never stall or backpressure the server.
+    ///
+    /// Errors are real write failures (child gone, fd closed) observed
+    /// while nothing was buffered; drops are silent by design.
+    pub fn queueInput(self: *Session, bytes: []const u8) !void {
+        self.flushPendingInput();
+        var index: usize = 0;
+        if (self.pending_input.items.len == 0) {
+            while (index < bytes.len) {
+                const n = std.posix.write(self.terminal.master_fd, bytes[index..]) catch |err| switch (err) {
+                    error.WouldBlock => break,
+                    else => return err,
+                };
+                if (n == 0) break;
+                index += n;
+            }
+            if (index == bytes.len) return;
+        }
+        if (self.pending_input.items.len + (bytes.len - index) > max_pending_input_bytes) {
+            std.log.debug("pending input full for session {s}; dropping {d} bytes", .{
+                &self.id, bytes.len - index,
+            });
+            return;
+        }
+        self.pending_input.appendSlice(self.alloc, bytes[index..]) catch {
+            // OOM: input is droppable by policy; never fail the caller
+            // once part of the frame may already be on the wire.
+        };
+    }
+
+    /// Write out as much queued input as the master fd accepts without
+    /// blocking. Called by the event loop on POLLOUT (and from the drain
+    /// step as a backstop). A real write error means the queued bytes can
+    /// never be delivered (child gone) — the buffer is dropped so the
+    /// loop stops arming write interest on a dead fd.
+    pub fn flushPendingInput(self: *Session) void {
+        const len = self.pending_input.items.len;
+        if (len == 0) return;
+        var written: usize = 0;
+        while (written < len) {
+            const n = std.posix.write(self.terminal.master_fd, self.pending_input.items[written..]) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    self.pending_input.clearRetainingCapacity();
+                    return;
+                },
+            };
+            if (n == 0) break;
+            written += n;
+        }
+        if (written == 0) return;
+        if (written < len) {
+            std.mem.copyForwards(u8, self.pending_input.items[0 .. len - written], self.pending_input.items[written..]);
+            self.pending_input.shrinkRetainingCapacity(len - written);
+        } else {
+            self.pending_input.clearRetainingCapacity();
+        }
+    }
+
+    pub fn hasPendingInput(self: *const Session) bool {
+        return self.pending_input.items.len != 0;
+    }
+
     pub fn deinit(self: *Session) void {
         // Tear down any still-attached clients before freeing the session.
-        // Takes the mutex just to be safe against a rogue late broadcast.
-        // Emit a disconnect for each still-open client before its storage
-        // goes away — this is our last chance to bracket the attach in the
-        // log. The reader-thread-exit path may have also flipped the
-        // `disconnect_logged` flag; the atomic swap ensures we emit
-        // exactly once per connection.
+        // Emit a disconnect for each still-open client — this is our last
+        // chance to bracket the attach in the log; the `disconnect_logged`
+        // swap ensures we emit exactly once per connection. Clients owned
+        // by an event-loop connection are only detached here (marked
+        // closed, `session_gone` set so the loop never dereferences this
+        // session again); the loop frees their storage when it reaps the
+        // connection. Self-owned clients (tests, teardown paths without a
+        // loop) are destroyed in place.
         const log_mod = @import("log.zig");
-        self.attach_mutex.lock();
-        for (self.attach_clients.items) |client| {
-            client.shutdown();
-        }
         const clients_snapshot = self.attach_clients.toOwnedSlice(self.alloc) catch &.{};
-        self.attach_mutex.unlock();
         for (clients_snapshot) |client| {
+            client.shutdown();
             if (!client.disconnect_logged.swap(true, .acq_rel)) {
                 var arena_state = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_state.deinit();
                 log_mod.logAttachDisconnectEvent(arena_state.allocator(), self, client.client_id);
             }
-            client.deinit();
+            if (client.owned_by_conn) {
+                client.session_gone = true;
+            } else {
+                client.deinit();
+            }
         }
         if (clients_snapshot.len > 0) self.alloc.free(clients_snapshot);
+
+        self.pending_input.deinit(self.alloc);
 
         if (self.log_file) |*f| {
             f.close();
@@ -349,36 +438,36 @@ pub const Session = struct {
 };
 
 /// Put an attach/watch socket into non-blocking mode. Broadcast writes
-/// from the drain step (which holds `registry.mutex`) must never block on
-/// a client that stopped reading. The flag has to live on the fd itself:
-/// macOS ignores `MSG_DONTWAIT` on UNIX-domain sockets, so per-call flags
-/// are not enough. The attach reader loop compensates by blocking in
-/// `poll` instead of `read` (see `server_attach.attachReaderLoop`).
+/// from the drain step must never block on a client that stopped reading.
+/// The flag has to live on the fd itself: macOS ignores `MSG_DONTWAIT` on
+/// UNIX-domain sockets, so per-call flags are not enough.
 pub fn setStreamNonBlocking(fd: std.posix.socket_t) !void {
     const fl = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
     const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
 }
 
-/// One live `hty attach` connection. The main accept loop's drain step
-/// broadcasts raw PTY bytes to each attach_client on the owning session;
-/// a per-client reader thread reads input frames from the socket and
-/// forwards them back into the session's terminal.
+/// One live `hty attach` connection's broadcast subscription. The drain
+/// step broadcasts raw PTY bytes to each attach_client on the owning
+/// session through the client's bounded outbound buffer; inbound frames
+/// are parsed by the event loop's connection state machine (there is no
+/// per-client reader thread).
 pub const AttachClient = struct {
     /// Upper bound on bytes buffered for a client whose socket would block.
     /// 1 MiB is generous — a full-screen ANSI frame is a few hundred KB at
-    /// worst — while bounding per-client memory. A client that falls further
-    /// behind is dropped (marked closed and reaped on the next drain pass):
-    /// drop-and-disconnect is the policy; observers never get to stall the
-    /// server or backpressure the PTY.
+    /// worst — while bounding per-client memory. This is the same bound and
+    /// policy as the loop's per-connection outbound buffer: a client that
+    /// falls further behind is dropped (marked closed and reaped, with an
+    /// `attach_disconnect` logged). Observers never get to stall the server
+    /// or backpressure the PTY.
     pub const max_pending_bytes: usize = 1 << 20;
 
     alloc: Allocator,
     session: *Session,
     stream: std.net.Stream,
     /// Outbound bytes the socket wouldn't accept without blocking, waiting
-    /// to be flushed by the next write attempt or drain tick. Guarded by
-    /// `write_mutex`. Bounded by `max_pending_bytes`.
+    /// to be flushed on POLLOUT (or the next write attempt / drain tick).
+    /// Bounded by `max_pending_bytes`.
     pending: std.ArrayListUnmanaged(u8) = .{},
     /// Opaque, self-describing id assigned by the server on accept. Appears
     /// in the session log in `attach_connect`, `attach_disconnect`, and
@@ -386,22 +475,28 @@ pub const AttachClient = struct {
     /// connects with disconnects even when multiple clients overlap.
     /// Format: `attach-<uuidv7>`. Owned by this struct; freed on deinit.
     client_id: []u8,
-    write_mutex: std.Thread.Mutex = .{},
     closed: std.atomic.Value(bool) = .init(false),
     /// Set true once the `attach_disconnect` log event has been emitted.
-    /// Used by the reaper path to avoid double-emitting if both the
-    /// reader-thread-exit path and the session-deinit path run on the
-    /// same client.
+    /// Used to avoid double-emitting when both the loop's reap path and
+    /// the session-deinit path run on the same client.
     disconnect_logged: std.atomic.Value(bool) = .init(false),
-    reader_thread: ?std.Thread = null,
     /// If true, the client is a `hty watch` subscriber: it sits on the
     /// same broadcast list as a full attach client, receives the same
     /// initial snapshot and live output/exit frames, but any `input` /
     /// `resize` frames it sends are silently dropped by the server-side
-    /// reader loop. This lets watch piggyback on attach's broadcast
+    /// frame dispatch. This lets watch piggyback on attach's broadcast
     /// infrastructure with one flag rather than a parallel subscriber
     /// list. See LatentEvals/hty#29.
     read_only: bool = false,
+    /// True when an event-loop connection owns this client's lifecycle
+    /// (socket close + storage free happen when the loop reaps the conn).
+    /// False for clients constructed directly (tests / loop-less paths),
+    /// which are destroyed by `reapClosedAttachClients` or session deinit.
+    owned_by_conn: bool = false,
+    /// Set by `Session.deinit` when the owning session is torn down while
+    /// a loop connection still references this client. Tells the loop's
+    /// reap path that `session` is dangling and must not be dereferenced.
+    session_gone: bool = false,
 
     pub fn isClosed(self: *const AttachClient) bool {
         return self.closed.load(.acquire);
@@ -409,50 +504,44 @@ pub const AttachClient = struct {
 
     pub fn shutdown(self: *AttachClient) void {
         if (self.closed.swap(true, .acq_rel)) return;
-        // Shutting down the socket unblocks any in-flight read() on the
-        // reader thread so it can exit cleanly.
+        // Shutting down the socket makes the peer see EOF promptly; the
+        // loop (or reaper) frees the client on its next pass.
         std.posix.shutdown(self.stream.handle, .both) catch {};
     }
 
     /// Best-effort, non-blocking write of a pre-framed JSONL line (with
     /// trailing '\n'). Bytes the socket won't accept right now are queued
-    /// in `pending` (flushed on the next write or drain tick). Never blocks:
-    /// this runs from the drain step while `registry.mutex` is held, so a
-    /// stalled reader must not be able to wedge the server. Marks the
+    /// in `pending` (flushed on POLLOUT or the next write). Never blocks:
+    /// a stalled reader must not be able to wedge the server. Marks the
     /// client closed — so the broadcaster drops it on the next pass — on
     /// any real write error or when `pending` would exceed
     /// `max_pending_bytes`.
     pub fn tryWriteFrame(self: *AttachClient, frame: []const u8) bool {
         if (self.isClosed()) return false;
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
         // Anything already queued must go out before this frame so the
         // client sees frames in broadcast order.
-        if (!self.flushPendingLocked()) return false;
+        if (!self.flushPendingInner()) return false;
         var sent: usize = 0;
         if (self.pending.items.len == 0) {
-            sent = self.sendNonBlockingLocked(frame) orelse return false;
+            sent = self.sendNonBlocking(frame) orelse return false;
         }
-        if (sent < frame.len) return self.queuePendingLocked(frame[sent..]);
+        if (sent < frame.len) return self.queuePending(frame[sent..]);
         return true;
     }
 
-    /// Give this client a chance to drain its pending buffer. Called once
-    /// per drain tick so a client that stalled during a burst catches back
-    /// up even when the session emits no further output.
+    /// Give this client a chance to drain its pending buffer. Called on
+    /// POLLOUT and once per drain tick so a client that stalled during a
+    /// burst catches back up even when the session emits no further output.
     pub fn flushPending(self: *AttachClient) void {
         if (self.isClosed()) return;
-        self.write_mutex.lock();
-        defer self.write_mutex.unlock();
-        _ = self.flushPendingLocked();
+        _ = self.flushPendingInner();
     }
 
-    /// Caller holds `write_mutex`. Returns false if the client got marked
-    /// closed by a write error.
-    fn flushPendingLocked(self: *AttachClient) bool {
+    /// Returns false if the client got marked closed by a write error.
+    fn flushPendingInner(self: *AttachClient) bool {
         const len = self.pending.items.len;
         if (len == 0) return true;
-        const n = self.sendNonBlockingLocked(self.pending.items) orelse return false;
+        const n = self.sendNonBlocking(self.pending.items) orelse return false;
         if (n == 0) return true;
         if (n < len) {
             std.mem.copyForwards(u8, self.pending.items[0 .. len - n], self.pending.items[n..]);
@@ -463,13 +552,13 @@ pub const AttachClient = struct {
         return true;
     }
 
-    /// Caller holds `write_mutex`. The socket is in non-blocking mode
-    /// (`setStreamNonBlocking`, done at attach setup) so a full socket
-    /// buffer surfaces as `error.WouldBlock` instead of stalling; the
-    /// MSG_DONTWAIT flag is belt-and-braces for platforms that honor it.
-    /// Returns the byte count the kernel accepted (0 when the buffer is
-    /// full), or null after marking the client closed on any real error.
-    fn sendNonBlockingLocked(self: *AttachClient, bytes: []const u8) ?usize {
+    /// The socket is in non-blocking mode (`setStreamNonBlocking`, done at
+    /// attach setup) so a full socket buffer surfaces as `error.WouldBlock`
+    /// instead of stalling; the MSG_DONTWAIT flag is belt-and-braces for
+    /// platforms that honor it. Returns the byte count the kernel accepted
+    /// (0 when the buffer is full), or null after marking the client
+    /// closed on any real error.
+    fn sendNonBlocking(self: *AttachClient, bytes: []const u8) ?usize {
         var written: usize = 0;
         while (written < bytes.len) {
             const n = std.posix.send(
@@ -489,10 +578,10 @@ pub const AttachClient = struct {
         return written;
     }
 
-    /// Caller holds `write_mutex`. Queue leftover bytes for a later flush;
-    /// a client too far behind (`max_pending_bytes`) is marked closed and
-    /// dropped instead of buffered without bound.
-    fn queuePendingLocked(self: *AttachClient, bytes: []const u8) bool {
+    /// Queue leftover bytes for a later flush; a client too far behind
+    /// (`max_pending_bytes`) is marked closed and dropped instead of
+    /// buffered without bound.
+    fn queuePending(self: *AttachClient, bytes: []const u8) bool {
         if (self.pending.items.len + bytes.len > max_pending_bytes) {
             self.closed.store(true, .release);
             return false;
@@ -504,10 +593,20 @@ pub const AttachClient = struct {
         return true;
     }
 
+    /// Full teardown for self-owned clients: closes the socket and frees
+    /// all storage. Conn-owned clients must use `deinitDetached` instead —
+    /// the loop's connection owns (and closes) the fd.
     pub fn deinit(self: *AttachClient) void {
         self.shutdown();
-        if (self.reader_thread) |t| t.join();
         self.stream.close();
+        self.pending.deinit(self.alloc);
+        self.alloc.free(self.client_id);
+        self.alloc.destroy(self);
+    }
+
+    /// Free storage without touching the stream (the event-loop connection
+    /// owns the fd and closes it during conn teardown).
+    pub fn deinitDetached(self: *AttachClient) void {
         self.pending.deinit(self.alloc);
         self.alloc.free(self.client_id);
         self.alloc.destroy(self);

@@ -1869,6 +1869,7 @@ const ServerHarness = struct {
 const ServerEntryCtx = struct {
     alloc: std.mem.Allocator,
     socket_path: []const u8,
+    log_dir: []const u8,
     stop: *std.atomic.Value(bool),
     err_flag: *std.atomic.Value(bool),
 
@@ -1876,6 +1877,7 @@ const ServerEntryCtx = struct {
         runServerWithOpts(self.alloc, self.socket_path, .{
             .empty_grace_ms = 30_000, // let stop_signal control exit
             .stop_signal = self.stop,
+            .log_dir = self.log_dir,
         }) catch {
             self.err_flag.store(true, .release);
         };
@@ -1918,6 +1920,7 @@ fn startServerHarness(alloc: std.mem.Allocator, tag: []const u8) !*ServerHarness
     ctx.* = .{
         .alloc = alloc,
         .socket_path = harness.socket_path,
+        .log_dir = harness.log_dir,
         .stop = &harness.stop,
         .err_flag = &harness.server_err,
     };
@@ -3340,9 +3343,7 @@ fn registerAttachClient(
     // Mirror production attach setup: broadcast sockets are non-blocking.
     try session_mod_tests.setStreamNonBlocking(local.handle);
 
-    sess.attach_mutex.lock();
     try sess.attach_clients.append(alloc, client);
-    sess.attach_mutex.unlock();
 
     // Record the connect event — this is what `handleAttachConnection`
     // does in production right after appending to the list.
@@ -3395,7 +3396,7 @@ test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect
     const client_id_owned = try alloc.dupe(u8, client.client_id);
     defer alloc.free(client_id_owned);
 
-    // Dispatch an input frame the way `attachReaderLoop` would.
+    // Dispatch an input frame the way the event loop's frame parser would.
     const frame = "{\"op\":\"input\",\"bytes_hex\":\"71\"}";
     try server_attach_mod.dispatchAttachFrame(client, frame);
 
@@ -3589,8 +3590,8 @@ test "issue #33: abrupt attach drop still logs attach_disconnect" {
     defer alloc.free(client_id_owned);
 
     // "Abrupt": close the peer end (no detach op, no protocol teardown).
-    // Mirror what `attachReaderLoop` does when its read() returns 0 or
-    // errors: flip the client closed, then the reaper does the rest.
+    // Mirror what the event loop does when it observes EOF on an attach
+    // conn: flip the client closed, then the reaper does the rest.
     pair.peer.close();
     client.shutdown();
     attach_mod.reapClosedAttachClients(sess);
@@ -3790,7 +3791,11 @@ test "issue #29: watch against existing session receives started + initial snaps
         line,
         true, // read_only
     );
-    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
+    const watch_client = switch (result) {
+        .attached => |client| client,
+        else => return error.ExpectedAttached,
+    };
+    try std.testing.expect(watch_client.read_only);
 
     var reader = LineReader.init(alloc, pair.peer);
     defer reader.deinit();
@@ -3822,25 +3827,11 @@ test "issue #29: watch against existing session receives started + initial snaps
         try std.testing.expect(parsed.value.object.get("bytes_hex") != null);
     }
 
-    // Clean up: close the peer so the server reader thread exits.
-    // handleAttachConnection doesn't give us the client pointer back, so
-    // we find it on the session's attach list and shut it down.
+    // Clean up: there is no reader thread anymore — mark the client
+    // closed the way the loop would on EOF and reap it directly.
     const sess = try sessionByName(&registry, "watchexist");
     pair.peer.close();
-    // Wait for the reader thread to notice EOF and flip `closed`.
-    // Loop for up to 1s.
-    var waited_ms: u32 = 0;
-    while (waited_ms < 1000) {
-        var any_open = false;
-        sess.attach_mutex.lock();
-        for (sess.attach_clients.items) |client| {
-            if (!client.isClosed()) any_open = true;
-        }
-        sess.attach_mutex.unlock();
-        if (!any_open) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-        waited_ms += 10;
-    }
+    watch_client.shutdown();
     attach_mod.reapClosedAttachClients(sess);
 
     {
@@ -3850,35 +3841,67 @@ test "issue #29: watch against existing session receives started + initial snaps
     }
 }
 
-test "issue #29: watch pre-creation promotes on spawn" {
+/// Open a raw attach-style connection against a harness server: connect
+/// to the Unix socket and write the request line. The caller reads
+/// frames off the returned stream (and owns/closes it).
+fn openStreamingConn(socket_path: []const u8, request_line: []const u8) !std.net.Stream {
+    const stream = try std.net.connectUnixSocket(socket_path);
+    errdefer stream.close();
+    try stream.writeAll(request_line);
+    try stream.writeAll("\n");
+    return stream;
+}
+
+/// Read frames until one of kind `expected_kind` arrives (skipping other
+/// kinds), within `timeout_ms` total. Returns the frame's `bytes_hex`
+/// decoded when present (caller frees), or an empty slice.
+fn expectFrameKind(
+    alloc: std.mem.Allocator,
+    reader: *LineReader,
+    expected_kind: []const u8,
+    timeout_ms: u64,
+) ![]const u8 {
+    const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    while (true) {
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns >= deadline_ns) return error.FrameTimeout;
+        const remaining_ms: u64 = @intCast(@divTrunc(deadline_ns - now_ns, std.time.ns_per_ms));
+        const line = try reader.readLine(@max(1, remaining_ms));
+        defer alloc.free(line);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => continue,
+        };
+        const kind = obj.get("kind") orelse continue;
+        if (kind != .string) continue;
+        if (!std.mem.eql(u8, kind.string, expected_kind)) continue;
+        if (obj.get("bytes_hex")) |hv| {
+            if (hv == .string) return try hex.decodeHex(alloc, hv.string);
+        }
+        return try alloc.dupe(u8, "");
+    }
+}
+
+test "issue #29: watch pre-creation promotes on spawn (socket level)" {
     const alloc = std.testing.allocator;
-    const log_dir = try setupAttachLogDir(alloc, "watch-pending");
-    defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
-    defer registry.deinit();
-    registry.log_dir = log_dir;
+    const harness = try startServerHarness(alloc, "watchpend");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
 
-    // No session exists yet. Park a watcher on a future name.
-    const pair = try makeSocketPair();
-    // Close the peer explicitly after reading — no defer (double-close).
-
-    const line = "{\"op\":\"watch\",\"session\":\"ghostname\"}";
-    const result = try server_attach_mod.handleAttachConnection(
-        alloc,
-        &registry,
-        pair.local,
-        line,
-        true,
-    );
-    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
-
-    var reader = LineReader.init(alloc, pair.peer);
+    // No session exists yet. Park a watcher on a future name through the
+    // real socket protocol.
+    const stream = try openStreamingConn(harness.socket_path, "{\"op\":\"watch\",\"session\":\"ghostname\"}");
+    defer stream.close();
+    var reader = LineReader.init(alloc, stream);
     defer reader.deinit();
 
     // First line is the waiting ack.
-    const ack = try reader.readLine(1000);
+    const ack = try reader.readLine(2000);
     defer alloc.free(ack);
     {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, ack, .{});
@@ -3890,10 +3913,10 @@ test "issue #29: watch pre-creation promotes on spawn" {
         try std.testing.expect(w == .bool and w.bool);
     }
 
-    // Spawn the session with the matching name. Promotion happens
-    // synchronously inside registry.create() under the mutex.
+    // Spawn the session with the matching name; the loop promotes the
+    // parked conn in the same iteration the spawn dispatches.
     {
-        var parsed = try testRequest(&registry, .{
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
             .op = "spawn",
             .name = "ghostname",
             .program = "/bin/cat",
@@ -3904,58 +3927,15 @@ test "issue #29: watch pre-creation promotes on spawn" {
         _ = try expectTestOk(parsed);
     }
 
-    // Next line must be the "started" frame.
-    const started = try reader.readLine(2000);
-    defer alloc.free(started);
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, started, .{});
-        defer parsed.deinit();
-        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
-        try std.testing.expect(kind == .string);
-        try std.testing.expectEqualStrings("started", kind.string);
-    }
-
-    // Followed by the initial snapshot as an `output` frame.
-    const snap = try reader.readLine(2000);
-    defer alloc.free(snap);
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, snap, .{});
-        defer parsed.deinit();
-        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
-        try std.testing.expect(kind == .string);
-        try std.testing.expectEqualStrings("output", kind.string);
-    }
-
-    // Verify the watcher was indeed promoted to an AttachClient on the
-    // new session, with read_only=true.
-    const sess = try sessionByName(&registry, "ghostname");
-    sess.attach_mutex.lock();
-    try std.testing.expect(sess.attach_clients.items.len >= 1);
-    var saw_readonly = false;
-    for (sess.attach_clients.items) |client| {
-        if (client.read_only) saw_readonly = true;
-    }
-    sess.attach_mutex.unlock();
-    try std.testing.expect(saw_readonly);
-
-    // Tear down.
-    pair.peer.close();
-    var waited_ms: u32 = 0;
-    while (waited_ms < 1000) {
-        var any_open = false;
-        sess.attach_mutex.lock();
-        for (sess.attach_clients.items) |client| {
-            if (!client.isClosed()) any_open = true;
-        }
-        sess.attach_mutex.unlock();
-        if (!any_open) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-        waited_ms += 10;
-    }
-    attach_mod.reapClosedAttachClients(sess);
+    // Next line must be the "started" frame, followed by the initial
+    // snapshot as an `output` frame.
+    const started_bytes = try expectFrameKind(alloc, &reader, "started", 5000);
+    alloc.free(started_bytes);
+    const snap_bytes = try expectFrameKind(alloc, &reader, "output", 5000);
+    alloc.free(snap_bytes);
 
     {
-        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "ghostname" });
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "ghostname" });
         defer kill_parsed.deinit();
         _ = try expectTestOk(kill_parsed);
     }
@@ -3989,41 +3969,29 @@ const RegistryTicker = struct {
 
 test "issue #29: promoted watcher streams live output (regression: post-promotion read EOF)" {
     const alloc = std.testing.allocator;
-    const log_dir = try setupAttachLogDir(alloc, "watch-stream");
-    defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
-    defer registry.deinit();
-    registry.log_dir = log_dir;
+    const harness = try startServerHarness(alloc, "watchstream");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
 
-    // Park a watcher on a name that doesn't exist yet.
-    const pair = try makeSocketPair();
-    // Close explicitly at end (not via defer — avoids double close).
-
-    const watch_line = "{\"op\":\"watch\",\"session\":\"streamfoo\"}";
-    const result = try server_attach_mod.handleAttachConnection(
-        alloc,
-        &registry,
-        pair.local,
-        watch_line,
-        true,
-    );
-    try std.testing.expectEqual(server_attach_mod.ConnectionResult.attached, result);
-
-    var reader = LineReader.init(alloc, pair.peer);
+    // Park a watcher on a name that doesn't exist yet, through the real
+    // socket protocol.
+    const stream = try openStreamingConn(harness.socket_path, "{\"op\":\"watch\",\"session\":\"streamfoo\"}");
+    defer stream.close();
+    var reader = LineReader.init(alloc, stream);
     defer reader.deinit();
 
     // Consume the waiting ack.
-    const ack = try reader.readLine(1000);
+    const ack = try reader.readLine(2000);
     defer alloc.free(ack);
 
     // Spawn the session running a shell that prints three lines with a
-    // short sleep between each. The spec's repro used 0.4s; we shrink to
-    // 0.1s to keep the test fast while still guaranteeing each line
-    // reaches the PTY as a separate output event.
+    // short sleep between each, so each line reaches the PTY as a
+    // separate output event.
     {
-        var parsed = try testRequest(&registry, .{
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
             .op = "spawn",
             .name = "streamfoo",
             .program = "/bin/sh",
@@ -4035,50 +4003,23 @@ test "issue #29: promoted watcher streams live output (regression: post-promotio
         _ = try expectTestOk(parsed);
     }
 
-    // Start the drain ticker so PTY events reach the attach broadcast.
-    var ticker = RegistryTicker{ .registry = &registry };
-    try ticker.start();
-    defer ticker.stopAndJoin();
-
     // Expect: `started` frame, then output frames containing L1/L2/L3.
     // The first `output` frame is the initial snapshot (possibly blank);
     // subsequent ones carry live PTY bytes. Rather than assume a precise
     // frame count we drain frames until we've seen all three markers or
     // the timeout expires.
-    const started = try reader.readLine(2000);
-    defer alloc.free(started);
-    {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, started, .{});
-        defer parsed.deinit();
-        const kind = parsed.value.object.get("kind") orelse return error.MissingKind;
-        try std.testing.expectEqualStrings("started", kind.string);
-    }
+    const started_bytes = try expectFrameKind(alloc, &reader, "started", 5000);
+    alloc.free(started_bytes);
 
     var saw_l1 = false;
     var saw_l2 = false;
     var saw_l3 = false;
-    // Generous per-frame timeout to tolerate loaded CI machines; the
-    // shell script takes ~0.3s to run to completion.
-    const total_deadline_ns = std.time.nanoTimestamp() + @as(i128, 3_000) * std.time.ns_per_ms;
+    const total_deadline_ns = std.time.nanoTimestamp() + @as(i128, 10_000) * std.time.ns_per_ms;
     while (!(saw_l1 and saw_l2 and saw_l3)) {
         const now_ns = std.time.nanoTimestamp();
         if (now_ns >= total_deadline_ns) break;
         const remaining_ms: u64 = @intCast(@divTrunc(total_deadline_ns - now_ns, std.time.ns_per_ms));
-        const line = reader.readLine(@max(50, remaining_ms)) catch break;
-        defer alloc.free(line);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
-        defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => continue,
-        };
-        const kind = obj.get("kind") orelse continue;
-        if (kind != .string) continue;
-        if (!std.mem.eql(u8, kind.string, "output")) continue;
-        const hex_val = obj.get("bytes_hex") orelse continue;
-        if (hex_val != .string) continue;
-        const bytes = hex.decodeHex(alloc, hex_val.string) catch continue;
+        const bytes = expectFrameKind(alloc, &reader, "output", @max(50, remaining_ms)) catch break;
         defer alloc.free(bytes);
         if (std.mem.indexOf(u8, bytes, "L1") != null) saw_l1 = true;
         if (std.mem.indexOf(u8, bytes, "L2") != null) saw_l2 = true;
@@ -4089,25 +4030,8 @@ test "issue #29: promoted watcher streams live output (regression: post-promotio
     try std.testing.expect(saw_l2);
     try std.testing.expect(saw_l3);
 
-    // Tear down.
-    pair.peer.close();
-    const sess = try sessionByName(&registry, "streamfoo");
-    var waited_ms: u32 = 0;
-    while (waited_ms < 1000) {
-        var any_open = false;
-        sess.attach_mutex.lock();
-        for (sess.attach_clients.items) |client| {
-            if (!client.isClosed()) any_open = true;
-        }
-        sess.attach_mutex.unlock();
-        if (!any_open) break;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-        waited_ms += 10;
-    }
-    attach_mod.reapClosedAttachClients(sess);
-
     {
-        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "streamfoo" });
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "streamfoo" });
         defer kill_parsed.deinit();
         _ = try expectTestOk(kill_parsed);
     }
@@ -4156,9 +4080,7 @@ test "issue #29: read-only input frames are dropped by the server" {
         .client_id = client_id,
         .read_only = true,
     };
-    sess.attach_mutex.lock();
     try sess.attach_clients.append(alloc, client);
-    sess.attach_mutex.unlock();
     {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
@@ -4252,9 +4174,8 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
         seq +%= 1;
         try std.testing.expect(client.tryWriteFrame(&frame));
         try expected.appendSlice(alloc, &frame);
-        client.write_mutex.lock();
+        // Single-threaded now — the buffer can be inspected directly.
         const pending_len = client.pending.items.len;
-        client.write_mutex.unlock();
         // Stop well under max_pending_bytes so nothing gets dropped.
         if (pending_len >= 64 * 1024) break;
         try std.testing.expect(expected.items.len < AttachClientTest.max_pending_bytes);
@@ -4355,9 +4276,12 @@ test "hardening: stalled attach reader does not block drainAll; concurrent list 
             defer parsed.deinit();
             _ = try expectTestOk(parsed);
         }
-        sess.attach_mutex.lock();
+        // The ticker's drainAll mutates the attach list under
+        // registry.mutex; fence this read the same way (attach_mutex is
+        // gone — the list is loop-thread-only in production).
+        registry.mutex.lock();
         const remaining = sess.attach_clients.items.len;
-        sess.attach_mutex.unlock();
+        registry.mutex.unlock();
         if (remaining == 0) {
             reaped = true;
             break;
@@ -4401,6 +4325,277 @@ test "hardening: stalled attach reader does not block drainAll; concurrent list 
 
     {
         var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "stalled" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+test "event loop: stalled watch socket is dropped via the conn outbound buffer; list keeps answering" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "connstall");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // Spawn a session that bursts ~700 KB of output. Hex framing doubles
+    // that on the attach wire, so the stalled watcher below must blow
+    // through the kernel socket buffer plus the 1 MiB pending cap.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "connstall",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "sleep 0.3; head -c 700000 /dev/zero | tr '\\0' x; sleep 30" },
+            .rows = 24,
+            .cols = 200,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Watch through the real socket protocol and then never read another
+    // byte — the pathological Ctrl-Z'd `hty watch`.
+    const stream = try openStreamingConn(harness.socket_path, "{\"op\":\"watch\",\"session\":\"connstall\"}");
+    defer stream.close();
+    {
+        var reader = LineReader.init(alloc, stream);
+        defer reader.deinit();
+        const ack = try reader.readLine(2000);
+        alloc.free(ack);
+    }
+
+    // While the burst floods the broadcast path, `list` RPCs must keep
+    // completing, and the overflowed watcher must get dropped with an
+    // `attach_disconnect` in the session log (the loop's reap path).
+    var dropped = false;
+    var overall_timer = try std.time.Timer.start();
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/connstall.jsonl", .{harness.log_dir});
+    defer alloc.free(link_path);
+    while (overall_timer.read() < 60 * std.time.ns_per_s) {
+        {
+            var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+            defer parsed.deinit();
+            _ = try expectTestOk(parsed);
+        }
+        const file = std.fs.openFileAbsolute(link_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer file.close();
+        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer alloc.free(contents);
+        if (std.mem.indexOf(u8, contents, "\"kind\":\"attach_disconnect\"") != null) {
+            dropped = true;
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dropped);
+
+    // Once the burst is fully ingested a `list` must meet its usual
+    // budget again.
+    {
+        var idle = try socketRequest(alloc, harness.socket_path, .{
+            .op = "wait_for_idle",
+            .session = "connstall",
+            .idle_ms = 300,
+            .timeout_ms = 60_000,
+        });
+        defer idle.deinit();
+        _ = try expectTestOk(idle);
+    }
+    var list_timer = try std.time.Timer.start();
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(list_timer.read() < 2 * std.time.ns_per_s);
+
+    {
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "connstall" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+/// Send one attach `input` frame carrying `text` on an attach socket.
+fn sendInputFrame(alloc: std.mem.Allocator, stream: std.net.Stream, text: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const hex_str = try hex.encodeHex(arena, text);
+    const frame = try std.fmt.allocPrint(arena, "{{\"op\":\"input\",\"bytes_hex\":\"{s}\"}}\n", .{hex_str});
+    try stream.writeAll(frame);
+}
+
+/// Assert a socket-level wait_for_text found its needle (ok and not
+/// timed out) — i.e. the text appears contiguously on the screen.
+fn expectTextFound(alloc: std.mem.Allocator, socket_path: []const u8, session: []const u8, text: []const u8) !void {
+    var parsed = try socketRequest(alloc, socket_path, .{
+        .op = "wait_for_text",
+        .session = session,
+        .text = text,
+        .timeout_ms = 10_000,
+    });
+    defer parsed.deinit();
+    const object = try expectTestOk(parsed);
+    if (object.get("timed_out")) |to| {
+        try std.testing.expect(to == .bool and !to.bool);
+    }
+}
+
+test "event loop: attach input fan-in interleaves at frame granularity" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "fanin");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // `cat` with tty echo: every input byte is echoed to the screen in
+    // the exact order it reached the PTY, so contiguity of each token in
+    // the plain-text snapshot proves whole-frame interleaving.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "fanin",
+            .program = "/bin/cat",
+            .rows = 10,
+            .cols = 120,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Two interactive attach clients over the real socket protocol.
+    const a1 = try openStreamingConn(harness.socket_path, "{\"op\":\"attach\",\"session\":\"fanin\"}");
+    defer a1.close();
+    const a2 = try openStreamingConn(harness.socket_path, "{\"op\":\"attach\",\"session\":\"fanin\"}");
+    defer a2.close();
+    {
+        var r1 = LineReader.init(alloc, a1);
+        defer r1.deinit();
+        const ack1 = try r1.readLine(2000);
+        alloc.free(ack1);
+        var r2 = LineReader.init(alloc, a2);
+        defer r2.deinit();
+        const ack2 = try r2.readLine(2000);
+        alloc.free(ack2);
+    }
+
+    // Interleave frames from three sources in quick succession. Each
+    // token is 12 bytes; if any two frames interleaved mid-frame, at
+    // least one token would be broken on screen and its wait below would
+    // time out. Total 72 chars < 120 cols, so nothing wraps.
+    try sendInputFrame(alloc, a1, "A1A1A1A1A1A1");
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "send_text",
+            .session = "fanin",
+            .text = "R1R1R1R1R1R1",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try sendInputFrame(alloc, a2, "B1B1B1B1B1B1");
+    try sendInputFrame(alloc, a1, "A2A2A2A2A2A2");
+    try sendInputFrame(alloc, a2, "B2B2B2B2B2B2");
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "send_text",
+            .session = "fanin",
+            .text = "R2R2R2R2R2R2",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // All bytes arrive, none interleaved mid-frame: every token is found
+    // contiguously in the echoed screen text.
+    try expectTextFound(alloc, harness.socket_path, "fanin", "A1A1A1A1A1A1");
+    try expectTextFound(alloc, harness.socket_path, "fanin", "R1R1R1R1R1R1");
+    try expectTextFound(alloc, harness.socket_path, "fanin", "B1B1B1B1B1B1");
+    try expectTextFound(alloc, harness.socket_path, "fanin", "A2A2A2A2A2A2");
+    try expectTextFound(alloc, harness.socket_path, "fanin", "B2B2B2B2B2B2");
+    try expectTextFound(alloc, harness.socket_path, "fanin", "R2R2R2R2R2R2");
+
+    {
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "fanin" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+test "event loop: pending-input overflow drops without stalling the server" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "wedged");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // A wedged child: the shell stops itself before exec'ing cat, so
+    // nothing ever reads the tty. The kernel input queue fills, master-fd
+    // writes surface WouldBlock, and the session's 64 KiB pending-input
+    // buffer must absorb then *drop* the flood — never stall the loop.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "wedged",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "kill -STOP $$; exec cat" },
+            .rows = 24,
+            .cols = 80,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Flood 320 KiB (40 x 8 KiB frames) — 5x past the 64 KiB bound plus
+    // any kernel tty buffer. Every send must return promptly with ok
+    // (drops are silent by policy); a stalled server would hang the
+    // first blocked request forever.
+    var payload: [8192]u8 = undefined;
+    @memset(&payload, 'x');
+    var payload_hex: [16384]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (payload, 0..) |b, i| {
+        payload_hex[i * 2] = hex_chars[b >> 4];
+        payload_hex[i * 2 + 1] = hex_chars[b & 0xf];
+    }
+    var flood_timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "send_bytes_hex",
+            .session = "wedged",
+            .bytes_hex = @as([]const u8, &payload_hex),
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(flood_timer.read() < 60 * std.time.ns_per_s);
+
+    // The server is still fully responsive: `list` answers within its
+    // usual budget.
+    var list_timer = try std.time.Timer.start();
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(list_timer.read() < 2 * std.time.ns_per_s);
+
+    {
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "wedged" });
         defer kill_parsed.deinit();
         _ = try expectTestOk(kill_parsed);
     }

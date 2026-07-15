@@ -1,16 +1,20 @@
 //! The hty server: a single-threaded event loop over `poll(2)`.
 //!
-//! Phase 1 of the event-loop migration: RPC connections are loop-owned
-//! `Conn` state machines driven by `src/loop.zig` — no worker threads.
-//! Immediate ops dispatch synchronously on the loop thread and queue
-//! their response into a bounded per-connection outbound buffer flushed
-//! on `POLLOUT`. Wait ops park the connection in a waiter table and are
-//! re-evaluated after each housekeeping drain and on deadline expiry, so
-//! a long `wait_for_*` costs a table entry instead of a thread.
+//! Phases 1 + 2 of the event-loop migration: every client connection —
+//! RPC, attach, watch, and pre-creation pending watch — is a loop-owned
+//! `Conn` state machine driven by `src/loop.zig`. No worker threads, no
+//! attach reader threads, no pending-watcher self-pipe. Immediate ops
+//! dispatch synchronously on the loop thread and queue their response
+//! into a bounded per-connection outbound buffer flushed on `POLLOUT`.
+//! Wait ops park the connection in a waiter table and are re-evaluated
+//! after each housekeeping drain and on deadline expiry, so a long
+//! `wait_for_*` costs a table entry instead of a thread. Attach input
+//! frames land in the owning session's bounded pending-input buffer,
+//! flushed to the PTY master fd on its `POLLOUT` — a child that stops
+//! reading its tty drops input instead of stalling the loop.
 //!
-//! Still thread-based for now (later phases): attach/watch connections
-//! keep their existing reader-thread handoff, and each session keeps its
-//! PTY reader thread pumping the terminal event queue that the recurring
+//! Still thread-based for now (phase 3): each session keeps its PTY
+//! reader thread pumping the terminal event queue that the recurring
 //! housekeeping deadline drains via `registry.drainAll()` every 25ms.
 //! `registry.mutex` therefore remains — it fences the loop thread against
 //! those surviving threads.
@@ -36,7 +40,10 @@ const requestErrorMessage = protocol.requestErrorMessage;
 const SessionRegistry = @import("registry.zig").SessionRegistry;
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
+const AttachClient = session_mod.AttachClient;
 const setStreamNonBlocking = session_mod.setStreamNonBlocking;
+
+const log_mod = @import("log.zig");
 
 const ops = @import("ops.zig");
 
@@ -45,7 +52,6 @@ const Loop = loop_mod.Loop;
 const DeadlineTable = loop_mod.DeadlineTable;
 
 const server_attach = @import("server_attach.zig");
-const ConnectionResult = server_attach.ConnectionResult;
 const detectAttachOp = server_attach.detectAttachOp;
 const handleAttachConnection = server_attach.handleAttachConnection;
 
@@ -87,6 +93,10 @@ pub const RunOpts = struct {
     /// If non-null, the loop returns as soon as it observes this flag set
     /// to true (checked at least once per housekeeping interval).
     stop_signal: ?*std.atomic.Value(bool) = null,
+    /// Test hook: use this session-log directory (borrowed; must outlive
+    /// the server) instead of resolving the XDG state path, so socket-level
+    /// tests can assert on log contents hermetically.
+    log_dir: ?[]const u8 = null,
 };
 
 pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
@@ -113,14 +123,15 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();
 
-    // Resolve the session log directory best-effort. If it can't be set up,
-    // the server still runs — log hooks skip when registry.log_dir is null.
-    const log_dir_opt: ?[]u8 = resolveLogDir(alloc) catch |err| blk: {
+    // Resolve the session log directory best-effort (or take the test
+    // override). If it can't be set up, the server still runs — log hooks
+    // skip when registry.log_dir is null.
+    const log_dir_resolved: ?[]u8 = if (opts.log_dir != null) null else resolveLogDir(alloc) catch |err| blk: {
         std.debug.print("warning: session log dir unavailable ({s}) — logging disabled\n", .{@errorName(err)});
         break :blk null;
     };
-    defer if (log_dir_opt) |d| alloc.free(d);
-    if (log_dir_opt) |d| {
+    defer if (log_dir_resolved) |d| alloc.free(d);
+    if (opts.log_dir orelse log_dir_resolved) |d| {
         const by_name = std.fmt.allocPrint(alloc, "{s}/by-name", .{d}) catch null;
         if (by_name) |bn| {
             defer alloc.free(bn);
@@ -194,6 +205,14 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
             now = std.time.milliTimestamp();
         }
 
+        // End-of-iteration subscriber/input sync: promote pending watchers
+        // whose session appeared, reap attach conns marked closed (buffer
+        // overflow, exit broadcast, detach), keep POLLOUT armed for
+        // subscribers with buffered frames, and flush queued PTY input —
+        // all before the next poll builds its fd set.
+        srv.syncSubscribers();
+        srv.syncPendingInput();
+
         // External stop signal (test harness) wins over the empty timer.
         if (opts.stop_signal) |flag| {
             if (flag.load(.acquire)) return;
@@ -201,17 +220,20 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
     }
 }
 
-/// One RPC connection owned by the event loop.
+/// One client connection owned by the event loop: RPC, attach/watch, or
+/// pre-creation pending watch.
 const Conn = struct {
     stream: std.net.Stream,
     state: State = .reading_request,
-    /// Request bytes accumulated while hunting for the newline. Cleared
-    /// once a line has been dispatched; anything a client sends after its
-    /// request line is discarded (the protocol is one request, one
-    /// response, close — same as the old per-connection reader).
+    /// Inbound bytes. While `reading_request`: the request line being
+    /// accumulated (cleared once dispatched; RPC conns discard anything
+    /// after their request line — one request, one response, close).
+    /// While `attached`: the JSONL frame stream from the client.
     inbuf: std.ArrayListUnmanaged(u8) = .{},
     /// Outbound bytes not yet accepted by the socket, flushed on POLLOUT.
     /// Bounded by `max_outbound_bytes` (see its doc for the exact rule).
+    /// Attached conns use their subscriber's buffer instead
+    /// (`AttachClient.pending`, same bound and overflow policy).
     outbuf: std.ArrayListUnmanaged(u8) = .{},
     /// Bytes of `outbuf` already written to the socket.
     out_pos: usize = 0,
@@ -220,6 +242,12 @@ const Conn = struct {
     /// True once EOF was seen and read interest dropped (half-close while
     /// waiting or draining) so the loop stops polling a finished stream.
     read_disabled: bool = false,
+    /// The broadcast subscriber for an `attached` conn (`owned_by_conn` is
+    /// set: this conn frees it when reaping).
+    attach_client: ?*AttachClient = null,
+    /// The exact session name a `pending_watch` conn is waiting for.
+    /// Owned by the conn.
+    pending_watch_name: ?[]u8 = null,
 
     const State = enum {
         /// Accumulating bytes until the request line's newline.
@@ -228,6 +256,12 @@ const Conn = struct {
         waiting,
         /// Response queued; flush the outbound buffer, then close.
         draining,
+        /// Subscribed to a session (attach or watch): inbound bytes are
+        /// JSONL frames, outbound carries broadcast frames.
+        attached,
+        /// Watch-by-name before the session exists; promoted to
+        /// `attached` when a session with that name is created.
+        pending_watch,
     };
 };
 
@@ -256,9 +290,10 @@ const DispatchOutcome = union(enum) {
     response: []u8,
     /// The connection was parked in the waiter table.
     parked,
-    /// Attach/watch: the stream was handed to the attach machinery (or
-    /// closed on failure) and the `Conn` was destroyed.
-    handed_off,
+    /// Attach/watch: the conn changed role (`attached` / `pending_watch`)
+    /// or was torn down on failure; all bookkeeping (including inbuf
+    /// compaction) already happened inside `beginAttach`.
+    transitioned,
 };
 
 /// Loop-owned server state: the poll set, the deadline table, the live
@@ -272,6 +307,10 @@ const LoopServer = struct {
     deadlines: DeadlineTable,
     conns: std.AutoHashMapUnmanaged(std.posix.socket_t, *Conn) = .{},
     waiters: std.ArrayListUnmanaged(*Waiter) = .{},
+    /// PTY master fds currently registered for POLLOUT because their
+    /// session's pending-input buffer is non-empty. Reconciled against
+    /// the registry every iteration by `syncPendingInput`.
+    master_write_fds: std.AutoHashMapUnmanaged(std.posix.fd_t, void) = .{},
     next_waiter_deadline_id: u64 = first_waiter_deadline_id,
     /// True while accepts are suspended after EMFILE/ENFILE; the next
     /// housekeeping tick re-registers the listen fd.
@@ -292,12 +331,18 @@ const LoopServer = struct {
         var it = self.conns.valueIterator();
         while (it.next()) |conn_ptr| {
             const conn = conn_ptr.*;
+            // Attach conns: detach the subscriber from its session (the
+            // registry outlives this deinit) and emit the disconnect the
+            // reap path would have logged.
+            if (conn.attach_client) |client| self.detachSubscriber(client);
+            if (conn.pending_watch_name) |n| self.alloc.free(n);
             conn.stream.close();
             conn.inbuf.deinit(self.alloc);
             conn.outbuf.deinit(self.alloc);
             self.alloc.destroy(conn);
         }
         self.conns.deinit(self.alloc);
+        self.master_write_fds.deinit(self.alloc);
 
         self.loop.deinit();
         self.deadlines.deinit();
@@ -373,6 +418,13 @@ const LoopServer = struct {
     }
 
     fn adoptConn(self: *LoopServer, fd: std.posix.socket_t) !void {
+        // A session deleted earlier in this iteration closed its master
+        // fd, and this accept may have recycled the same fd number while
+        // the stale write-interest registration is still pending its
+        // `syncPendingInput` reconciliation. Clear it so registerFd below
+        // doesn't see a duplicate.
+        if (self.master_write_fds.remove(fd)) _ = self.loop.deregisterFd(fd);
+
         const conn = try self.alloc.create(Conn);
         errdefer self.alloc.destroy(conn);
         conn.* = .{ .stream = .{ .handle = fd } };
@@ -382,12 +434,21 @@ const LoopServer = struct {
     }
 
     fn connReady(self: *LoopServer, fd: std.posix.socket_t, revents: i16) void {
+        // Readiness on an fd that isn't a conn (a PTY master fd armed for
+        // POLLOUT by `syncPendingInput`) needs no per-event handling: the
+        // wakeup alone is the point — the end-of-iteration sync flushes
+        // every session's pending input.
         if ((revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
-            if (self.conns.get(fd)) |conn| self.teardownConn(conn);
+            if (self.conns.get(fd)) |conn| self.dropConn(conn);
             return;
         }
         if ((revents & std.posix.POLL.OUT) != 0) {
-            if (self.conns.get(fd)) |conn| self.flushConn(conn);
+            if (self.conns.get(fd)) |conn| {
+                switch (conn.state) {
+                    .attached => self.flushAttachConn(conn),
+                    else => self.flushConn(conn),
+                }
+            }
         }
         // Re-lookup after the flush: it may have completed the drain (or
         // hit a write error) and destroyed the conn.
@@ -398,6 +459,17 @@ const LoopServer = struct {
         }
     }
 
+    /// Generic "this connection is dead" teardown that routes attached
+    /// conns through the reap path (so the disconnect gets logged and the
+    /// subscriber leaves the session's broadcast list).
+    fn dropConn(self: *LoopServer, conn: *Conn) void {
+        if (conn.state == .attached) {
+            conn.attach_client.?.closed.store(true, .release);
+            return self.reapAttachConn(conn);
+        }
+        self.teardownConn(conn);
+    }
+
     /// Drain readable bytes. `hup` reports whether poll flagged POLLHUP —
     /// on EOF it distinguishes a fully-gone peer (tear down; nobody can
     /// read a response) from a half-close (stop reading, keep flushing).
@@ -406,7 +478,7 @@ const LoopServer = struct {
         while (true) {
             const n = std.posix.read(conn.stream.handle, &chunk) catch |err| switch (err) {
                 error.WouldBlock => return,
-                else => return self.teardownConn(conn),
+                else => return self.dropConn(conn),
             };
             if (n == 0) return self.connEof(conn, hup);
             switch (conn.state) {
@@ -422,12 +494,45 @@ const LoopServer = struct {
                     }
                     if (conn.inbuf.items.len > max_request_line_bytes) return self.respondTooLarge(conn);
                 },
+                .attached => {
+                    conn.inbuf.appendSlice(self.alloc, chunk[0..n]) catch return self.dropConn(conn);
+                    if (!self.consumeAttachFrames(conn)) return;
+                },
+                // A parked watcher isn't supposed to send anything;
+                // discard bytes, exactly like the old pending-watcher
+                // reader thread.
+                .pending_watch => conn.inbuf.clearRetainingCapacity(),
                 // One request per connection: bytes past the request line
                 // are discarded, exactly like the old reader that never
                 // looked past the first newline.
                 .waiting, .draining => {},
             }
         }
+    }
+
+    /// Dispatch every complete JSONL frame buffered on an attached conn.
+    /// Returns false when the conn was torn down (detach frame, malformed
+    /// frame, or a runaway line without a newline — any error ended the
+    /// old reader loop; same policy here).
+    fn consumeAttachFrames(self: *LoopServer, conn: *Conn) bool {
+        const client = conn.attach_client.?;
+        while (std.mem.indexOfScalar(u8, conn.inbuf.items, '\n')) |nl| {
+            const line = conn.inbuf.items[0..nl];
+            server_attach.dispatchAttachFrame(client, line) catch {
+                client.closed.store(true, .release);
+                self.reapAttachConn(conn);
+                return false;
+            };
+            const rest_len = conn.inbuf.items.len - nl - 1;
+            std.mem.copyForwards(u8, conn.inbuf.items[0..rest_len], conn.inbuf.items[nl + 1 ..]);
+            conn.inbuf.shrinkRetainingCapacity(rest_len);
+        }
+        if (conn.inbuf.items.len > max_request_line_bytes) {
+            client.closed.store(true, .release);
+            self.reapAttachConn(conn);
+            return false;
+        }
+        return true;
     }
 
     fn connEof(self: *LoopServer, conn: *Conn, hup: bool) void {
@@ -440,6 +545,9 @@ const LoopServer = struct {
                 if (conn.inbuf.items.len > max_request_line_bytes) return self.respondTooLarge(conn);
                 self.dispatchConnLine(conn, conn.inbuf.items);
             },
+            // EOF ends an attachment (the old reader loop broke on
+            // read() == 0) and drops a parked watcher.
+            .attached, .pending_watch => self.dropConn(conn),
             .waiting, .draining => {
                 if (hup) return self.teardownConn(conn);
                 // Half-close: the client is still reading. Drop read
@@ -486,7 +594,7 @@ const LoopServer = struct {
                 self.queueResponse(conn, bytes);
             },
             .parked => conn.inbuf.clearAndFree(self.alloc),
-            .handed_off => {},
+            .transitioned => {},
         }
     }
 
@@ -498,11 +606,11 @@ const LoopServer = struct {
             return .{ .response = try encodeResponse(self.alloc, .{ .ok = false, .@"error" = "empty request" }) };
         }
 
-        // Peek at the op before normal dispatch; attach and watch need a
-        // different lifecycle (hand the socket to the attach machinery).
+        // Peek at the op before normal dispatch; attach and watch flip the
+        // connection into a streaming role instead of request/response.
         switch (detectAttachOp(self.alloc, line)) {
-            .attach => return self.handoffAttach(conn, line, false),
-            .watch => return self.handoffAttach(conn, line, true),
+            .attach => return self.beginAttach(conn, line, false),
+            .watch => return self.beginAttach(conn, line, true),
             .none => {},
         }
 
@@ -768,7 +876,10 @@ const LoopServer = struct {
     }
 
     /// Close and free a connection, dropping any waiter parked on it.
+    /// Attached conns must go through `reapAttachConn` (or `dropConn`)
+    /// first so the subscriber leaves the session's broadcast list.
     fn teardownConn(self: *LoopServer, conn: *Conn) void {
+        std.debug.assert(conn.attach_client == null);
         if (conn.waiter) |waiter| {
             conn.waiter = null;
             for (self.waiters.items, 0..) |w, i| {
@@ -779,6 +890,10 @@ const LoopServer = struct {
             }
             self.destroyWaiter(waiter);
         }
+        if (conn.pending_watch_name) |n| {
+            self.alloc.free(n);
+            conn.pending_watch_name = null;
+        }
         _ = self.loop.deregisterFd(conn.stream.handle);
         _ = self.conns.remove(conn.stream.handle);
         conn.stream.close();
@@ -787,44 +902,177 @@ const LoopServer = struct {
         self.alloc.destroy(conn);
     }
 
-    /// Hand an attach/watch connection to the existing thread-based attach
-    /// machinery (absorbed into the loop in phase 2). The `Conn` leaves
-    /// the loop's bookkeeping either way; the stream is owned by the
-    /// attach client (or pending watcher) on success and closed on
-    /// failure.
-    fn handoffAttach(self: *LoopServer, conn: *Conn, line: []const u8, read_only: bool) DispatchOutcome {
-        const fd = conn.stream.handle;
-        _ = self.loop.deregisterFd(fd);
-        _ = self.conns.remove(fd);
-
-        // The attach bring-up writes its ack and initial snapshot with
-        // blocking semantics and flips the socket non-blocking itself
-        // once the client is on the broadcast list — restore blocking
-        // mode so that path behaves exactly as it did under the old
-        // thread handoff.
-        setStreamBlocking(fd) catch {};
-
-        const result = handleAttachConnection(self.alloc, self.registry, conn.stream, line, read_only) catch |err| blk: {
+    /// Flip a connection whose request line was `attach`/`watch` into its
+    /// streaming role. The conn keeps its fd and its place in the loop;
+    /// only its state changes. On setup failure the conn is torn down
+    /// (the error line was already written by the setup path).
+    fn beginAttach(self: *LoopServer, conn: *Conn, line: []const u8, read_only: bool) DispatchOutcome {
+        const setup = handleAttachConnection(self.alloc, self.registry, conn.stream, line, read_only) catch |err| {
             std.debug.print("attach failed: {s}\n", .{@errorName(err)});
-            break :blk ConnectionResult.done;
+            self.teardownConn(conn);
+            return .transitioned;
         };
-        switch (result) {
-            .done => conn.stream.close(),
-            .attached => {}, // The attach machinery owns the stream now.
+
+        // `line` aliases the front of inbuf; drop the request line (and
+        // its newline, when present) but keep anything after it — for a
+        // successful attach those bytes are the client's first frames.
+        const consumed = @min(line.len + 1, conn.inbuf.items.len);
+        const rest_len = conn.inbuf.items.len - consumed;
+        std.mem.copyForwards(u8, conn.inbuf.items[0..rest_len], conn.inbuf.items[consumed..]);
+        conn.inbuf.shrinkRetainingCapacity(rest_len);
+
+        switch (setup) {
+            .done => self.teardownConn(conn),
+            .attached => |client| {
+                client.owned_by_conn = true;
+                conn.attach_client = client;
+                conn.state = .attached;
+                if (client.pending.items.len > 0) self.loop.armWrite(conn.stream.handle);
+                // Frames may have arrived glued to the request line.
+                _ = self.consumeAttachFrames(conn);
+            },
+            .pending => |name_owned| {
+                conn.inbuf.clearRetainingCapacity();
+                conn.pending_watch_name = name_owned;
+                conn.state = .pending_watch;
+            },
         }
-        conn.inbuf.deinit(self.alloc);
-        conn.outbuf.deinit(self.alloc);
-        self.alloc.destroy(conn);
-        return .handed_off;
+        return .transitioned;
+    }
+
+    /// Flush an attached conn's broadcast buffer on POLLOUT; reap it if a
+    /// write error closed it, disarm write interest once drained.
+    fn flushAttachConn(self: *LoopServer, conn: *Conn) void {
+        const client = conn.attach_client.?;
+        client.flushPending();
+        if (client.isClosed()) return self.reapAttachConn(conn);
+        if (client.pending.items.len == 0) self.loop.disarmWrite(conn.stream.handle);
+    }
+
+    /// Unhook an attached conn's subscriber from its session (logging the
+    /// `attach_disconnect` — the single choke-point for graceful detach,
+    /// EOF, buffer overflow, and exit broadcasts alike) and tear the conn
+    /// down. The client must already be marked closed.
+    fn reapAttachConn(self: *LoopServer, conn: *Conn) void {
+        const client = conn.attach_client.?;
+        conn.attach_client = null;
+        self.detachSubscriber(client);
+        self.teardownConn(conn);
+    }
+
+    /// Remove a conn-owned subscriber from its session's broadcast list
+    /// (when the session is still alive), emit the disconnect event, and
+    /// free the client's storage. The conn keeps ownership of the fd.
+    fn detachSubscriber(self: *LoopServer, client: *AttachClient) void {
+        if (!client.session_gone) {
+            const sess = client.session;
+            for (sess.attach_clients.items, 0..) |c, i| {
+                if (c == client) {
+                    _ = sess.attach_clients.swapRemove(i);
+                    break;
+                }
+            }
+            if (!client.disconnect_logged.swap(true, .acq_rel)) {
+                var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena_state.deinit();
+                log_mod.logAttachDisconnectEvent(arena_state.allocator(), sess, client.client_id);
+            }
+        }
+        client.deinitDetached();
+    }
+
+    /// Once-per-iteration subscriber sync: reap attached conns whose
+    /// client got marked closed (broadcast overflow, exit broadcast,
+    /// write error), keep POLLOUT armed exactly for subscribers with
+    /// buffered frames, and promote pending watchers whose session now
+    /// exists (spawn turned into a state flip — the old PendingWatcher
+    /// promotion, minus the thread and self-pipe).
+    fn syncSubscribers(self: *LoopServer) void {
+        var to_reap: std.ArrayListUnmanaged(*Conn) = .{};
+        defer to_reap.deinit(self.alloc);
+        var to_promote: std.ArrayListUnmanaged(*Conn) = .{};
+        defer to_promote.deinit(self.alloc);
+
+        var it = self.conns.valueIterator();
+        while (it.next()) |conn_ptr| {
+            const conn = conn_ptr.*;
+            switch (conn.state) {
+                .attached => {
+                    const client = conn.attach_client.?;
+                    if (client.isClosed()) {
+                        to_reap.append(self.alloc, conn) catch {};
+                        continue;
+                    }
+                    if (client.pending.items.len > 0) {
+                        self.loop.armWrite(conn.stream.handle);
+                    } else {
+                        self.loop.disarmWrite(conn.stream.handle);
+                    }
+                },
+                .pending_watch => to_promote.append(self.alloc, conn) catch {},
+                else => {},
+            }
+        }
+        for (to_reap.items) |conn| self.reapAttachConn(conn);
+        for (to_promote.items) |conn| self.tryPromotePendingWatch(conn);
+    }
+
+    /// Promote a parked watch conn if a session with its exact name has
+    /// appeared. Sends the `started` frame and the initial snapshot, then
+    /// flips the conn to `attached` — same wire sequence the old
+    /// PendingWatcher promotion produced.
+    fn tryPromotePendingWatch(self: *LoopServer, conn: *Conn) void {
+        const name = conn.pending_watch_name orelse return;
+        const sess = self.registry.findByName(name) orelse return;
+        defer self.registry.release(sess);
+
+        const client = server_attach.promoteWatchSubscriber(self.alloc, sess, conn.stream) catch {
+            return self.teardownConn(conn);
+        };
+        client.owned_by_conn = true;
+        self.alloc.free(name);
+        conn.pending_watch_name = null;
+        conn.attach_client = client;
+        conn.state = .attached;
+        if (client.pending.items.len > 0) self.loop.armWrite(conn.stream.handle);
+    }
+
+    /// Once-per-iteration input sync: flush every session's pending-input
+    /// buffer and reconcile POLLOUT interest on PTY master fds so a
+    /// wedged child's fd wakes the loop the moment it drains its tty
+    /// input queue. Sessions freed during this iteration simply drop out
+    /// of the desired set and get deregistered here.
+    fn syncPendingInput(self: *LoopServer) void {
+        var pending_fds: std.ArrayListUnmanaged(std.posix.fd_t) = .{};
+        defer pending_fds.deinit(self.alloc);
+        self.registry.flushPendingInputAll(self.alloc, &pending_fds);
+
+        // Deregister armed fds whose buffer drained (or whose session is
+        // gone).
+        var stale: std.ArrayListUnmanaged(std.posix.fd_t) = .{};
+        defer stale.deinit(self.alloc);
+        var it = self.master_write_fds.keyIterator();
+        while (it.next()) |fd_ptr| {
+            const fd = fd_ptr.*;
+            const still_pending = for (pending_fds.items) |p| {
+                if (p == fd) break true;
+            } else false;
+            if (!still_pending) stale.append(self.alloc, fd) catch {};
+        }
+        for (stale.items) |fd| {
+            _ = self.loop.deregisterFd(fd);
+            _ = self.master_write_fds.remove(fd);
+        }
+
+        for (pending_fds.items) |fd| {
+            if (self.master_write_fds.contains(fd)) continue;
+            self.loop.registerFd(fd, .{ .read = false, .write = true }) catch continue;
+            self.master_write_fds.put(self.alloc, fd, {}) catch {
+                _ = self.loop.deregisterFd(fd);
+            };
+        }
     }
 };
-
-/// Undo `setStreamNonBlocking` (see `handoffAttach`).
-fn setStreamBlocking(fd: std.posix.socket_t) !void {
-    const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
-    const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock);
-}
 
 fn encodeErrorLine(alloc: Allocator, id: ?i64, err: anyerror) ![]u8 {
     return encodeResponse(alloc, .{ .id = id, .ok = false, .@"error" = requestErrorMessage(err) });
