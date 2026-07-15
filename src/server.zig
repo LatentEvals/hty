@@ -43,6 +43,7 @@ const ops = @import("ops.zig");
 const loop_mod = @import("loop.zig");
 const Loop = loop_mod.Loop;
 const DeadlineTable = loop_mod.DeadlineTable;
+const log_mod = @import("log.zig");
 
 const server_attach = @import("server_attach.zig");
 const ConnectionResult = server_attach.ConnectionResult;
@@ -87,6 +88,9 @@ pub const RunOpts = struct {
     /// If non-null, the loop returns as soon as it observes this flag set
     /// to true (checked at least once per housekeeping interval).
     stop_signal: ?*std.atomic.Value(bool) = null,
+    /// Test override for the session log directory. Production leaves this
+    /// null and resolves the directory from the environment.
+    log_dir: ?[]const u8 = null,
 };
 
 pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
@@ -115,10 +119,13 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
 
     // Resolve the session log directory best-effort. If it can't be set up,
     // the server still runs — log hooks skip when registry.log_dir is null.
-    const log_dir_opt: ?[]u8 = resolveLogDir(alloc) catch |err| blk: {
-        std.debug.print("warning: session log dir unavailable ({s}) — logging disabled\n", .{@errorName(err)});
-        break :blk null;
-    };
+    const log_dir_opt: ?[]u8 = if (opts.log_dir) |override|
+        try alloc.dupe(u8, override)
+    else
+        resolveLogDir(alloc) catch |err| blk: {
+            std.debug.print("warning: session log dir unavailable ({s}) — logging disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
     defer if (log_dir_opt) |d| alloc.free(d);
     if (log_dir_opt) |d| {
         const by_name = std.fmt.allocPrint(alloc, "{s}/by-name", .{d}) catch null;
@@ -129,6 +136,10 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
             };
         }
         registry.log_dir = d;
+        // One-time reconciliation: logs written by older hty versions may
+        // predate the by-name symlink that `nameInUse` now treats as
+        // authoritative; create any missing links before serving requests.
+        log_mod.reconcileByNameLinks(alloc, d);
     }
 
     var srv = LoopServer{
