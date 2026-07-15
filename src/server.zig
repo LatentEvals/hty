@@ -21,6 +21,8 @@ const Session = @import("session.zig").Session;
 
 const ops = @import("ops.zig");
 
+const log_mod = @import("log.zig");
+
 const server_attach = @import("server_attach.zig");
 const ConnectionResult = server_attach.ConnectionResult;
 const detectAttachOp = server_attach.detectAttachOp;
@@ -43,6 +45,9 @@ pub const RunOpts = struct {
     /// If non-null, the accept loop returns as soon as it observes this
     /// flag set to true (and after joining in-flight workers).
     stop_signal: ?*std.atomic.Value(bool) = null,
+    /// Test override for the session log directory. Production leaves this
+    /// null and resolves the directory from the environment.
+    log_dir: ?[]const u8 = null,
 };
 
 /// One in-flight RPC connection owned by a worker thread. The accept loop
@@ -168,10 +173,13 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
 
     // Resolve the session log directory best-effort. If it can't be set up,
     // the server still runs — log hooks skip when registry.log_dir is null.
-    const log_dir_opt: ?[]u8 = resolveLogDir(alloc) catch |err| blk: {
-        std.debug.print("warning: session log dir unavailable ({s}) — logging disabled\n", .{@errorName(err)});
-        break :blk null;
-    };
+    const log_dir_opt: ?[]u8 = if (opts.log_dir) |override|
+        try alloc.dupe(u8, override)
+    else
+        resolveLogDir(alloc) catch |err| blk: {
+            std.debug.print("warning: session log dir unavailable ({s}) — logging disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
     defer if (log_dir_opt) |d| alloc.free(d);
     if (log_dir_opt) |d| {
         const by_name = std.fmt.allocPrint(alloc, "{s}/by-name", .{d}) catch null;
@@ -182,6 +190,10 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
             };
         }
         registry.log_dir = d;
+        // One-time reconciliation: logs written by older hty versions may
+        // predate the by-name symlink that `nameInUse` now treats as
+        // authoritative; create any missing links before serving requests.
+        log_mod.reconcileByNameLinks(alloc, d);
     }
 
     // Auto-shutdown: start in "empty" state. Every time the registry drops to

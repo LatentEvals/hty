@@ -185,10 +185,12 @@ pub const SessionRegistry = struct {
 
         if (name_owned) |n| {
             if (self.name_index.contains(n)) return error.NameAlreadyExists;
-            // `nameInUse` does filesystem I/O (scans the log dir). We hold
-            // the registry lock across it because the alternative — check
-            // without the lock, then take it — is TOCTOU-prone and session
-            // creation is cold-path.
+            // `nameInUse` is a single O(1) access on the authoritative
+            // by-name symlink (a one-time startup reconciliation covers
+            // logs from older hty versions). We hold the registry lock
+            // across it because the alternative — check without the lock,
+            // then take it — is TOCTOU-prone and session creation is
+            // cold-path.
             if (log_mod.nameInUse(self.alloc, self.log_dir, n)) return error.NameAlreadyExists;
         }
 
