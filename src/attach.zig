@@ -1,11 +1,16 @@
 //! Broadcast frames from a session's drain loop out to every live
 //! `hty attach` client subscribed to that session.
 //!
-//! All three functions are called from the drain step under the server's
+//! All functions here are called from the drain step under the server's
 //! main loop — they take the per-session `attach_mutex` to serialize with
 //! the per-client writer threads. `reapClosedAttachClients` is where closed
 //! clients get `deinit`d; that happens OUTSIDE the mutex so the joined
 //! reader thread can call back into session state without deadlocking.
+//!
+//! Broadcasts never block: `tryWriteFrame` uses non-blocking sends and a
+//! bounded per-client pending buffer, so a client that stops reading can't
+//! wedge the drain loop (which holds `registry.mutex`). Overflowing the
+//! bound marks the client closed and it gets reaped like any other drop.
 
 const std = @import("std");
 const session_mod = @import("session.zig");
@@ -54,6 +59,16 @@ pub fn broadcastExitedToAttach(sess: *Session, code: ?i32) void {
         // so its reader thread (and the deinit path) can shut down cleanly.
         client.shutdown();
     }
+}
+
+/// Give every attached client a chance to drain bytes buffered by an
+/// earlier would-block send. Called once per drain tick so a client that
+/// stalled during a burst catches back up (or errors out and gets reaped)
+/// even when the session emits no further output.
+pub fn flushPendingToAttach(sess: *Session) void {
+    sess.attach_mutex.lock();
+    defer sess.attach_mutex.unlock();
+    for (sess.attach_clients.items) |client| client.flushPending();
 }
 
 /// Remove any attached clients whose socket has been closed (either by the

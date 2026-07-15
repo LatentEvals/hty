@@ -169,6 +169,15 @@ pub fn handleAttachConnection(
     // streaming mode.
     try writeAttachAck(conn.stream);
 
+    // Make the socket non-blocking from here on: every later write goes
+    // through `tryWriteFrame`'s bounded-buffer path, and the drain step's
+    // broadcasts must never block on a client that stopped reading. If
+    // the fcntl fails (it shouldn't), drop the client rather than let a
+    // blocking socket onto the broadcast list.
+    session_mod.setStreamNonBlocking(conn.stream.handle) catch {
+        client.shutdown();
+    };
+
     // Send an initial snapshot so the attach viewer has something to
     // show right away (the recorded output stream doesn't replay).
     if (sess.terminal.snapshot()) |snap| {
@@ -263,6 +272,10 @@ pub fn writeAttachError(stream: std.net.Stream, message: []const u8) !void {
 /// ops retarget the terminal, detach ops exit the loop cleanly. Any
 /// error (EOF, parse failure, bad socket) ends the loop; the client is
 /// marked closed so the next drain pass reaps it.
+///
+/// The socket is non-blocking (the broadcast writer must never stall on
+/// it), so this loop blocks in `poll` rather than `read`. The poll
+/// timeout doubles as a periodic check of the `closed` flag.
 pub fn attachReaderLoop(client: *AttachClient) void {
     defer client.closed.store(true, .release);
 
@@ -272,7 +285,17 @@ pub fn attachReaderLoop(client: *AttachClient) void {
 
     var chunk: [4096]u8 = undefined;
     while (!client.isClosed()) {
-        const n = client.stream.read(&chunk) catch break;
+        var pfds = [_]std.posix.pollfd{.{
+            .fd = client.stream.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pfds, 250) catch break;
+        if (ready == 0) continue;
+        const n = client.stream.read(&chunk) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => break,
+        };
         if (n == 0) break;
         buffer.appendSlice(chunk[0..n]) catch break;
 

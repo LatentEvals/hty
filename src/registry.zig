@@ -299,6 +299,14 @@ pub const SessionRegistry = struct {
         // pending watcher so its deinit won't double-close.
         pw.owns_stream = false;
 
+        // Match the live-attach setup: the socket must be non-blocking
+        // before it can sit on the broadcast list, so a promoted watcher
+        // that stops reading can't stall the drain step either. On
+        // failure drop the client instead of risking a blocking write.
+        session_mod.setStreamNonBlocking(client.stream.handle) catch {
+            client.shutdown();
+        };
+
         // Log the connect event and send the started+snapshot frames.
         // Use a local arena so failures here don't leak.
         var arena_state = std.heap.ArenaAllocator.init(self.alloc);
@@ -637,6 +645,10 @@ pub const SessionRegistry = struct {
                 var owned = event;
                 owned.deinit(sess.alloc);
             }
+            // Push out any bytes buffered for momentarily-slow attach
+            // clients (non-blocking; a client over its buffer bound is
+            // marked closed and picked up by the reap below).
+            attach.flushPendingToAttach(sess);
             // Reap any attach clients whose reader thread has exited.
             attach.reapClosedAttachClients(sess);
         }

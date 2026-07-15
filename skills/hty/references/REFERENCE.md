@@ -89,7 +89,7 @@ Real-time read-only stream of the session's rendered screen. Great for a human t
 hty watch [SESSION]
 ```
 
-Ctrl-C to exit. Supports pre-creation: `hty watch foo` before `hty run --name foo -- …` parks the watcher until the session appears.
+Ctrl-C to exit. Supports pre-creation: `hty watch foo` before `hty run --name foo -- …` parks the watcher until the session appears. A viewer that stops reading (e.g. suspended with Ctrl-Z) and falls ~1 MiB behind is disconnected rather than allowed to slow the session — reconnect to resume; this applies to `attach` clients too.
 
 ## `hty attach`
 
