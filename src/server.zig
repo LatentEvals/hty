@@ -140,6 +140,10 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
             };
         }
         registry.log_dir = d;
+        // One-time reconciliation: logs written by older hty versions may
+        // predate the by-name symlink that `nameInUse` now treats as
+        // authoritative; create any missing links before serving requests.
+        log_mod.reconcileByNameLinks(alloc, d);
     }
 
     var srv = LoopServer{

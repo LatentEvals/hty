@@ -1869,6 +1869,8 @@ const ServerHarness = struct {
 const ServerEntryCtx = struct {
     alloc: std.mem.Allocator,
     socket_path: []const u8,
+    /// Wired through `RunOpts.log_dir` so the server uses the harness's
+    /// tmp log dir instead of resolving one from the environment.
     log_dir: []const u8,
     stop: *std.atomic.Value(bool),
     err_flag: *std.atomic.Value(bool),
@@ -1885,9 +1887,6 @@ const ServerEntryCtx = struct {
 };
 
 fn startServerHarness(alloc: std.mem.Allocator, tag: []const u8) !*ServerHarness {
-    const harness = try alloc.create(ServerHarness);
-    errdefer alloc.destroy(harness);
-
     const stamp = std.time.nanoTimestamp();
     const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-{s}-log-{d}", .{ tag, stamp });
     errdefer alloc.free(log_dir);
@@ -1895,6 +1894,33 @@ fn startServerHarness(alloc: std.mem.Allocator, tag: []const u8) !*ServerHarness
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
     try std.fs.cwd().makePath(by_name);
+    return startServerHarnessImpl(alloc, tag, log_dir);
+}
+
+/// Variant of `startServerHarness` that points the server at a
+/// caller-prepared log directory (via `RunOpts.log_dir`), so a test can
+/// plant on-disk state the server must observe at startup.
+fn startServerHarnessInLogDir(
+    alloc: std.mem.Allocator,
+    tag: []const u8,
+    prepared_log_dir: []const u8,
+) !*ServerHarness {
+    const log_dir = try alloc.dupe(u8, prepared_log_dir);
+    errdefer alloc.free(log_dir);
+    return startServerHarnessImpl(alloc, tag, log_dir);
+}
+
+/// On success the returned harness owns `log_dir`; on error the caller's
+/// errdefer frees it.
+fn startServerHarnessImpl(
+    alloc: std.mem.Allocator,
+    tag: []const u8,
+    log_dir: []u8,
+) !*ServerHarness {
+    const harness = try alloc.create(ServerHarness);
+    errdefer alloc.destroy(harness);
+
+    const stamp = std.time.nanoTimestamp();
 
     // Unix-socket paths are capped at ~104 bytes on macOS / ~108 on
     // Linux. Keep the path short and predictable; uniqueness comes from
@@ -1964,6 +1990,88 @@ fn socketRequest(
     }
     const newline = std.mem.indexOfScalar(u8, buf.items, '\n') orelse buf.items.len;
     return std.json.parseFromSlice(std.json.Value, alloc, buf.items[0..newline], .{});
+}
+
+test "startup reconciliation: legacy log without by-name symlink still reserves its name" {
+    const alloc = std.testing.allocator;
+
+    // Prepare a log dir holding a legacy session log: the spawn header
+    // names the session, but no by-name symlink exists (as written by hty
+    // versions that predate the symlink).
+    const stamp = std.time.nanoTimestamp();
+    const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-reconcile-log-{d}", .{stamp});
+    defer alloc.free(log_dir);
+    try std.fs.cwd().makePath(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
+    defer alloc.free(by_name);
+    try std.fs.cwd().makePath(by_name);
+
+    const legacy_id = "00000000-0000-7000-8000-00000000abcd";
+    {
+        const legacy_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ log_dir, legacy_id });
+        defer alloc.free(legacy_path);
+        const file = try std.fs.createFileAbsolute(legacy_path, .{ .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(
+            "{\"t\":1,\"kind\":\"spawn\",\"program\":\"/bin/cat\",\"args\":[],\"name\":\"legacy-reserved\",\"rows\":8,\"cols\":24}\n",
+        );
+    }
+
+    const harness = try startServerHarnessInLogDir(alloc, "reconcile", log_dir);
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // Spawning under the legacy name must hit the existing name-conflict
+    // error. Since `nameInUse` no longer scans the directory, this proves
+    // startup reconciliation created the missing symlink.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "legacy-reserved",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        try expectTestError(parsed, "already exists");
+    }
+
+    // The reconciled symlink is on disk and points at the legacy log.
+    {
+        const link_path = try std.fmt.allocPrint(alloc, "{s}/legacy-reserved.jsonl", .{by_name});
+        defer alloc.free(link_path);
+        var target_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const target = try std.fs.readLinkAbsolute(link_path, &target_buf);
+        const expected_target = try std.fmt.allocPrint(alloc, "../{s}.jsonl", .{legacy_id});
+        defer alloc.free(expected_target);
+        try std.testing.expectEqualStrings(expected_target, target);
+    }
+
+    // An unclaimed name still spawns fine — reconciliation reserves only
+    // names actually present in legacy headers.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "reconcile-fresh",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "kill",
+            .session = "reconcile-fresh",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
 }
 
 test "concurrency: long wait_for_text does not block concurrent list (LatentEvals/hty#14)" {

@@ -243,61 +243,85 @@ pub fn logResizeEvent(arena: Allocator, sess: *Session, rows: u16, cols: u16) vo
     writeLogEvent(sess, line);
 }
 
-/// Best-effort check for whether `name` is already reserved by a session log
-/// or by-name symlink on disk. Used to keep named sessions reserved until the
-/// corresponding log is deleted.
+/// Best-effort O(1) check for whether `name` is already reserved by a session
+/// log on disk. The `by-name/<name>.jsonl` symlink is authoritative: it is
+/// created at spawn (`openSessionLog`) and removed by delete/auto-remove.
+/// Logs written by hty versions that predate the symlink are covered by the
+/// one-time `reconcileByNameLinks` scan at server startup, so this hot-path
+/// check never iterates the log directory.
 pub fn nameInUse(alloc: Allocator, log_dir: ?[]const u8, name: []const u8) bool {
     const dir = log_dir orelse return false;
 
     const link_path = std.fmt.allocPrint(alloc, "{s}/by-name/{s}.jsonl", .{ dir, name }) catch return false;
     defer alloc.free(link_path);
-    if (fileExistsAbsolute(link_path)) return true;
+    return fileExistsAbsolute(link_path);
+}
 
-    var root = std.fs.openDirAbsolute(dir, .{ .iterate = true }) catch return false;
+/// One-time startup reconciliation for logs written by hty versions that
+/// predate the by-name symlink: scan the log dir once and, for every
+/// `.jsonl` whose spawn header carries a name but whose
+/// `by-name/<name>.jsonl` link is missing (or dangling), create the link.
+/// This keeps the O(1) `nameInUse` check authoritative across upgrades from
+/// older on-disk state. Best-effort and silent on per-file failures, like
+/// all log-dir maintenance. Runs before the server accepts requests, so it
+/// never races spawn/delete.
+pub fn reconcileByNameLinks(alloc: Allocator, log_dir: []const u8) void {
+    var root = std.fs.openDirAbsolute(log_dir, .{ .iterate = true }) catch return;
     defer root.close();
 
     var it = root.iterate();
-    while (it.next() catch return false) |entry| {
+    while (it.next() catch return) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
-        const path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, entry.name }) catch continue;
-        defer alloc.free(path);
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-        const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch continue;
-        defer file.close();
+        const name = spawnHeaderName(arena, log_dir, entry.name) orelse continue;
 
-        var line_buf = std.array_list.Managed(u8).init(alloc);
-        defer line_buf.deinit();
+        // A resolvable link (or plain file) already reserves the name —
+        // leave it alone; first claimant wins. A missing or dangling link
+        // gets (re)created pointing at this log.
+        const link_path = std.fmt.allocPrint(arena, "{s}/by-name/{s}.jsonl", .{ log_dir, name }) catch continue;
+        if (fileExistsAbsolute(link_path)) continue;
 
-        var chunk: [4096]u8 = undefined;
-        while (true) {
-            const n = file.read(&chunk) catch break;
-            if (n == 0) break;
-            if (std.mem.indexOfScalar(u8, chunk[0..n], '\n')) |nl| {
-                line_buf.appendSlice(chunk[0..nl]) catch break;
-                break;
-            }
-            line_buf.appendSlice(chunk[0..n]) catch break;
-        }
-
-        const line = line_buf.items;
-        if (line.len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
-        defer parsed.deinit();
-
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => continue,
+        const id = entry.name[0 .. entry.name.len - ".jsonl".len];
+        createByNameSymlink(arena, log_dir, name, id) catch |err| {
+            std.debug.print("by-name reconcile failed ({s}): {s}\n", .{ name, @errorName(err) });
         };
-        const kind = getString(obj, "kind") orelse continue;
-        if (!std.mem.eql(u8, kind, "spawn")) continue;
-        const existing_name = getString(obj, "name") orelse continue;
-        if (std.mem.eql(u8, existing_name, name)) return true;
     }
+}
 
-    return false;
+/// Read the first line of `<log_dir>/<file_name>` and return the session
+/// name from its spawn header, or null if the header is missing, malformed,
+/// or the session is unnamed. Returned slice lives in `arena`.
+fn spawnHeaderName(arena: Allocator, log_dir: []const u8, file_name: []const u8) ?[]const u8 {
+    const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ log_dir, file_name }) catch return null;
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch return null;
+    defer file.close();
+
+    var line_buf = std.array_list.Managed(u8).init(arena);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = file.read(&chunk) catch return null;
+        if (n == 0) break;
+        if (std.mem.indexOfScalar(u8, chunk[0..n], '\n')) |nl| {
+            line_buf.appendSlice(chunk[0..nl]) catch return null;
+            break;
+        }
+        line_buf.appendSlice(chunk[0..n]) catch return null;
+    }
+    if (line_buf.items.len == 0) return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, line_buf.items, .{}) catch return null;
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    const kind = getString(obj, "kind") orelse return null;
+    if (!std.mem.eql(u8, kind, "spawn")) return null;
+    return getString(obj, "name");
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
