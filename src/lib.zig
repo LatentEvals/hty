@@ -116,6 +116,10 @@ pub const InteractiveTerminal = struct {
     mutex: std.Thread.Mutex = .{},
     write_mutex: std.Thread.Mutex = .{},
     events: std.ArrayListUnmanaged(OutputEvent) = .{},
+    /// Index of the next event `pollEvent` returns. Consuming from the
+    /// front by bumping this index (instead of `orderedRemove(0)`) keeps
+    /// polling O(1); the buffer is recycled whenever the queue drains.
+    events_head: usize = 0,
     closed: bool = false,
     exit_code: ?i32 = null,
     last_title: ?[]u8 = null,
@@ -202,6 +206,12 @@ pub const InteractiveTerminal = struct {
         self.stream = .initAlloc(alloc, self.handler);
         errdefer self.stream.deinit();
 
+        // Seed the event queue with capacity so the reserved-spare-slot
+        // invariant in `pushEventUnlocked` holds from the first push: the
+        // `exited` lifecycle event must never be dropped on OOM (a lost
+        // exit would hang `wait_for_exit` until its timeout).
+        try self.events.ensureTotalCapacity(alloc, initial_event_capacity);
+
         self.pushEvent(.started);
         self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
         return self;
@@ -216,8 +226,7 @@ pub const InteractiveTerminal = struct {
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
         if (self.last_title) |title| self.alloc.free(title);
-        while (self.events.items.len > 0) {
-            var event = self.events.pop().?;
+        for (self.events.items[self.events_head..]) |*event| {
             event.deinit(self.alloc);
         }
         self.events.deinit(self.alloc);
@@ -331,8 +340,17 @@ pub const InteractiveTerminal = struct {
     pub fn pollEvent(self: *InteractiveTerminal) ?OutputEvent {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.events.items.len == 0) return null;
-        return self.events.orderedRemove(0);
+        if (self.events_head == self.events.items.len) return null;
+        const event = self.events.items[self.events_head];
+        self.events_head += 1;
+        if (self.events_head == self.events.items.len) {
+            // Queue fully drained: recycle the buffer so consumed slots
+            // don't accumulate. Capacity (and with it the reserved spare
+            // slot for lifecycle events) is retained.
+            self.events.clearRetainingCapacity();
+            self.events_head = 0;
+        }
+        return event;
     }
 
     pub fn kill(self: *InteractiveTerminal) !void {
@@ -417,11 +435,40 @@ pub const InteractiveTerminal = struct {
         self.pushEventUnlocked(event);
     }
 
+    /// Initial capacity of the event queue, reserved at spawn. Must be at
+    /// least 2 so the spare-slot invariant below holds before any push.
+    const initial_event_capacity = 8;
+
+    /// Append an event; caller holds `self.mutex`. Ordinary events may be
+    /// dropped under OOM (observers self-heal on the next update), but the
+    /// `exited` lifecycle event must not be: `wait_for_exit` would hang to
+    /// its timeout. Every ordinary push therefore keeps one spare slot in
+    /// reserve (its own slot + 1), and `exited` — pushed exactly once, as
+    /// the terminal's final event — consumes that spare without allocating.
     fn pushEventUnlocked(self: *InteractiveTerminal, event: OutputEvent) void {
-        self.events.append(self.alloc, event) catch {
-            var dropped = event;
-            dropped.deinit(self.alloc);
-        };
+        switch (event) {
+            .exited => {
+                if (self.events.capacity > self.events.items.len) {
+                    self.events.appendAssumeCapacity(event);
+                } else {
+                    // Unreachable while the invariant holds; kept as a
+                    // best-effort fallback. `exited` owns no allocation,
+                    // so there is nothing to free if this fails.
+                    self.events.append(self.alloc, event) catch {};
+                }
+            },
+            else => {
+                self.events.ensureTotalCapacity(
+                    self.alloc,
+                    self.events.items.len + 2,
+                ) catch {
+                    var dropped = event;
+                    dropped.deinit(self.alloc);
+                    return;
+                };
+                self.events.appendAssumeCapacity(event);
+            },
+        }
     }
 
     fn pushErrorFmt(self: *InteractiveTerminal, comptime fmt: []const u8, args: anytype) void {
@@ -973,6 +1020,90 @@ test "title changes are emitted as events" {
     defer terminal.deinit();
 
     try waitForTitleEvent(terminal, "zig-title", 2_000);
+}
+
+test "exit event survives allocation failure" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sleep",
+        .args = &.{"5"},
+    }, .{
+        .rows = 5,
+        .cols = 20,
+        .emit_raw_bytes = false,
+        .emit_screen_updates = false,
+    });
+    defer terminal.deinit();
+
+    var failing = std.testing.FailingAllocator.init(
+        std.heap.c_allocator,
+        .{ .fail_index = 0 },
+    );
+
+    // Swap in an allocator that fails every allocation, then hammer the
+    // queue with ordinary events (droppable) followed by the lifecycle
+    // `exited` event, which must survive via the reserved spare slot.
+    // The whole sequence runs under the terminal mutex so the reader
+    // thread can't interleave a push while the failing allocator is in.
+    terminal.mutex.lock();
+    const real_alloc = terminal.alloc;
+    terminal.alloc = failing.allocator();
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        terminal.pushEventUnlocked(.screen_update);
+    }
+    terminal.pushEventUnlocked(.{ .exited = 42 });
+    terminal.alloc = real_alloc;
+    terminal.mutex.unlock();
+
+    var saw_exit = false;
+    while (terminal.pollEvent()) |event| {
+        var owned = event;
+        defer owned.deinit(std.heap.c_allocator);
+        switch (owned) {
+            .exited => |code| {
+                try std.testing.expectEqual(@as(?i32, 42), code);
+                saw_exit = true;
+            },
+            else => {},
+        }
+        if (saw_exit) break;
+    }
+    try std.testing.expect(saw_exit);
+}
+
+test "pollEvent returns events in FIFO order and recycles the buffer" {
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+        .program = "/bin/sleep",
+        .args = &.{"5"},
+    }, .{
+        .rows = 5,
+        .cols = 20,
+        .emit_raw_bytes = false,
+        .emit_screen_updates = false,
+    });
+    defer terminal.deinit();
+
+    // Drain the initial `started` event (and anything else queued).
+    while (terminal.pollEvent()) |event| {
+        var owned = event;
+        owned.deinit(std.heap.c_allocator);
+    }
+
+    terminal.pushEvent(.bell);
+    terminal.pushEvent(.screen_update);
+    terminal.pushEvent(.bell);
+
+    try std.testing.expect(terminal.pollEvent().? == .bell);
+    try std.testing.expect(terminal.pollEvent().? == .screen_update);
+    try std.testing.expect(terminal.pollEvent().? == .bell);
+    try std.testing.expect(terminal.pollEvent() == null);
+
+    // Fully drained: the queue must have been recycled, not left with a
+    // growing consumed prefix.
+    terminal.mutex.lock();
+    try std.testing.expectEqual(@as(usize, 0), terminal.events_head);
+    try std.testing.expectEqual(@as(usize, 0), terminal.events.items.len);
+    terminal.mutex.unlock();
 }
 
 test "snapshot preserves ansi styling" {
