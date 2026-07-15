@@ -367,6 +367,187 @@ pub fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap
     return .{ .id = id, .ok = true };
 }
 
+/// The condition a wait loop polls for. Both RPC surfaces — the standalone
+/// `wait_for_*` ops and the fused `wait_and_snapshot` op — parse their
+/// request fields into one of these and run the same `runWait` loop; only
+/// the response formatting differs per surface.
+const WaitCondition = union(enum) {
+    /// Sleep a fixed number of milliseconds, then complete. Never times
+    /// out (the fused op's `duration` kind ignores the deadline).
+    duration: u64,
+    /// Complete once the screen has been quiet for `idle_ms`. When
+    /// `floor_ms` is set, the idle reference is
+    /// `max(last_screen_change, floor_ms)` — the fused op passes its
+    /// op-start time so a long-quiet session can't satisfy the idle wait
+    /// instantly (see `handleWaitAndSnapshot`). The standalone op passes
+    /// null to keep its historical "idle since whenever" semantics.
+    idle: struct { idle_ms: i64, floor_ms: ?i64 },
+    /// Complete once `needle` appears in the rendered buffer — substring
+    /// match, or POSIX regex when `regex` is non-null. `matched_label` is
+    /// the wire value reported on success: the standalone op always says
+    /// "text" (historical shape, even in regex mode) while the fused op
+    /// distinguishes "text" / "regex".
+    text: struct { needle: []const u8, regex: ?*HtyRegex, matched_label: []const u8 },
+    /// Complete once the child process has exited.
+    exit,
+};
+
+/// Outcome of `runWait`, surface-agnostic. Either `matched` is non-null
+/// (with `text`/`exit` detail when the condition provides it) or
+/// `timed_out` is set.
+const WaitResult = struct {
+    matched: ?[]const u8 = null,
+    elapsed_ms: i64 = 0,
+    timed_out: bool = false,
+    text: ?WaitTextMatch = null,
+    exit: ?WaitExitInfo = null,
+};
+
+/// Compile a POSIX regex for a text wait, surfacing `error.InvalidRegex`
+/// on any compile failure. Caller owns the result (`hty_regex_free`).
+fn compileWaitRegex(arena: Allocator, pattern: []const u8) !*HtyRegex {
+    const nul_pattern = try arena.dupeZ(u8, pattern);
+    const re = hty_regex_compile(nul_pattern.ptr) orelse return error.InvalidRegex;
+    if (!hty_regex_is_valid(re)) {
+        hty_regex_free(re);
+        return error.InvalidRegex;
+    }
+    return re;
+}
+
+/// The single deadline-loop / drain / poll core shared by all wait ops.
+///
+/// Drain before each sleep. The accept thread also drains every 25ms,
+/// but in-process test callers drive `processRequestLine` directly
+/// with no accept loop, so the wait handlers remain the only thing
+/// flushing events into the log and updating session state. Each
+/// drainAll acquires the registry lock briefly and releases before
+/// the sleep, so concurrent workers are not serialized behind the
+/// wait.
+fn runWait(
+    arena: Allocator,
+    registry: *SessionRegistry,
+    sess: *Session,
+    condition: WaitCondition,
+    start_ms: i64,
+    deadline: i64,
+) !WaitResult {
+    if (condition == .duration) {
+        std.Thread.sleep(condition.duration * std.time.ns_per_ms);
+        registry.drainAll();
+        return .{
+            .matched = "duration",
+            .elapsed_ms = std.time.milliTimestamp() - start_ms,
+        };
+    }
+
+    while (std.time.milliTimestamp() <= deadline) {
+        registry.drainAll();
+
+        switch (condition) {
+            .duration => unreachable, // handled above
+            .idle => |cfg| {
+                const reference = if (cfg.floor_ms) |floor|
+                    @max(sess.getLastScreenChange(), floor)
+                else
+                    sess.getLastScreenChange();
+                const since = std.time.milliTimestamp() - reference;
+                if (since >= cfg.idle_ms) {
+                    return .{
+                        .matched = "idle",
+                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
+                    };
+                }
+            },
+            .text => |cfg| {
+                var snapshot = try sess.terminal.snapshot();
+                defer snapshot.deinit(sess.alloc);
+
+                // Capture the byte offset of the match during the first
+                // (and only) scan so regex callers get a uniform
+                // `text.offset` field. The regex helper returns the offset
+                // directly from `regexec`'s pmatch[0], so this doesn't
+                // cost a second pattern execution — it's the same call
+                // that decides match-vs-no-match.
+                const offset: ?i64 = if (cfg.regex) |re| blk: {
+                    break :blk try regexFindHaystack(sess.alloc, re, snapshot.buffer);
+                } else blk: {
+                    const idx = std.mem.indexOf(u8, snapshot.buffer, cfg.needle);
+                    break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
+                };
+                if (offset) |off| {
+                    return .{
+                        .matched = cfg.matched_label,
+                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
+                        .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
+                    };
+                }
+            },
+            .exit => {
+                if (sess.getStatus() != .running) {
+                    return .{
+                        .matched = "exit",
+                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
+                        .exit = .{ .code = sess.getExitCode() orelse 0 },
+                    };
+                }
+            },
+        }
+        std.Thread.sleep(25 * std.time.ns_per_ms);
+    }
+    return .{
+        .timed_out = true,
+        .elapsed_ms = std.time.milliTimestamp() - start_ms,
+    };
+}
+
+/// Format a standalone `wait_for_*` op's response from a `WaitResult`,
+/// preserving each op's historical wire shape: text/idle successes carry a
+/// snapshot payload, exit successes carry an `event` payload instead, and
+/// timeouts carry only the wait payload.
+fn standaloneWaitResponse(
+    arena: Allocator,
+    id: ?i64,
+    sess: *Session,
+    result: WaitResult,
+) !Response {
+    const sid = try arena.dupe(u8, &sess.id);
+    if (result.timed_out) {
+        return .{
+            .id = id,
+            .ok = true,
+            .timed_out = true,
+            .wait = .{
+                .matched = null,
+                .elapsed_ms = result.elapsed_ms,
+                .session = sid,
+                .timeout = true,
+            },
+        };
+    }
+    if (result.exit) |exit_info| {
+        return .{
+            .id = id,
+            .ok = true,
+            .event = .{ .kind = "exited", .code = exit_info.code },
+            .wait = .{
+                .matched = result.matched,
+                .elapsed_ms = result.elapsed_ms,
+                .session = sid,
+                .exit = exit_info,
+            },
+        };
+    }
+    var snapshot = try sess.terminal.snapshot();
+    defer snapshot.deinit(sess.alloc);
+    return try snapshotResponseWithWait(arena, id, snapshot, sess, .{
+        .matched = result.matched,
+        .elapsed_ms = result.elapsed_ms,
+        .session = sid,
+        .text = result.text,
+    });
+}
+
 pub fn handleWaitForText(
     arena: Allocator,
     registry: *SessionRegistry,
@@ -380,69 +561,17 @@ pub fn handleWaitForText(
     const start_ms = std.time.milliTimestamp();
     const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
-    // If regex mode, compile the pattern once up front.
-    var compiled_regex: ?*HtyRegex = null;
-    if (use_regex) {
-        const nul_pattern = try arena.dupeZ(u8, needle);
-        compiled_regex = hty_regex_compile(nul_pattern.ptr);
-        if (compiled_regex == null or !hty_regex_is_valid(compiled_regex.?)) {
-            if (compiled_regex) |re| hty_regex_free(re);
-            return error.InvalidRegex;
-        }
-    }
+    const compiled_regex: ?*HtyRegex = if (use_regex) try compileWaitRegex(arena, needle) else null;
     defer if (compiled_regex) |re| hty_regex_free(re);
 
-    // Drain before each sleep. The accept thread also drains every 25ms,
-    // but in-process test callers drive `processRequestLine` directly
-    // with no accept loop, so the wait handlers remain the only thing
-    // flushing events into the log and updating session state. Each
-    // drainAll acquires the registry lock briefly and releases before
-    // the sleep, so concurrent workers are not serialized behind the
-    // wait.
-    while (std.time.milliTimestamp() <= deadline) {
-        registry.drainAll();
-
-        var snapshot = try sess.terminal.snapshot();
-        defer snapshot.deinit(sess.alloc);
-
-        // Capture the byte offset of the match during the first (and only)
-        // scan so regex callers get a uniform `text.offset` field. The
-        // regex helper returns the offset directly from `regexec`'s
-        // pmatch[0], so this doesn't cost a second pattern execution —
-        // it's the same call that decides match-vs-no-match.
-        const offset: ?i64 = if (compiled_regex) |re| blk: {
-            const pos = try regexFindHaystack(sess.alloc, re, snapshot.buffer);
-            break :blk pos;
-        } else blk: {
-            const idx = std.mem.indexOf(u8, snapshot.buffer, needle);
-            break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
-        };
-        if (offset) |off| {
-            const elapsed = std.time.milliTimestamp() - start_ms;
-            const needle_owned = try arena.dupe(u8, needle);
-            const sid = try arena.dupe(u8, &sess.id);
-            return try snapshotResponseWithWait(arena, id, snapshot, sess, .{
-                .matched = "text",
-                .elapsed_ms = elapsed,
-                .session = sid,
-                .text = .{ .needle = needle_owned, .offset = off },
-            });
-        }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
-    }
-    const elapsed = std.time.milliTimestamp() - start_ms;
-    const sid = try arena.dupe(u8, &sess.id);
-    return .{
-        .id = id,
-        .ok = true,
-        .timed_out = true,
-        .wait = .{
-            .matched = null,
-            .elapsed_ms = elapsed,
-            .session = sid,
-            .timeout = true,
-        },
-    };
+    const result = try runWait(arena, registry, sess, .{ .text = .{
+        .needle = needle,
+        .regex = compiled_regex,
+        // Historical wire shape: the standalone op reports matched="text"
+        // even in regex mode.
+        .matched_label = "text",
+    } }, start_ms, deadline);
+    return try standaloneWaitResponse(arena, id, sess, result);
 }
 
 /// Match a regex against a terminal snapshot using bounded temporary memory.
@@ -480,40 +609,14 @@ pub fn handleWaitForIdle(
 ) !Response {
     const idle_ms_field = try readOptionalU64(object, "idle_ms", 250);
     const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const idle_ms: i64 = @intCast(idle_ms_field);
     const start_ms = std.time.milliTimestamp();
     const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
-    while (std.time.milliTimestamp() <= deadline) {
-        registry.drainAll();
-
-        const since = std.time.milliTimestamp() - sess.getLastScreenChange();
-        if (since >= idle_ms) {
-            var snapshot = try sess.terminal.snapshot();
-            defer snapshot.deinit(sess.alloc);
-            const elapsed = std.time.milliTimestamp() - start_ms;
-            const sid = try arena.dupe(u8, &sess.id);
-            return try snapshotResponseWithWait(arena, id, snapshot, sess, .{
-                .matched = "idle",
-                .elapsed_ms = elapsed,
-                .session = sid,
-            });
-        }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
-    }
-    const elapsed = std.time.milliTimestamp() - start_ms;
-    const sid = try arena.dupe(u8, &sess.id);
-    return .{
-        .id = id,
-        .ok = true,
-        .timed_out = true,
-        .wait = .{
-            .matched = null,
-            .elapsed_ms = elapsed,
-            .session = sid,
-            .timeout = true,
-        },
-    };
+    const result = try runWait(arena, registry, sess, .{ .idle = .{
+        .idle_ms = @intCast(idle_ms_field),
+        .floor_ms = null,
+    } }, start_ms, deadline);
+    return try standaloneWaitResponse(arena, id, sess, result);
 }
 
 pub fn handleWaitForExit(
@@ -527,41 +630,8 @@ pub fn handleWaitForExit(
     const start_ms = std.time.milliTimestamp();
     const deadline = start_ms + @as(i64, @intCast(timeout_ms));
 
-    while (std.time.milliTimestamp() <= deadline) {
-        registry.drainAll();
-
-        if (sess.getStatus() != .running) {
-            const elapsed = std.time.milliTimestamp() - start_ms;
-            const code_opt = sess.getExitCode();
-            const code: i32 = code_opt orelse 0;
-            const sid = try arena.dupe(u8, &sess.id);
-            return .{
-                .id = id,
-                .ok = true,
-                .event = .{ .kind = "exited", .code = code },
-                .wait = .{
-                    .matched = "exit",
-                    .elapsed_ms = elapsed,
-                    .session = sid,
-                    .exit = .{ .code = code },
-                },
-            };
-        }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
-    }
-    const elapsed = std.time.milliTimestamp() - start_ms;
-    const sid = try arena.dupe(u8, &sess.id);
-    return .{
-        .id = id,
-        .ok = true,
-        .timed_out = true,
-        .wait = .{
-            .matched = null,
-            .elapsed_ms = elapsed,
-            .session = sid,
-            .timeout = true,
-        },
-    };
+    const result = try runWait(arena, registry, sess, .exit, start_ms, deadline);
+    return try standaloneWaitResponse(arena, id, sess, result);
 }
 
 /// Server-side fused wait+snapshot op. The client-side commands `hty send`
@@ -613,88 +683,47 @@ pub fn handleWaitAndSnapshot(
         return try buildFusedResponse(arena, id, sess, include_snapshot, null, 0, false, null, null);
     }
 
-    if (std.mem.eql(u8, wait_kind, "duration")) {
-        const duration_ms = try readOptionalU64(object, "duration_ms", 0);
-        std.Thread.sleep(duration_ms * std.time.ns_per_ms);
-        registry.drainAll();
-        const elapsed = std.time.milliTimestamp() - start_ms;
-        return try buildFusedResponse(arena, id, sess, include_snapshot, "duration", elapsed, false, null, null);
-    }
+    var compiled_regex: ?*HtyRegex = null;
+    defer if (compiled_regex) |re| hty_regex_free(re);
 
-    if (std.mem.eql(u8, wait_kind, "idle")) {
-        const idle_ms_field = try readOptionalU64(object, "idle_ms", 100);
-        const idle_ms: i64 = @intCast(idle_ms_field);
-
-        while (std.time.milliTimestamp() <= deadline) {
-            registry.drainAll();
+    const condition: WaitCondition = blk: {
+        if (std.mem.eql(u8, wait_kind, "duration")) {
+            break :blk .{ .duration = try readOptionalU64(object, "duration_ms", 0) };
+        }
+        if (std.mem.eql(u8, wait_kind, "idle")) {
+            const idle_ms_field = try readOptionalU64(object, "idle_ms", 100);
             // Race fix: if the session was already idle before this op
             // started, treat op-start as the idle reference instead.
-            const reference = @max(sess.getLastScreenChange(), start_ms);
-            const since = std.time.milliTimestamp() - reference;
-            if (since >= idle_ms) {
-                const elapsed = std.time.milliTimestamp() - start_ms;
-                return try buildFusedResponse(arena, id, sess, include_snapshot, "idle", elapsed, false, null, null);
-            }
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+            break :blk .{ .idle = .{ .idle_ms = @intCast(idle_ms_field), .floor_ms = start_ms } };
         }
-        const elapsed = std.time.milliTimestamp() - start_ms;
-        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
-    }
-
-    if (std.mem.eql(u8, wait_kind, "text") or std.mem.eql(u8, wait_kind, "regex")) {
-        const needle = try readRequiredString(object, "text");
-        const use_regex = std.mem.eql(u8, wait_kind, "regex");
-
-        var compiled_regex: ?*HtyRegex = null;
-        if (use_regex) {
-            const nul_pattern = try arena.dupeZ(u8, needle);
-            compiled_regex = hty_regex_compile(nul_pattern.ptr);
-            if (compiled_regex == null or !hty_regex_is_valid(compiled_regex.?)) {
-                if (compiled_regex) |re| hty_regex_free(re);
-                return error.InvalidRegex;
-            }
+        if (std.mem.eql(u8, wait_kind, "text") or std.mem.eql(u8, wait_kind, "regex")) {
+            const needle = try readRequiredString(object, "text");
+            const use_regex = std.mem.eql(u8, wait_kind, "regex");
+            if (use_regex) compiled_regex = try compileWaitRegex(arena, needle);
+            break :blk .{ .text = .{
+                .needle = needle,
+                .regex = compiled_regex,
+                .matched_label = if (use_regex) "regex" else "text",
+            } };
         }
-        defer if (compiled_regex) |re| hty_regex_free(re);
-
-        while (std.time.milliTimestamp() <= deadline) {
-            registry.drainAll();
-            var snapshot = try sess.terminal.snapshot();
-            defer snapshot.deinit(sess.alloc);
-
-            const offset: ?i64 = if (compiled_regex) |re| blk: {
-                break :blk try regexFindHaystack(sess.alloc, re, snapshot.buffer);
-            } else blk: {
-                const idx = std.mem.indexOf(u8, snapshot.buffer, needle);
-                break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
-            };
-            if (offset) |off| {
-                const elapsed = std.time.milliTimestamp() - start_ms;
-                const needle_owned = try arena.dupe(u8, needle);
-                const matched_label: []const u8 = if (use_regex) "regex" else "text";
-                const text_match = WaitTextMatch{ .needle = needle_owned, .offset = off };
-                return try buildFusedResponse(arena, id, sess, include_snapshot, matched_label, elapsed, false, text_match, null);
-            }
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+        if (std.mem.eql(u8, wait_kind, "exit")) {
+            break :blk .exit;
         }
-        const elapsed = std.time.milliTimestamp() - start_ms;
-        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
-    }
+        return error.InvalidFieldValue;
+    };
 
-    if (std.mem.eql(u8, wait_kind, "exit")) {
-        while (std.time.milliTimestamp() <= deadline) {
-            registry.drainAll();
-            if (sess.getStatus() != .running) {
-                const elapsed = std.time.milliTimestamp() - start_ms;
-                const code: i32 = sess.getExitCode() orelse 0;
-                return try buildFusedResponse(arena, id, sess, include_snapshot, "exit", elapsed, false, null, .{ .code = code });
-            }
-            std.Thread.sleep(25 * std.time.ns_per_ms);
-        }
-        const elapsed = std.time.milliTimestamp() - start_ms;
-        return try buildFusedResponse(arena, id, sess, include_snapshot, null, elapsed, true, null, null);
-    }
-
-    return error.InvalidFieldValue;
+    const result = try runWait(arena, registry, sess, condition, start_ms, deadline);
+    return try buildFusedResponse(
+        arena,
+        id,
+        sess,
+        include_snapshot,
+        result.matched,
+        result.elapsed_ms,
+        result.timed_out,
+        result.text,
+        result.exit,
+    );
 }
 
 /// Pack a wait + (optional) snapshot result into a Response. Centralizes
