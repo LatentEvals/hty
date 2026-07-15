@@ -37,6 +37,6 @@ Use `HTY_SOCKET` to connect to a remote hty server over an SSH tunnel. Forward t
 </Callout>
 ## Multiple clients
 
-Multiple CLI invocations can connect to the same server simultaneously. The server handles each connection sequentially on a single thread, but because most requests are fast (snapshot, send, list), concurrent callers rarely have to wait.
+Multiple CLI invocations can connect to the same server simultaneously. The server multiplexes every connection on a single-threaded event loop: fast requests (snapshot, send, list) are answered as they arrive, and long-running waits (`hty wait`) are parked on the loop rather than blocking it, so a caller waiting on one session never delays another.
 
 Long-lived commands like `hty watch` and `hty attach` can both observe the same session at the same time. `hty attach` registers as a subscriber and receives raw PTY output as it arrives; `hty watch` polls the server for snapshots on its own schedule. Neither blocks the other, and neither blocks other CLI commands from running against the same session.
