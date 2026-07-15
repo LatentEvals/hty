@@ -17,6 +17,7 @@ const encodeResponse = protocol.encodeResponse;
 const requestErrorMessage = protocol.requestErrorMessage;
 
 const SessionRegistry = @import("registry.zig").SessionRegistry;
+const Session = @import("session.zig").Session;
 
 const ops = @import("ops.zig");
 
@@ -345,6 +346,48 @@ pub fn processRequestLine(alloc: Allocator, registry: *SessionRegistry, line: []
     return encodeResponse(alloc, response);
 }
 
+/// How to invoke an op handler. The variants mirror the handful of handler
+/// signatures in `ops.zig`; the top-level split is whether the op needs a
+/// resolved session (`session: false` ops run before any registry lookup,
+/// so unknown ops surface as UnknownOperation rather than SessionNotFound).
+const OpHandler = union(enum) {
+    // Registry-level ops — no session resolution.
+    registry: *const fn (Allocator, *SessionRegistry, ?i64) anyerror!Response,
+    registry_obj: *const fn (Allocator, *SessionRegistry, std.json.ObjectMap, ?i64) anyerror!Response,
+    // Session ops — dispatch resolves + borrows the session first.
+    session: *const fn (Allocator, *Session, ?i64) anyerror!Response,
+    session_obj: *const fn (Allocator, *Session, std.json.ObjectMap, ?i64) anyerror!Response,
+    registry_session: *const fn (Allocator, *SessionRegistry, *Session, ?i64) anyerror!Response,
+    registry_session_obj: *const fn (Allocator, *SessionRegistry, *Session, std.json.ObjectMap, ?i64) anyerror!Response,
+};
+
+const OpEntry = struct {
+    name: []const u8,
+    handler: OpHandler,
+};
+
+/// The single source of truth for the RPC surface: op name → handler.
+/// Adding an op means adding exactly one row here. (`attach`/`watch` are
+/// deliberately absent — they hijack the connection and are branched off
+/// in `handleConnection` before normal dispatch.)
+const op_table = [_]OpEntry{
+    .{ .name = "spawn", .handler = .{ .registry_obj = ops.handleSpawn } },
+    .{ .name = "list", .handler = .{ .registry = ops.handleList } },
+    .{ .name = "info", .handler = .{ .registry = ops.handleInfo } },
+    .{ .name = "snapshot", .handler = .{ .session = ops.handleSnapshot } },
+    .{ .name = "send_text", .handler = .{ .session_obj = ops.handleSendText } },
+    .{ .name = "send_key", .handler = .{ .session_obj = ops.handleSendKey } },
+    .{ .name = "send_bytes_hex", .handler = .{ .session_obj = ops.handleSendBytesHex } },
+    .{ .name = "send_mouse", .handler = .{ .session_obj = ops.handleSendMouse } },
+    .{ .name = "resize", .handler = .{ .session_obj = ops.handleResize } },
+    .{ .name = "wait_for_text", .handler = .{ .registry_session_obj = ops.handleWaitForText } },
+    .{ .name = "wait_for_idle", .handler = .{ .registry_session_obj = ops.handleWaitForIdle } },
+    .{ .name = "wait_for_exit", .handler = .{ .registry_session_obj = ops.handleWaitForExit } },
+    .{ .name = "kill", .handler = .{ .registry_session = ops.handleKill } },
+    .{ .name = "delete", .handler = .{ .registry_session = ops.handleDelete } },
+    .{ .name = "wait_and_snapshot", .handler = .{ .registry_session_obj = ops.handleWaitAndSnapshot } },
+};
+
 pub fn dispatchRequest(
     arena: Allocator,
     registry: *SessionRegistry,
@@ -352,28 +395,20 @@ pub fn dispatchRequest(
     op: []const u8,
     id: ?i64,
 ) !Response {
-    if (std.mem.eql(u8, op, "spawn")) return ops.handleSpawn(arena, registry, object, id);
-    if (std.mem.eql(u8, op, "list")) return ops.handleList(arena, registry, id);
-    if (std.mem.eql(u8, op, "info")) return ops.handleInfo(arena, registry, id);
-
     // Validate the op before touching the session registry so unknown ops
     // surface as UnknownOperation rather than SessionNotFound.
-    // Note: `info` and `list` are dispatched above (no session needed), so
-    // they're not in this list.
-    const known_ops = [_][]const u8{
-        "snapshot",      "send_text",         "send_key",      "send_bytes_hex",
-        "send_mouse",
-        "resize",        "wait_for_text",     "wait_for_idle", "wait_for_exit",
-        "kill",          "delete",            "wait_and_snapshot",
-    };
-    var matched_op = false;
-    for (known_ops) |candidate| {
-        if (std.mem.eql(u8, op, candidate)) {
-            matched_op = true;
-            break;
+    const entry = blk: {
+        for (&op_table) |*candidate| {
+            if (std.mem.eql(u8, op, candidate.name)) break :blk candidate;
         }
+        return error.UnknownOperation;
+    };
+
+    switch (entry.handler) {
+        .registry => |handler| return handler(arena, registry, id),
+        .registry_obj => |handler| return handler(arena, registry, object, id),
+        else => {},
     }
-    if (!matched_op) return error.UnknownOperation;
 
     const session_ref = try readOptionalString(object, "session");
     const sess = try registry.resolveOrSole(session_ref);
@@ -384,18 +419,11 @@ pub fn dispatchRequest(
     // storage stays alive until this borrow (the last one) is dropped.
     defer registry.release(sess);
 
-    if (std.mem.eql(u8, op, "snapshot")) return ops.handleSnapshot(arena, sess, id);
-    if (std.mem.eql(u8, op, "send_text")) return ops.handleSendText(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "send_key")) return ops.handleSendKey(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "send_bytes_hex")) return ops.handleSendBytesHex(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "send_mouse")) return ops.handleSendMouse(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "resize")) return ops.handleResize(arena, sess, object, id);
-    if (std.mem.eql(u8, op, "wait_for_text")) return ops.handleWaitForText(arena, registry, sess, object, id);
-    if (std.mem.eql(u8, op, "wait_for_idle")) return ops.handleWaitForIdle(arena, registry, sess, object, id);
-    if (std.mem.eql(u8, op, "wait_for_exit")) return ops.handleWaitForExit(arena, registry, sess, object, id);
-    if (std.mem.eql(u8, op, "kill")) return ops.handleKill(arena, registry, sess, id);
-    if (std.mem.eql(u8, op, "delete")) return ops.handleDelete(arena, registry, sess, id);
-    if (std.mem.eql(u8, op, "wait_and_snapshot")) return ops.handleWaitAndSnapshot(arena, registry, sess, object, id);
-
-    return error.UnknownOperation;
+    return switch (entry.handler) {
+        .registry, .registry_obj => unreachable, // dispatched above
+        .session => |handler| handler(arena, sess, id),
+        .session_obj => |handler| handler(arena, sess, object, id),
+        .registry_session => |handler| handler(arena, registry, sess, id),
+        .registry_session_obj => |handler| handler(arena, registry, sess, object, id),
+    };
 }
