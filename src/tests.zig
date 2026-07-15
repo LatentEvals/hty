@@ -3255,8 +3255,13 @@ fn registerAttachClient(
 
 /// Get a session pointer by name for tests that need to poke at the
 /// attach machinery directly. Returns an error if the session is gone.
+/// The borrow acquired by `resolveOrSole` is released immediately — the
+/// returned pointer is a bare peek, valid only while the test refrains
+/// from deleting the session on another thread.
 fn sessionByName(registry: *SessionRegistry, name: []const u8) !*session_mod_tests.Session {
-    return registry.resolveOrSole(name);
+    const sess = try registry.resolveOrSole(name);
+    registry.release(sess);
+    return sess;
 }
 
 test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect" {
@@ -4482,8 +4487,8 @@ test "run --remove: session is auto-removed after child exits" {
         _ = try expectTestOk(parsed);
     }
 
-    // Child exits almost immediately; drain + grace window (100ms) should
-    // reap it within a second at most. Give ample headroom for CI.
+    // Child exits almost immediately; the drain sweep reaps it as soon as
+    // the exit is observed. Give ample headroom for CI.
     const Ctx = struct { r: *SessionRegistry };
     const ctx = Ctx{ .r = &registry };
     const Pred = struct {
@@ -4544,7 +4549,7 @@ test "run --remove: session persists while child is alive" {
         _ = try expectTestOk(parsed);
     }
 
-    // After kill + grace window, the session must be gone.
+    // After kill, the sweep must remove the session.
     const Ctx = struct { r: *SessionRegistry };
     const ctx = Ctx{ .r = &registry };
     const Pred = struct {
@@ -4649,12 +4654,168 @@ test "spawn without --remove keeps the session after exit" {
         _ = try expectTestOk(parsed);
     }
 
-    // Drain through several ticks past the auto-remove grace window to
-    // prove the zombie lingers because `--remove` was *not* set.
+    // Drain through several ticks to prove the zombie lingers because
+    // `--remove` was *not* set.
     var i: usize = 0;
     while (i < 15) : (i += 1) {
         registry.drainAll();
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
+}
+
+// ============================================================================
+// Unit 6: session lifetime by ownership (refcount), not timing.
+// ============================================================================
+
+test "delete during wait_for_text: wait returns structured error, no UAF" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "del-mid-wait",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Run the wait on a worker thread, exactly like a real RPC worker
+    // would: the handler borrows the session at resolve time and polls
+    // it for up to 5s.
+    const WaiterCtx = struct {
+        registry: *SessionRegistry,
+        response: ?[]u8 = null,
+    };
+    var ctx = WaiterCtx{ .registry = &registry };
+    const Waiter = struct {
+        fn run(c: *WaiterCtx) void {
+            const req =
+                "{\"op\":\"wait_for_text\",\"session\":\"del-mid-wait\"," ++
+                "\"text\":\"never-appears\",\"timeout_ms\":5000}";
+            c.response = processRequestLine(std.testing.allocator, c.registry, req) catch null;
+        }
+    };
+    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&ctx});
+
+    // Give the wait a few poll iterations to get in flight, then delete
+    // the session out from under it from this thread.
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+    {
+        var parsed = try testRequest(&registry, .{ .op = "delete", .session = "del-mid-wait" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    waiter_thread.join();
+    const response = ctx.response orelse return error.WaitRequestFailed;
+    defer alloc.free(response);
+
+    // The wait must complete with a structured result: the "session not
+    // found" error from the doomed check (normal case), or — under
+    // extreme scheduling — its own timeout. Never a crash: the debug
+    // allocator trips if the handler touched freed session memory.
+    const not_found = std.mem.indexOf(u8, response, "session not found") != null;
+    const timed_out = std.mem.indexOf(u8, response, "\"timed_out\":true") != null;
+    try std.testing.expect(not_found or timed_out);
+
+    // And the session really is gone.
+    try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
+}
+
+test "handler error mid-op releases the session borrow" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "err-mid-handler",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // `send_key` with a bogus key resolves the session first, then errors
+    // inside the handler — exercising the error exit path of the
+    // dispatch-level release.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_key",
+            .session = "err-mid-handler",
+            .key = "definitely-not-a-key",
+        });
+        defer parsed.deinit();
+        try expectTestError(parsed, "invalid key");
+    }
+
+    // The borrow must be back to zero: the `defer registry.release(sess)`
+    // in dispatchRequest ran on the error return.
+    const sess = try sessionByName(&registry, "err-mid-handler");
+    registry.mutex.lock();
+    const refs = sess.ref_count;
+    registry.mutex.unlock();
+    try std.testing.expectEqual(@as(u32, 0), refs);
+
+    // Delete must now free the session for real — a stuck refcount would
+    // surface as a leak, and std.testing.allocator fails the test on leaks.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "delete", .session = "err-mid-handler" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
+}
+
+test "refcount: removeLocked defers free while borrowed; last release frees" {
+    const alloc = std.testing.allocator;
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "refcount",
+            .rows = 8,
+            .cols = 24,
+            .emit_raw_bytes = false,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "refcount" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Borrow the session the way dispatchRequest does.
+    const sess = try registry.resolveOrSole("refcount");
+
+    // Remove while borrowed: the session is unpublished immediately (no
+    // resolve can find it), but the storage must NOT be freed yet.
+    registry.remove(sess);
+    try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
+    try std.testing.expect(sess.isDoomed());
+    try std.testing.expectError(error.SessionNotFound, registry.resolveOrSole("refcount"));
+
+    // The borrow still protects the memory — reads through the pointer
+    // are safe (the debug allocator would trip on freed memory).
+    try std.testing.expect(sess.getStatus() != .running);
+
+    // Dropping the last borrow frees the session; the testing allocator
+    // fails the test if it leaks instead.
+    registry.release(sess);
 }

@@ -117,13 +117,6 @@ fn pendingWatcherReaderLoop(pw: *PendingWatcher) void {
     }
 }
 
-/// Delay between observing a `--remove` session's terminal transition and
-/// actually freeing the session in `drainAll`. Gives in-flight wait /
-/// snapshot handlers that saw the transition on the same tick a window to
-/// finish touching the session pointer before it goes away. The accept
-/// loop's drain period is 25ms, so 100ms = ~4 ticks of slack.
-pub const auto_remove_grace_ms: i64 = 100;
-
 pub const SessionRegistry = struct {
     alloc: Allocator,
     by_id: std.StringHashMapUnmanaged(*Session) = .{},
@@ -474,10 +467,15 @@ pub const SessionRegistry = struct {
 
     /// Resolve a session reference (full UUID, unique prefix, or name).
     /// Returns null if no match. Returns error.AmbiguousPrefix if prefix matches 2+.
+    /// On a successful (non-null) resolve the session's refcount is
+    /// incremented — the caller borrows the pointer and MUST pair the call
+    /// with `release()` on every exit path.
     pub fn resolve(self: *SessionRegistry, reference: []const u8) !?*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.resolveLocked(reference);
+        const sess = try self.resolveLocked(reference);
+        if (sess) |s| s.ref_count += 1;
+        return sess;
     }
 
     /// Caller must hold `self.mutex`. Used internally by `resolve` and by
@@ -500,16 +498,46 @@ pub const SessionRegistry = struct {
     }
 
     /// Resolve or pick the sole session when reference is null.
+    /// On success the session's refcount is incremented while `self.mutex`
+    /// is still held — the caller borrows the pointer and MUST pair the
+    /// call with `release()` on every exit path (typically via `defer`).
+    /// The borrow keeps the Session storage alive across a concurrent
+    /// `hty delete` / `--remove` sweep; those unpublish the session
+    /// immediately, but the memory is only freed once the last borrow is
+    /// released.
     pub fn resolveOrSole(self: *SessionRegistry, reference: ?[]const u8) !*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (reference) |r| {
-            return (try self.resolveLocked(r)) orelse error.SessionNotFound;
+        const sess = blk: {
+            if (reference) |r| {
+                break :blk (try self.resolveLocked(r)) orelse return error.SessionNotFound;
+            }
+            if (self.by_id.count() == 0) return error.SessionNotFound;
+            if (self.by_id.count() > 1) return error.AmbiguousPrefix;
+            var it = self.by_id.valueIterator();
+            break :blk it.next().?.*;
+        };
+        sess.ref_count += 1;
+        return sess;
+    }
+
+    /// Drop a borrow acquired by `resolve` / `resolveOrSole`. If the
+    /// session was doomed (unpublished by `removeLocked`) and this was the
+    /// last borrow, the session is freed here. The free runs outside
+    /// `self.mutex`: nothing else can reach the session anymore (it's out
+    /// of both maps and the count is zero), and `Session.deinit` joins
+    /// attach reader threads, which we don't want serialized under the
+    /// registry lock.
+    pub fn release(self: *SessionRegistry, sess: *Session) void {
+        self.mutex.lock();
+        std.debug.assert(sess.ref_count > 0);
+        sess.ref_count -= 1;
+        const free_now = sess.ref_count == 0 and sess.isDoomed();
+        self.mutex.unlock();
+        if (free_now) {
+            sess.deinit();
+            self.alloc.destroy(sess);
         }
-        if (self.by_id.count() == 0) return error.SessionNotFound;
-        if (self.by_id.count() > 1) return error.AmbiguousPrefix;
-        var it = self.by_id.valueIterator();
-        return it.next().?.*;
     }
 
     pub fn remove(self: *SessionRegistry, sess: *Session) void {
@@ -518,15 +546,20 @@ pub const SessionRegistry = struct {
         self.removeLocked(sess);
     }
 
-    /// Caller must hold `self.mutex`. Drops the session from both maps,
-    /// tears down the Session struct, and frees its storage. Used by the
-    /// locked auto-remove sweep in `drainAll` and by the public `remove`
-    /// (which takes the lock first).
+    /// Caller must hold `self.mutex`. Unpublishes the session from both
+    /// maps immediately — no new resolve can find it — and marks it
+    /// doomed. If no handler currently borrows the session it is torn
+    /// down and freed right here; otherwise the last `release()` frees
+    /// it. Used by the locked auto-remove sweep in `drainAll` and by the
+    /// public `remove` (which takes the lock first).
     pub fn removeLocked(self: *SessionRegistry, sess: *Session) void {
         _ = self.by_id.remove(&sess.id);
         if (sess.name) |n| _ = self.name_index.remove(n);
-        sess.deinit();
-        self.alloc.destroy(sess);
+        sess.doomed_atomic.store(true, .release);
+        if (sess.ref_count == 0) {
+            sess.deinit();
+            self.alloc.destroy(sess);
+        }
     }
 
     /// Drain any queued events, updating last_screen_change_at, status, the
@@ -596,23 +629,20 @@ pub const SessionRegistry = struct {
         }
 
         // Auto-remove sweep for `--remove` sessions whose child has
-        // exited. We defer by a short grace window (`auto_remove_grace_ms`)
-        // so any in-flight wait/snapshot handler that observed the
-        // terminal transition on this same tick has time to finish
-        // touching the session pointer before we free it. The sweep runs
-        // under `self.mutex`, same lock the maps + session teardown need,
-        // so racing `hty kill` / `hty delete` can't double-free: whichever
+        // exited. Removal is immediate: `removeLocked` unpublishes the
+        // session from the maps and any in-flight wait/snapshot handler
+        // is protected by the borrow it acquired at resolve time (the
+        // last release frees the storage). The sweep runs under
+        // `self.mutex`, same lock the maps + session teardown need, so
+        // racing `hty kill` / `hty delete` can't double-free: whichever
         // path wins the mutex observes the other's state change.
-        const sweep_now = std.time.milliTimestamp();
         var to_remove: std.ArrayListUnmanaged(*Session) = .{};
         defer to_remove.deinit(self.alloc);
         var sweep_it = self.by_id.valueIterator();
         while (sweep_it.next()) |sess_ptr| {
             const sess = sess_ptr.*;
             if (!sess.remove_on_exit) continue;
-            const terminal_at = sess.getTerminalAt();
-            if (terminal_at == 0) continue;
-            if (sweep_now - terminal_at < auto_remove_grace_ms) continue;
+            if (sess.getTerminalAt() == 0) continue;
             to_remove.append(self.alloc, sess) catch break;
         }
         for (to_remove.items) |sess| {

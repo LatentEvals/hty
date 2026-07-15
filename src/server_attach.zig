@@ -106,6 +106,12 @@ pub fn handleAttachConnection(
         try writeAttachError(conn.stream, requestErrorMessage(err));
         return .done;
     };
+    // Borrow from `resolveOrSole` — released on every exit path of this
+    // function. By the time we return, the AttachClient (if any) is
+    // registered on the session's attach list, and session teardown owns
+    // its lifecycle from there; the borrow only needs to cover the setup
+    // window where we hold a bare `*Session`.
+    defer registry.release(sess);
 
     // Optional resize on attach so the PTY matches the observer's terminal.
     // Watch subscribers are read-only — their terminal size is informational

@@ -377,6 +377,12 @@ pub fn dispatchRequest(
 
     const session_ref = try readOptionalString(object, "session");
     const sess = try registry.resolveOrSole(session_ref);
+    // `resolveOrSole` handed us a borrow (refcount incremented under the
+    // registry lock). Release it on every exit path — normal return AND
+    // error return from any handler below — so a concurrent `delete` or
+    // `--remove` sweep can unpublish the session immediately while the
+    // storage stays alive until this borrow (the last one) is dropped.
+    defer registry.release(sess);
 
     if (std.mem.eql(u8, op, "snapshot")) return ops.handleSnapshot(arena, sess, id);
     if (std.mem.eql(u8, op, "send_text")) return ops.handleSendText(arena, sess, object, id);

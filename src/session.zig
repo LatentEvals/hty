@@ -199,20 +199,36 @@ pub const Session = struct {
     status_atomic: std.atomic.Value(u8),
     exit_code_atomic: std.atomic.Value(i32),
 
-    /// When true, the registry automatically removes this session shortly
-    /// after the child process exits (success, failure, signal, or `hty
-    /// kill`). Opt-in via `hty run --remove`. The auto-removal path in
+    /// When true, the registry automatically removes this session once the
+    /// child process exits (success, failure, signal, or `hty kill`).
+    /// Opt-in via `hty run --remove`. The auto-removal path in
     /// `SessionRegistry.drainAll` treats this identically to `hty delete`
-    /// — same teardown, same filesystem cleanup — but defers the removal
-    /// by a short grace window so in-flight wait/snapshot handlers can
-    /// finish touching the session pointer before it's freed.
+    /// — same teardown, same filesystem cleanup. In-flight wait/snapshot
+    /// handlers are protected by the refcount (`ref_count` below), not by
+    /// timing: removal unpublishes the session immediately and the last
+    /// borrow holder frees it.
     remove_on_exit: bool = false,
     /// Unix-epoch milliseconds at which this session was first observed in
     /// a non-`running` state. `0` means "still running / not yet stamped."
     /// Set by the drain loop on exit/failure transitions and by
     /// `handleKill` when it flips status to `.killed`. Read by the drain
-    /// loop's auto-remove sweep to enforce the grace window.
+    /// loop's auto-remove sweep to decide eligibility.
     terminal_at_ms_atomic: std.atomic.Value(i64) = .init(0),
+
+    /// Number of live borrows of this session pointer held by in-flight
+    /// handlers (RPC workers, attach setup). Guarded by
+    /// `SessionRegistry.mutex`: incremented by the registry's resolve
+    /// paths, decremented by `SessionRegistry.release`. When the count
+    /// drops to zero and `doomed_atomic` is set, the releaser frees the
+    /// session — ownership, not timing, decides the lifetime.
+    ref_count: u32 = 0,
+    /// Set (under `SessionRegistry.mutex`) when the session has been
+    /// unpublished from the registry maps (`hty delete` or the `--remove`
+    /// sweep) but destruction is deferred because handlers still hold
+    /// borrows. Stored as an atomic so wait loops can check it lock-free
+    /// between polls and bail out instead of running to their timeout
+    /// against a deleted session.
+    doomed_atomic: std.atomic.Value(bool) = .init(false),
 
     /// Mouse-input mode flags inferred from the PTY output stream.
     /// Mutated from `drainAll` when raw_bytes events arrive; read by
@@ -277,15 +293,23 @@ pub const Session = struct {
     }
 
     /// Stamp `terminal_at_ms_atomic` the first time the session leaves the
-    /// running state. Idempotent: subsequent calls are no-ops so the grace
-    /// window is measured from the first observed transition, not from a
-    /// later `hty kill` racing against an already-exited session.
+    /// running state. Idempotent: subsequent calls are no-ops so the stamp
+    /// records the first observed transition, not a later `hty kill`
+    /// racing against an already-exited session.
     pub fn markTerminal(self: *Session, now_ms: i64) void {
         _ = self.terminal_at_ms_atomic.cmpxchgStrong(0, now_ms, .release, .monotonic);
     }
 
     pub fn getTerminalAt(self: *const Session) i64 {
         return self.terminal_at_ms_atomic.load(.acquire);
+    }
+
+    /// True once the session has been unpublished from the registry and is
+    /// awaiting its last borrow release. Handlers holding a borrow may
+    /// still touch the memory safely, but should treat the session as
+    /// deleted for every observable purpose.
+    pub fn isDoomed(self: *const Session) bool {
+        return self.doomed_atomic.load(.acquire);
     }
 
     pub fn deinit(self: *Session) void {
