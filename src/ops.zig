@@ -392,9 +392,10 @@ const WaitCondition = union(enum) {
     exit,
 };
 
-/// Outcome of `runWait`, surface-agnostic. Either `matched` is non-null
-/// (with `text`/`exit` detail when the condition provides it) or
-/// `timed_out` is set.
+/// Outcome of a wait, surface-agnostic. `evaluateWaitCondition` produces
+/// the satisfied outcomes (`matched` non-null, with `text`/`exit` detail
+/// when the condition provides it); `runWait` produces the `timed_out`
+/// ones.
 const WaitResult = struct {
     matched: ?[]const u8 = null,
     elapsed_ms: i64 = 0,
@@ -415,7 +416,126 @@ fn compileWaitRegex(arena: Allocator, pattern: []const u8) !*HtyRegex {
     return re;
 }
 
-/// The single deadline-loop / drain / poll core shared by all wait ops.
+/// Per-waiter evaluation state carried between `evaluateWaitCondition`
+/// calls. One instance lives for the lifetime of a wait — today on
+/// `runWait`'s stack, later in the event loop's waiter table — and holds
+/// everything a re-evaluation needs besides the condition itself.
+const WaitState = struct {
+    /// When the wait began; the reference point for `duration` conditions
+    /// and for `elapsed_ms` in every outcome.
+    start_ms: i64,
+    /// Screen-change stamp observed by the most recent text scan. Snapshots
+    /// are the expensive part of a text poll, and the screen usually hasn't
+    /// changed between evaluations — re-scan only when the stamp moved
+    /// since the previous scan (the caller's drain is what bumps it). Null
+    /// means "never scanned", so the first evaluation always scans.
+    last_scanned_change: ?i64 = null,
+    /// Sessions spawned with `emit_screen_updates: false` never bump the
+    /// change stamp, so for those every evaluation scans unconditionally.
+    track_screen_changes: bool,
+
+    fn init(sess: *const Session, start_ms: i64) WaitState {
+        return .{
+            .start_ms = start_ms,
+            .track_screen_changes = sess.terminal.config.emit_screen_updates,
+        };
+    }
+};
+
+/// Evaluate one wait condition against current session state, returning
+/// the outcome when satisfied or null when the wait should continue.
+///
+/// Pure and loop-agnostic by design: no sleeps, no drains, no deadline
+/// bookkeeping, and no I/O beyond session snapshot/status reads. The
+/// caller owns the schedule — when to drain, when to re-evaluate, and
+/// when to give up. Today that caller is `runWait`'s 25ms poll shell;
+/// the event loop's waiter table will call this on PTY-output and timer
+/// events instead.
+fn evaluateWaitCondition(
+    arena: Allocator,
+    condition: WaitCondition,
+    sess: *Session,
+    state: *WaitState,
+) !?WaitResult {
+    switch (condition) {
+        .duration => |duration_ms| {
+            const now = std.time.milliTimestamp();
+            if (now - state.start_ms >= @as(i64, @intCast(duration_ms))) {
+                return .{
+                    .matched = "duration",
+                    .elapsed_ms = now - state.start_ms,
+                };
+            }
+        },
+        .idle => |cfg| {
+            const reference = if (cfg.floor_ms) |floor|
+                @max(sess.getLastScreenChange(), floor)
+            else
+                sess.getLastScreenChange();
+            const since = std.time.milliTimestamp() - reference;
+            if (since >= cfg.idle_ms) {
+                return .{
+                    .matched = "idle",
+                    .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                };
+            }
+        },
+        .text => |cfg| {
+            // Read the stamp *before* snapshotting: output that lands
+            // in between is scanned now with an older stamp recorded,
+            // so the next drain's newer stamp forces a re-scan — we
+            // may scan once redundantly, but never miss a change.
+            const change_stamp = sess.getLastScreenChange();
+            const unchanged = state.track_screen_changes and
+                state.last_scanned_change != null and
+                state.last_scanned_change.? == change_stamp;
+            if (!unchanged) {
+                state.last_scanned_change = change_stamp;
+
+                // Polling uses the cheap plain-text snapshot; the full
+                // snapshot (ANSI render, cells grid, normalizer) is
+                // built once by the response formatter on completion.
+                const buffer = try sess.terminal.plainSnapshot();
+                defer sess.alloc.free(buffer);
+
+                // Capture the byte offset of the match during the first
+                // (and only) scan so regex callers get a uniform
+                // `text.offset` field. The regex helper returns the offset
+                // directly from `regexec`'s pmatch[0], so this doesn't
+                // cost a second pattern execution — it's the same call
+                // that decides match-vs-no-match.
+                const offset: ?i64 = if (cfg.regex) |re| blk: {
+                    break :blk try regexFindHaystack(sess.alloc, re, buffer);
+                } else blk: {
+                    const idx = std.mem.indexOf(u8, buffer, cfg.needle);
+                    break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
+                };
+                if (offset) |off| {
+                    return .{
+                        .matched = cfg.matched_label,
+                        .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                        .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
+                    };
+                }
+            }
+        },
+        .exit => {
+            if (sess.getStatus() != .running) {
+                return .{
+                    .matched = "exit",
+                    .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                    .exit = .{ .code = sess.getExitCode() orelse 0 },
+                };
+            }
+        },
+    }
+    return null;
+}
+
+/// The single deadline-loop / drain / poll shell shared by all wait ops:
+/// loop { check deadline; drainAll; evaluateWaitCondition; sleep 25ms }.
+/// All condition checking lives in `evaluateWaitCondition`; this shell
+/// only owns the schedule and the two lifecycle policies below.
 ///
 /// Drain before each sleep. The accept thread also drains every 25ms,
 /// but in-process test callers drive `processRequestLine` directly
@@ -424,6 +544,13 @@ fn compileWaitRegex(arena: Allocator, pattern: []const u8) !*HtyRegex {
 /// drainAll acquires the registry lock briefly and releases before
 /// the sleep, so concurrent workers are not serialized behind the
 /// wait.
+///
+/// `duration` conditions are a plain sleep on the wire, not a poll of
+/// session state, so two policies don't apply to them (historical
+/// semantics, preserved exactly): they never time out (the fused op's
+/// `duration` kind ignores the deadline) and they never observe session
+/// dooming — a duration wait completes even if the session is deleted
+/// mid-sleep.
 fn runWait(
     arena: Allocator,
     registry: *SessionRegistry,
@@ -432,91 +559,21 @@ fn runWait(
     start_ms: i64,
     deadline: i64,
 ) !WaitResult {
-    if (condition == .duration) {
-        std.Thread.sleep(condition.duration * std.time.ns_per_ms);
-        registry.drainAll();
-        return .{
-            .matched = "duration",
-            .elapsed_ms = std.time.milliTimestamp() - start_ms,
-        };
-    }
+    var state = WaitState.init(sess, start_ms);
+    const is_duration = condition == .duration;
 
-    // Screen-change stamp observed by the most recent text scan. Snapshots
-    // are the expensive part of a text poll, and the screen usually hasn't
-    // changed between 25ms ticks — re-scan only when the stamp moved since
-    // the previous scan (the drainAll below is what bumps it). Null means
-    // "never scanned", so the first iteration always scans. Sessions
-    // spawned with `emit_screen_updates: false` never bump the stamp, so
-    // for those we scan every tick as before.
-    var last_scanned_change: ?i64 = null;
-    const track_screen_changes = sess.terminal.config.emit_screen_updates;
+    while (true) {
+        if (!is_duration and std.time.milliTimestamp() > deadline) {
+            return .{
+                .timed_out = true,
+                .elapsed_ms = std.time.milliTimestamp() - start_ms,
+            };
+        }
 
-    while (std.time.milliTimestamp() <= deadline) {
         registry.drainAll();
 
-        switch (condition) {
-            .duration => unreachable, // handled above
-            .idle => |cfg| {
-                const reference = if (cfg.floor_ms) |floor|
-                    @max(sess.getLastScreenChange(), floor)
-                else
-                    sess.getLastScreenChange();
-                const since = std.time.milliTimestamp() - reference;
-                if (since >= cfg.idle_ms) {
-                    return .{
-                        .matched = "idle",
-                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
-                    };
-                }
-            },
-            .text => |cfg| {
-                // Read the stamp *before* snapshotting: output that lands
-                // in between is scanned now with an older stamp recorded,
-                // so the next drain's newer stamp forces a re-scan — we
-                // may scan once redundantly, but never miss a change.
-                const change_stamp = sess.getLastScreenChange();
-                const unchanged = track_screen_changes and
-                    last_scanned_change != null and
-                    last_scanned_change.? == change_stamp;
-                if (!unchanged) {
-                    last_scanned_change = change_stamp;
-
-                    // Polling uses the cheap plain-text snapshot; the full
-                    // snapshot (ANSI render, cells grid, normalizer) is
-                    // built once by the response formatter on completion.
-                    const buffer = try sess.terminal.plainSnapshot();
-                    defer sess.alloc.free(buffer);
-
-                    // Capture the byte offset of the match during the first
-                    // (and only) scan so regex callers get a uniform
-                    // `text.offset` field. The regex helper returns the offset
-                    // directly from `regexec`'s pmatch[0], so this doesn't
-                    // cost a second pattern execution — it's the same call
-                    // that decides match-vs-no-match.
-                    const offset: ?i64 = if (cfg.regex) |re| blk: {
-                        break :blk try regexFindHaystack(sess.alloc, re, buffer);
-                    } else blk: {
-                        const idx = std.mem.indexOf(u8, buffer, cfg.needle);
-                        break :blk if (idx) |i| @as(i64, @intCast(i)) else null;
-                    };
-                    if (offset) |off| {
-                        return .{
-                            .matched = cfg.matched_label,
-                            .elapsed_ms = std.time.milliTimestamp() - start_ms,
-                            .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
-                        };
-                    }
-                }
-            },
-            .exit => {
-                if (sess.getStatus() != .running) {
-                    return .{
-                        .matched = "exit",
-                        .elapsed_ms = std.time.milliTimestamp() - start_ms,
-                        .exit = .{ .code = sess.getExitCode() orelse 0 },
-                    };
-                }
-            },
+        if (try evaluateWaitCondition(arena, condition, sess, &state)) |result| {
+            return result;
         }
 
         // A concurrent `hty delete` (or the `--remove` sweep inside the
@@ -527,14 +584,10 @@ fn runWait(
         // Checked *after* the condition so a wait that was satisfied on
         // the same drain tick that doomed the session (e.g. wait_for_exit
         // on a `--remove` session) still reports its success.
-        if (sess.isDoomed()) return error.SessionNotFound;
+        if (!is_duration and sess.isDoomed()) return error.SessionNotFound;
 
         std.Thread.sleep(25 * std.time.ns_per_ms);
     }
-    return .{
-        .timed_out = true,
-        .elapsed_ms = std.time.milliTimestamp() - start_ms,
-    };
 }
 
 /// Format a standalone `wait_for_*` op's response from a `WaitResult`,
