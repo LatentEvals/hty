@@ -428,8 +428,26 @@ pub const SessionRegistry = struct {
     /// for the scan+remove, then joins + frees outside the lock.
     pub fn reapClosedPendingWatchers(self: *SessionRegistry) void {
         self.mutex.lock();
-        var reaped: std.ArrayListUnmanaged(*PendingWatcher) = .{};
+        var reaped = self.reapClosedPendingWatchersLocked();
+        self.mutex.unlock();
         defer reaped.deinit(self.alloc);
+
+        // Join and free outside the lock — deinit joins the reader
+        // thread, which could otherwise deadlock if the thread is
+        // mid-shutdown and we're holding the map mutex it might want.
+        for (reaped.items) |pw| pw.deinit();
+    }
+
+    /// Core of the pending-watcher reap: unlink every closed watcher from
+    /// `pending_watchers_by_name` (dropping emptied buckets) and return
+    /// the unlinked watchers. Caller must hold `self.mutex`, owns the
+    /// returned list, and must call `deinit()` on each watcher — ideally
+    /// after releasing the lock, since that joins its reader thread.
+    /// Shared by `reapClosedPendingWatchers` and `drainAll`.
+    fn reapClosedPendingWatchersLocked(
+        self: *SessionRegistry,
+    ) std.ArrayListUnmanaged(*PendingWatcher) {
+        var reaped: std.ArrayListUnmanaged(*PendingWatcher) = .{};
 
         var empty_keys: std.ArrayListUnmanaged([]const u8) = .{};
         defer empty_keys.deinit(self.alloc);
@@ -457,12 +475,7 @@ pub const SessionRegistry = struct {
                 v.deinit(self.alloc);
             }
         }
-        self.mutex.unlock();
-
-        // Join and free outside the lock — deinit joins the reader
-        // thread, which could otherwise deadlock if the thread is
-        // mid-shutdown and we're holding the map mutex it might want.
-        for (reaped.items) |pw| pw.deinit();
+        return reaped;
     }
 
     /// Resolve a session reference (full UUID, unique prefix, or name).
@@ -673,46 +686,11 @@ pub const SessionRegistry = struct {
         }
 
         // Reap pending watchers (pre-creation subscribers) whose socket
-        // has closed. We're already holding `self.mutex`, so do the
-        // scan inline and join/deinit outside the lock after it's
-        // released by the outer `defer`. Collect pointers into a local
-        // list that outlives the mutex release — but since we return
-        // immediately after, easier to do this inside a dedicated
-        // helper that takes the lock itself. Call it via the explicit
-        // unlock-before-reap pattern.
-        //
-        // Note: we must NOT call `reapClosedPendingWatchers` here
-        // directly since it would self-deadlock. Instead, tear down
-        // inline using a local collection.
-        var reaped: std.ArrayListUnmanaged(*PendingWatcher) = .{};
+        // has closed. We already hold `self.mutex` (released by the
+        // outer `defer` on return), so call the shared locked core
+        // directly — `reapClosedPendingWatchers` would self-deadlock.
+        var reaped = self.reapClosedPendingWatchersLocked();
         defer reaped.deinit(self.alloc);
-
-        var empty_keys: std.ArrayListUnmanaged([]const u8) = .{};
-        defer empty_keys.deinit(self.alloc);
-
-        var pit = self.pending_watchers_by_name.iterator();
-        while (pit.next()) |entry| {
-            var list_ptr = entry.value_ptr;
-            var i: usize = 0;
-            while (i < list_ptr.items.len) {
-                const pw = list_ptr.items[i];
-                if (pw.isClosed()) {
-                    _ = list_ptr.swapRemove(i);
-                    reaped.append(self.alloc, pw) catch {};
-                    continue;
-                }
-                i += 1;
-            }
-            if (list_ptr.items.len == 0) {
-                empty_keys.append(self.alloc, entry.key_ptr.*) catch {};
-            }
-        }
-        for (empty_keys.items) |key| {
-            if (self.pending_watchers_by_name.fetchRemove(key)) |kv| {
-                var v = kv.value;
-                v.deinit(self.alloc);
-            }
-        }
         // Deinit (which joins reader threads) happens under the mutex
         // here. The reader thread doesn't touch the registry, so no
         // deadlock risk; the only cost is that join is serialized with
