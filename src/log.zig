@@ -19,30 +19,15 @@ const getString = json_mod.getString;
 
 /// Append one JSONL line (no trailing newline on input) to the session's log
 /// file, followed by '\n'. Silent no-op if the session has no log file.
-///
-/// Takes `sess.log_mutex` so records from concurrent writers (drain thread,
-/// attach reader thread, RPC worker threads) don't interleave mid-line. The
-/// two `writeAll` calls underneath are not atomic at the syscall level —
-/// without the mutex, a big record could have another thread's newline
-/// injected between its payload and its terminator.
+/// Single-writer by construction: every log helper runs on the server's
+/// one thread (or the single test thread), so lines cannot interleave.
 pub fn writeLogEvent(sess: *Session, line: []const u8) void {
-    sess.log_mutex.lock();
-    defer sess.log_mutex.unlock();
-    writeLogEventLocked(sess, line);
-}
-
-/// Caller must hold `sess.log_mutex`. Used when a caller already holds the
-/// lock for a compound operation (e.g. `openSessionLog` — install the file
-/// handle and write the spawn line atomically with respect to drain events).
-fn writeLogEventLocked(sess: *Session, line: []const u8) void {
     const log_file = sess.log_file orelse return;
     log_file.writeAll(line) catch return;
     log_file.writeAll("\n") catch return;
 }
 
 pub fn closeLogFile(sess: *Session) void {
-    sess.log_mutex.lock();
-    defer sess.log_mutex.unlock();
     if (sess.log_file) |*f| {
         f.close();
         sess.log_file = null;
@@ -96,13 +81,8 @@ pub fn openSessionLog(
         return;
     };
 
-    // Install the file handle and write the spawn line atomically with
-    // respect to any concurrent drain events that would otherwise sneak in
-    // ahead of the spawn record.
-    sess.log_mutex.lock();
-    defer sess.log_mutex.unlock();
     sess.log_file = file;
-    writeLogEventLocked(sess, line);
+    writeLogEvent(sess, line);
 
     if (sess.name) |name| {
         createByNameSymlink(arena, dir, name, &sess.id) catch |err| {
@@ -134,41 +114,68 @@ fn createByNameSymlink(
     try std.posix.symlink(target_z, link_z);
 }
 
-/// Append a drained PTY event to the session log. Caller has already decided
-/// the event kind is loggable; screen_update and started are filtered upstream.
-pub fn logDrainedEvent(sess: *Session, now_ms: i64, event: hty.OutputEvent) void {
+// The typed event writers below are called directly by PTY output
+// dispatch (`SessionRegistry.dispatchOutput` and the exit/failure
+// transitions) — one helper per record kind, no event-queue shapes.
+
+/// Append a raw PTY output chunk as an `output` event.
+pub fn logOutputEvent(sess: *Session, now_ms: i64, bytes: []const u8) void {
     if (sess.log_file == null) return;
     var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    const line = std.json.Stringify.valueAlloc(arena, .{
+        .t = now_ms,
+        .kind = "output",
+        .bytes_hex = hex_mod.encodeHex(arena, bytes) catch return,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
 
-    const line = switch (event) {
-        .raw_bytes => |bytes| std.json.Stringify.valueAlloc(arena, .{
-            .t = now_ms,
-            .kind = "output",
-            .bytes_hex = hex_mod.encodeHex(arena, bytes) catch return,
-        }, .{}) catch return,
-        .title_changed => |title| std.json.Stringify.valueAlloc(arena, .{
-            .t = now_ms,
-            .kind = "title",
-            .title = title,
-        }, .{}) catch return,
-        .bell => std.json.Stringify.valueAlloc(arena, .{
-            .t = now_ms,
-            .kind = "bell",
-        }, .{}) catch return,
-        .exited => |code| std.json.Stringify.valueAlloc(arena, .{
-            .t = now_ms,
-            .kind = "exited",
-            .code = code,
-        }, .{}) catch return,
-        .failure => |message| std.json.Stringify.valueAlloc(arena, .{
-            .t = now_ms,
-            .kind = "failure",
-            .message = message,
-        }, .{}) catch return,
-        else => return,
-    };
+pub fn logTitleEvent(sess: *Session, now_ms: i64, title: []const u8) void {
+    if (sess.log_file == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
+    defer arena_state.deinit();
+    const line = std.json.Stringify.valueAlloc(arena_state.allocator(), .{
+        .t = now_ms,
+        .kind = "title",
+        .title = title,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
+pub fn logBellEvent(sess: *Session, now_ms: i64) void {
+    if (sess.log_file == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
+    defer arena_state.deinit();
+    const line = std.json.Stringify.valueAlloc(arena_state.allocator(), .{
+        .t = now_ms,
+        .kind = "bell",
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
+pub fn logExitedEvent(sess: *Session, now_ms: i64, code: ?i32) void {
+    if (sess.log_file == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
+    defer arena_state.deinit();
+    const line = std.json.Stringify.valueAlloc(arena_state.allocator(), .{
+        .t = now_ms,
+        .kind = "exited",
+        .code = code,
+    }, .{}) catch return;
+    writeLogEvent(sess, line);
+}
+
+pub fn logFailureEvent(sess: *Session, now_ms: i64, message: []const u8) void {
+    if (sess.log_file == null) return;
+    var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
+    defer arena_state.deinit();
+    const line = std.json.Stringify.valueAlloc(arena_state.allocator(), .{
+        .t = now_ms,
+        .kind = "failure",
+        .message = message,
+    }, .{}) catch return;
     writeLogEvent(sess, line);
 }
 

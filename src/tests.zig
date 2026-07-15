@@ -2121,9 +2121,8 @@ test "concurrency: long wait_for_text does not block concurrent list (LatentEval
     var wait_ctx = WaitCtx{ .alloc = alloc, .socket_path = harness.socket_path };
     const wait_thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&wait_ctx});
 
-    // Small delay so the wait handler is definitely mid-poll when we
-    // issue the competing list call. The wait does its first drainAll
-    // and then sleeps 25ms; 100ms is plenty of wiggle room.
+    // Small delay so the wait is definitely parked in the loop's waiter
+    // table when we issue the competing list call.
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // 3. Issue a `list` request and time it. In the pre-fix server this
@@ -3463,13 +3462,10 @@ fn registerAttachClient(
 
 /// Get a session pointer by name for tests that need to poke at the
 /// attach machinery directly. Returns an error if the session is gone.
-/// The borrow acquired by `resolveOrSole` is released immediately — the
-/// returned pointer is a bare peek, valid only while the test refrains
-/// from deleting the session on another thread.
+/// The returned pointer stays valid until the test deletes the session
+/// (frees are deferred to `freeDoomed` / registry deinit).
 fn sessionByName(registry: *SessionRegistry, name: []const u8) !*session_mod_tests.Session {
-    const sess = try registry.resolveOrSole(name);
-    registry.release(sess);
-    return sess;
+    return try registry.resolveOrSole(name);
 }
 
 test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect" {
@@ -4049,32 +4045,6 @@ test "issue #29: watch pre-creation promotes on spawn (socket level)" {
     }
 }
 
-/// Background ticker that mimics the real server's accept loop calling
-/// `registry.drainAll()` every ~25ms. Tests use this when they need PTY
-/// events to flow to attach/watch subscribers without driving RPCs.
-const RegistryTicker = struct {
-    registry: *SessionRegistry,
-    stop: std.atomic.Value(bool) = .init(false),
-    thread: ?std.Thread = null,
-
-    fn start(self: *RegistryTicker) !void {
-        self.thread = try std.Thread.spawn(.{}, RegistryTicker.loop, .{self});
-    }
-
-    fn stopAndJoin(self: *RegistryTicker) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
-        self.thread = null;
-    }
-
-    fn loop(self: *RegistryTicker) void {
-        while (!self.stop.load(.acquire)) {
-            self.registry.drainAll();
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
-    }
-};
-
 test "issue #29: promoted watcher streams live output (regression: post-promotion read EOF)" {
     const alloc = std.testing.allocator;
 
@@ -4244,7 +4214,7 @@ test "issue #29: read-only input frames are dropped by the server" {
 
 // ============================================================================
 // Non-blocking attach broadcasts (hardening: stalled readers must not
-// wedge drainAll / registry.mutex)
+// wedge the loop's broadcast path)
 // ============================================================================
 
 test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops on overflow" {
@@ -4289,8 +4259,8 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
         try std.testing.expect(expected.items.len < AttachClientTest.max_pending_bytes);
     }
 
-    // Phase 2: drain from the peer while ticking flushPending (as drainAll
-    // does). Every byte must arrive, in write order.
+    // Phase 2: drain from the peer while ticking flushPending (as the
+    // pump does). Every byte must arrive, in write order.
     var received: usize = 0;
     var chunk: [8192]u8 = undefined;
     var drain_timer = try std.time.Timer.start();
@@ -4327,7 +4297,7 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
     try std.testing.expect(client.isClosed());
 }
 
-test "hardening: stalled attach reader does not block drainAll; concurrent list completes and client is reaped" {
+test "hardening: stalled attach reader does not block the pump; list completes and client is reaped" {
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "stalled-reader");
     defer alloc.free(log_dir);
@@ -4360,46 +4330,32 @@ test "hardening: stalled attach reader does not block drainAll; concurrent list 
     const sess = try sessionByName(&registry, "stalled");
     _ = try registerAttachClient(alloc, sess, pair.local);
 
-    // Tick drainAll on a background thread like the real accept loop.
-    // Before this hardening, the first broadcast that filled the stalled
-    // socket blocked inside writeAll while holding registry.mutex, so the
-    // ticker wedged and every RPC below hung forever.
-    var ticker = RegistryTicker{ .registry = &registry };
-    try ticker.start();
-    defer ticker.stopAndJoin();
-
-    // While the burst floods the broadcast path, `list` RPCs (which
-    // contend on registry.mutex with drainAll) must keep completing, and
-    // the overflowed client must get dropped + reaped. No per-call
-    // stopwatch inside the flood: a drain tick honestly ingesting the
-    // burst may hold registry.mutex for a while in Debug builds. The
-    // pre-fix failure mode — drainAll blocked forever inside writeAll on
-    // the stalled socket — makes the first `list` below never return
-    // (and `reaped` can never flip), so this loop still catches it.
+    // Service the session the way the event loop does (pump ingests PTY
+    // output and broadcasts through the bounded non-blocking buffer).
+    // The pre-hardening failure mode was a broadcast blocking forever
+    // inside writeAll on the stalled socket, which would wedge this loop
+    // on its first pump; with the bounded buffer the overflowed client
+    // is dropped + reaped instead, and `list` keeps completing between
+    // pumps.
     var reaped = false;
     var overall_timer = try std.time.Timer.start();
     while (overall_timer.read() < 60 * std.time.ns_per_s) {
+        registry.pump();
         {
             var parsed = try testRequest(&registry, .{ .op = "list" });
             defer parsed.deinit();
             _ = try expectTestOk(parsed);
         }
-        // The ticker's drainAll mutates the attach list under
-        // registry.mutex; fence this read the same way (attach_mutex is
-        // gone — the list is loop-thread-only in production).
-        registry.mutex.lock();
-        const remaining = sess.attach_clients.items.len;
-        registry.mutex.unlock();
-        if (remaining == 0) {
+        if (sess.attach_clients.items.len == 0) {
             reaped = true;
             break;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(5 * std.time.ns_per_ms);
     }
     try std.testing.expect(reaped);
 
-    // Once the session goes quiet (burst fully ingested), drain ticks are
-    // cheap again and a concurrent `list` must meet its usual budget.
+    // Once the session goes quiet (burst fully ingested), a `list` must
+    // meet its usual budget.
     {
         var idle = try testRequest(&registry, .{
             .op = "wait_for_idle",
@@ -4709,6 +4665,145 @@ test "event loop: pending-input overflow drops without stalling the server" {
     }
 }
 
+// With PTY fds on the loop, a parked `wait_for_text` must resolve in the
+// same iteration its output arrives: send input, and the tty echo wakes
+// poll, gets fed, and completes the waiter — no tick quantization. The
+// old architecture re-evaluated waiters on a 25ms housekeeping cadence,
+// making resolve latency uniform in [0, 25)ms with a median around
+// 12.5ms; the event-driven path is single-digit milliseconds. Median of
+// 15 samples must land well under the old tick (PRD latency criterion).
+test "event loop: wait_for_text resolves on the iteration output arrives (median well under 25ms)" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "waitlat");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // `cat` with tty echo: input bytes come straight back as output.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "waitlat",
+            .program = "/bin/cat",
+            .rows = 10,
+            .cols = 80,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    var samples: [15]i64 = undefined;
+    for (&samples, 0..) |*sample, i| {
+        var token_buf: [32]u8 = undefined;
+        const token = try std.fmt.bufPrint(&token_buf, "lat{d}tok", .{i});
+        // Newline-terminated so every token sits on its own line — a
+        // token soft-wrapped across the 80-col boundary would never
+        // match as a contiguous needle.
+        var send_buf: [33]u8 = undefined;
+        const token_line = try std.fmt.bufPrint(&send_buf, "{s}\n", .{token});
+
+        // Park the wait on its own connection...
+        var req_buf: [256]u8 = undefined;
+        // The fused op with `snapshot:false` keeps the response to one
+        // small line, so the clock below measures wait-resolve latency,
+        // not the transfer time of a full snapshot payload.
+        const request = try std.fmt.bufPrint(
+            &req_buf,
+            "{{\"op\":\"wait_and_snapshot\",\"session\":\"waitlat\",\"wait_kind\":\"text\",\"text\":\"{s}\",\"snapshot\":false,\"timeout_ms\":5000}}",
+            .{token},
+        );
+        const wait_stream = try openStreamingConn(harness.socket_path, request);
+        defer wait_stream.close();
+        var reader = LineReader.init(alloc, wait_stream);
+        defer reader.deinit();
+
+        // ...give the loop a beat to park it, so the measurement below
+        // exercises the parked-waiter wakeup, not first-evaluation luck.
+        std.Thread.sleep(30 * std.time.ns_per_ms);
+
+        // Produce the needle and clock how long the parked wait takes to
+        // answer after the send RPC has fully completed. The tty's echo
+        // puts the token on screen without cat even being scheduled —
+        // content-based, chunking-agnostic.
+        {
+            var parsed = try socketRequest(alloc, harness.socket_path, .{
+                .op = "send_text",
+                .session = "waitlat",
+                .text = token_line,
+            });
+            defer parsed.deinit();
+            _ = try expectTestOk(parsed);
+        }
+        var timer = try std.time.Timer.start();
+        const line = try reader.readLine(5000);
+        defer alloc.free(line);
+        sample.* = @intCast(timer.read() / std.time.ns_per_ms);
+
+        try std.testing.expect(std.mem.indexOf(u8, line, "\"ok\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, line, token) != null);
+    }
+
+    std.mem.sort(i64, &samples, {}, std.sort.asc(i64));
+    const median = samples[samples.len / 2];
+    // Well under the old 25ms tick (whose median was ~12.5ms). The
+    // event-driven path typically lands at 1-3ms; 10ms leaves headroom
+    // for loaded CI machines while still discriminating architectures.
+    try std.testing.expect(median < 10);
+
+    {
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = "waitlat" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
+// Socket-level `--remove` auto-clean regression: the loop observes the
+// child's exit on its PTY fd and the auto-remove sweep runs on that same
+// iteration — the session must vanish from `list` without any client
+// nudging the server.
+test "event loop: --remove session is auto-removed once its exit is observed" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "autorm");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "autorm",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "exit 0" },
+            .rows = 8,
+            .cols = 24,
+            .remove = true,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Child exits almost immediately; poll `list` until the sweep has
+    // reaped the session. Ample headroom for CI.
+    var removed = false;
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (std.time.milliTimestamp() < deadline) {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const sessions = object.get("sessions") orelse return error.InvalidResponse;
+        if (sessions.array.items.len == 0) {
+            removed = true;
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(removed);
+}
+
 // ============================================================================
 // Mouse input (issue #24)
 // ============================================================================
@@ -5009,10 +5104,10 @@ test "mouse: X10 encoding when only 1000 is on (no SGR)" {
 // `hty run --remove` — auto-delete session from registry once the child exits.
 // ============================================================================
 
-/// Drive the registry's drain loop until `predicate` returns true or the
-/// deadline passes. Mirrors what the server's accept loop does every 25ms
-/// in production — tests exercise the same sweep without spinning up the
-/// real socket server.
+/// Drive the registry's PTY servicing until `predicate` returns true or
+/// the deadline passes. Mirrors the event loop's per-iteration session
+/// phase (pump + auto-remove sweep) — tests exercise the same sweep
+/// without spinning up the real socket server.
 fn waitForDrainCondition(
     registry: *SessionRegistry,
     deadline_ms: i64,
@@ -5021,7 +5116,7 @@ fn waitForDrainCondition(
 ) bool {
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < deadline_ms) {
-        registry.drainAll();
+        registry.pump();
         if (predicate(ctx)) return true;
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
@@ -5029,8 +5124,6 @@ fn waitForDrainCondition(
 }
 
 fn sessionCount(registry: *SessionRegistry) usize {
-    registry.mutex.lock();
-    defer registry.mutex.unlock();
     return registry.by_id.count();
 }
 
@@ -5116,11 +5209,11 @@ test "run --remove: session persists while child is alive" {
         _ = try expectTestOk(parsed);
     }
 
-    // Drain a few ticks to let the auto-remove sweep run; session should
+    // Pump a few passes to let the auto-remove sweep run; session should
     // stay because cat is still running.
-    registry.drainAll();
+    registry.pump();
     std.Thread.sleep(150 * std.time.ns_per_ms);
-    registry.drainAll();
+    registry.pump();
     try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
 
     // Kill the session — handleKill marks it .killed + stamps terminal_at.
@@ -5235,18 +5328,20 @@ test "spawn without --remove keeps the session after exit" {
         _ = try expectTestOk(parsed);
     }
 
-    // Drain through several ticks to prove the zombie lingers because
+    // Pump through several passes to prove the zombie lingers because
     // `--remove` was *not* set.
     var i: usize = 0;
     while (i < 15) : (i += 1) {
-        registry.drainAll();
+        registry.pump();
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
 }
 
 // ============================================================================
-// Unit 6: session lifetime by ownership (refcount), not timing.
+// Session lifetime by structure (deferred free), not timing: delete
+// unpublishes immediately; storage is freed in the loop's deferred-free
+// phase, so nothing observable can touch a freed session.
 // ============================================================================
 
 test "delete during wait_for_text: wait returns structured error, no UAF" {
@@ -5361,16 +5456,10 @@ test "handler error mid-op releases the session borrow" {
         try expectTestError(parsed, "invalid key");
     }
 
-    // The borrow must be back to zero: the `defer registry.release(sess)`
-    // in dispatchRequest ran on the error return.
-    const sess = try sessionByName(&registry, "err-mid-handler");
-    registry.mutex.lock();
-    const refs = sess.ref_count;
-    registry.mutex.unlock();
-    try std.testing.expectEqual(@as(u32, 0), refs);
-
-    // Delete must now free the session for real — a stuck refcount would
-    // surface as a leak, and std.testing.allocator fails the test on leaks.
+    // The handler error must not leave the session in a state delete
+    // can't reclaim: delete succeeds and unpublishes it (the storage
+    // itself is torn down by the deferred free at registry deinit —
+    // std.testing.allocator fails the test if it leaks instead).
     {
         var parsed = try testRequest(&registry, .{ .op = "delete", .session = "err-mid-handler" });
         defer parsed.deinit();
@@ -5379,7 +5468,7 @@ test "handler error mid-op releases the session borrow" {
     try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
 }
 
-test "refcount: removeLocked defers free while borrowed; last release frees" {
+test "deferred free: remove unpublishes immediately; storage survives until freeDoomed" {
     const alloc = std.testing.allocator;
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();
@@ -5388,7 +5477,7 @@ test "refcount: removeLocked defers free while borrowed; last release frees" {
         var parsed = try testRequest(&registry, .{
             .op = "spawn",
             .program = "/bin/cat",
-            .name = "refcount",
+            .name = "deferred",
             .rows = 8,
             .cols = 24,
             .emit_raw_bytes = false,
@@ -5397,28 +5486,31 @@ test "refcount: removeLocked defers free while borrowed; last release frees" {
         _ = try expectTestOk(parsed);
     }
     {
-        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "refcount" });
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "deferred" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
 
-    // Borrow the session the way dispatchRequest does.
-    const sess = try registry.resolveOrSole("refcount");
+    // Hold the pointer the way a dispatch does.
+    const sess = try registry.resolveOrSole("deferred");
 
-    // Remove while borrowed: the session is unpublished immediately (no
-    // resolve can find it), but the storage must NOT be freed yet.
+    // Remove while held: the session is unpublished immediately (no
+    // resolve can find it), but the storage must NOT be freed yet —
+    // that's the deferred-free contract that makes mid-dispatch deletes
+    // safe on the single-threaded loop.
     registry.remove(sess);
     try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
     try std.testing.expect(sess.isDoomed());
-    try std.testing.expectError(error.SessionNotFound, registry.resolveOrSole("refcount"));
+    try std.testing.expectError(error.SessionNotFound, registry.resolveOrSole("deferred"));
 
-    // The borrow still protects the memory — reads through the pointer
+    // The deferral still protects the memory — reads through the pointer
     // are safe (the debug allocator would trip on freed memory).
     try std.testing.expect(sess.getStatus() != .running);
 
-    // Dropping the last borrow frees the session; the testing allocator
-    // fails the test if it leaks instead.
-    registry.release(sess);
+    // The deferred-free phase (the loop runs this at end of iteration)
+    // tears the session down; the testing allocator fails the test if it
+    // leaks instead.
+    registry.freeDoomed();
 }
 
 // ============================================================================

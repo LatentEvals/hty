@@ -1,23 +1,31 @@
 //! The hty server: a single-threaded event loop over `poll(2)`.
 //!
-//! Phases 1 + 2 of the event-loop migration: every client connection —
-//! RPC, attach, watch, and pre-creation pending watch — is a loop-owned
-//! `Conn` state machine driven by `src/loop.zig`. No worker threads, no
-//! attach reader threads, no pending-watcher self-pipe. Immediate ops
-//! dispatch synchronously on the loop thread and queue their response
-//! into a bounded per-connection outbound buffer flushed on `POLLOUT`.
-//! Wait ops park the connection in a waiter table and are re-evaluated
-//! after each housekeeping drain and on deadline expiry, so a long
-//! `wait_for_*` costs a table entry instead of a thread. Attach input
-//! frames land in the owning session's bounded pending-input buffer,
-//! flushed to the PTY master fd on its `POLLOUT` — a child that stops
-//! reading its tty drops input instead of stalling the loop.
+//! One thread, one poll set: the listen socket, every client connection
+//! (RPC, attach, watch, pre-creation pending watch), and every live
+//! session's PTY master fd. No worker threads, no reader threads, no
+//! mutexes, no atomics in server state — with a single thread there is
+//! no lock order and no publication protocol.
 //!
-//! Still thread-based for now (phase 3): each session keeps its PTY
-//! reader thread pumping the terminal event queue that the recurring
-//! housekeeping deadline drains via `registry.drainAll()` every 25ms.
-//! `registry.mutex` therefore remains — it fences the loop thread against
-//! those surviving threads.
+//! Connections are loop-owned `Conn` state machines driven by
+//! `src/loop.zig`. Immediate ops dispatch synchronously and queue their
+//! response into a bounded per-connection outbound buffer flushed on
+//! `POLLOUT`. Wait ops park the connection in a waiter table; PTY output
+//! re-evaluates waiters on the same iteration it arrives, so a
+//! `wait_for_text` resolves the moment its needle is fed — no tick
+//! quantization. Attach input frames land in the owning session's
+//! bounded pending-input buffer, flushed to the master fd on its
+//! `POLLOUT` — a child that stops reading its tty drops input instead of
+//! stalling the loop.
+//!
+//! PTY readability drives everything session-side: `POLLIN` on a master
+//! fd pumps 8 KiB chunks synchronously through VT feed, session log,
+//! attach broadcast, and waiter wake-up; EOF/EIO reaps the child with
+//! `waitpid(WNOHANG)` and runs the exit transition. Session deletion is
+//! deferred-free: `delete` (and the `--remove` sweep, which runs on the
+//! iteration that observes the exit) unpublishes the session
+//! immediately, and the loop frees doomed sessions in its
+//! end-of-iteration phase — a pointer obtained during dispatch is valid
+//! structurally, not by grace timing or refcounts.
 
 const std = @import("std");
 
@@ -72,18 +80,27 @@ pub const max_request_line_bytes: usize = 1024 * 1024;
 /// past this limit — the connection is dropped instead.
 pub const max_outbound_bytes: usize = 1024 * 1024;
 
-/// Interval of the recurring housekeeping deadline. This is the explicit
-/// successor of the old unconditional 25ms accept-loop tick: it drains
-/// the terminals' event queues into the log / attach broadcast pipeline
-/// and re-evaluates parked waiters. It disappears in phase 3, when PTY
-/// fds join the poll set and there is nothing left to drain.
-const housekeeping_interval_ms: i64 = 25;
+/// How soon to retry `waitpid(WNOHANG)` for a child whose fd reported
+/// EOF (or was closed by kill) before the child became reapable. SIGKILL
+/// and pty-EOF children die promptly; this is a short backstop, not a
+/// tick.
+const reap_retry_ms: i64 = 5;
+
+/// How long to keep accepts paused after EMFILE/ENFILE before retrying.
+const listen_resume_ms: i64 = 100;
+
+/// Poll cadence for the test-only external stop signal. Only armed when
+/// `RunOpts.stop_signal` is provided — production runs have no recurring
+/// deadline at all.
+const stop_poll_ms: i64 = 25;
 
 // Deadline-table ids. Waiter ids are allocated upward from
-// `first_waiter_deadline_id`; the two fixed ids below never collide.
-const housekeeping_deadline_id: u64 = 1;
-const empty_shutdown_deadline_id: u64 = 2;
-const first_waiter_deadline_id: u64 = 3;
+// `first_waiter_deadline_id`; the fixed ids below never collide.
+const empty_shutdown_deadline_id: u64 = 1;
+const listen_resume_deadline_id: u64 = 2;
+const reap_retry_deadline_id: u64 = 3;
+const stop_poll_deadline_id: u64 = 4;
+const first_waiter_deadline_id: u64 = 5;
 
 /// Optional configuration for the server loop. Production uses the
 /// defaults; tests pass a short `empty_grace_ms` and/or a `stop_signal`
@@ -91,7 +108,10 @@ const first_waiter_deadline_id: u64 = 3;
 pub const RunOpts = struct {
     empty_grace_ms: i64 = empty_grace_ms,
     /// If non-null, the loop returns as soon as it observes this flag set
-    /// to true (checked at least once per housekeeping interval).
+    /// to true (checked at least once per `stop_poll_ms`). Test-only
+    /// escape hatch: the flag is flipped from the test harness thread,
+    /// which is the one cross-thread edge the loop still has — hence the
+    /// atomic. Production passes null and pays nothing.
     stop_signal: ?*std.atomic.Value(bool) = null,
     /// Test hook: use this session-log directory (borrowed; must outlive
     /// the server) instead of resolving the XDG state path, so socket-level
@@ -154,19 +174,26 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
         .loop = Loop.init(alloc),
         .deadlines = DeadlineTable.init(alloc),
     };
-    // Runs before `registry.deinit()`: waiters hold session borrows that
-    // must be released while the registry is still alive.
+    // Runs before `registry.deinit()`: waiters and attach conns hold
+    // session pointers that must be dropped while the registry is alive.
     defer srv.deinit();
 
     try srv.loop.registerFd(srv.listen_fd, .{});
-    try srv.deadlines.insert(housekeeping_deadline_id, std.time.milliTimestamp() + housekeeping_interval_ms);
 
     // Auto-shutdown: the server starts empty, so arm the shutdown deadline
     // right away (the old code's `empty_since_ms = now` initialization). A
-    // new session or connection cancels it on the next housekeeping tick.
+    // new session or connection cancels it at the next iteration's sync.
     if (srv.deadlines.insert(empty_shutdown_deadline_id, std.time.milliTimestamp() + opts.empty_grace_ms)) {
         srv.empty_armed = true;
     } else |_| {}
+
+    // Test harnesses stop the loop by flipping a flag from another
+    // thread; poll it on a recurring deadline so a fully-quiet server
+    // still notices. Production (null) keeps a deadline-free steady
+    // state: poll blocks until real work arrives.
+    if (opts.stop_signal != null) {
+        srv.deadlines.insert(stop_poll_deadline_id, std.time.milliTimestamp() + stop_poll_ms) catch {};
+    }
 
     while (true) {
         const timeout = srv.deadlines.nextTimeoutMs(std.time.milliTimestamp());
@@ -174,48 +201,67 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
             std.debug.print("poll failed: {s}\n", .{@errorName(err)});
             continue;
         };
+        // Fixed service order per iteration: listen accepts land first
+        // (the listen fd is registered first), then connection I/O and
+        // PTY reads in poll-set order.
         while (ready.next()) |r| {
             if (r.fd == srv.listen_fd) {
                 srv.acceptReady();
-            } else {
+            } else if (srv.conns.contains(r.fd)) {
                 srv.connReady(r.fd, r.revents);
+            } else {
+                srv.ptyReady(r.fd);
             }
         }
 
-        // Ops dispatched above may have changed what parked waiters are
-        // watching (kill/delete/send_*): re-evaluate now so, e.g., a
-        // `delete` resolves that session's waiters in the same iteration.
+        // PTY output fed and ops dispatched above may have changed what
+        // parked waiters are watching (output, exit, kill, delete):
+        // re-evaluate now so a wait resolves in the same iteration the
+        // event that satisfies it arrived.
         srv.evaluateWaiters();
 
         var now = std.time.milliTimestamp();
         while (srv.deadlines.popExpired(now)) |expired| {
             switch (expired.id) {
-                housekeeping_deadline_id => {
-                    srv.housekeeping(now);
-                    // Re-arm the recurring tick. The table just popped an
-                    // entry, so this insert reuses retained capacity and
-                    // cannot fail in practice; a failure would stall
-                    // housekeeping, so surface it loudly.
-                    srv.deadlines.insert(housekeeping_deadline_id, now + housekeeping_interval_ms) catch |err| {
-                        std.debug.print("housekeeping re-arm failed: {s}\n", .{@errorName(err)});
-                    };
-                },
                 empty_shutdown_deadline_id => {
                     srv.empty_armed = false;
                     if (srv.serverIsEmpty()) return;
+                },
+                listen_resume_deadline_id => srv.retryListen(now),
+                reap_retry_deadline_id => {
+                    srv.reap_armed = false;
+                    if (srv.registry.retryReaps()) srv.armReapRetry(now);
+                },
+                stop_poll_deadline_id => {
+                    srv.deadlines.insert(stop_poll_deadline_id, now + stop_poll_ms) catch {};
                 },
                 else => srv.waiterDeadlineExpired(expired.id, now),
             }
             now = std.time.milliTimestamp();
         }
 
-        // End-of-iteration subscriber/input sync: promote pending watchers
-        // whose session appeared, reap attach conns marked closed (buffer
-        // overflow, exit broadcast, detach), keep POLLOUT armed for
-        // subscribers with buffered frames, and flush queued PTY input —
-        // all before the next poll builds its fd set.
+        // Deadline expiries can also resolve waiter-visible state (a reap
+        // retry observing the exit); evaluate once more so those complete
+        // this iteration too.
+        srv.evaluateWaiters();
+
+        // End-of-iteration sync: promote pending watchers whose session
+        // appeared, reap attach conns marked closed (buffer overflow,
+        // exit broadcast, detach), keep POLLOUT armed for subscribers
+        // with buffered frames; run the `--remove` sweep on the iteration
+        // that observed the exit; reconcile PTY fd registrations and
+        // queued-input write interest; keep the empty-shutdown deadline
+        // in sync — all before the deferred-free phase and the next poll.
         srv.syncSubscribers();
-        srv.syncPendingInput();
+        srv.registry.autoRemoveSweep();
+        srv.evaluateWaiters();
+        srv.syncSessionPtys(now);
+        srv.checkEmptyTimer(now);
+
+        // Deferred frees, last: every waiter parked on a doomed session
+        // was resolved above, so nothing observable can touch the storage
+        // after this point.
+        srv.freeDoomedSessions();
 
         // External stop signal (test harness) wins over the empty timer.
         if (opts.stop_signal) |flag| {
@@ -271,9 +317,10 @@ const Conn = struct {
 
 /// One parked wait: everything needed to re-evaluate the condition and,
 /// on completion, format the response the blocking handler would have
-/// produced. Holds a session borrow (released on resolution) and owns the
-/// arena the parsed request lives in (the condition's needle points into
-/// it).
+/// produced. Holds the session pointer (kept valid by the deferred-free
+/// rule: a doomed session is not freed while a waiter references it) and
+/// owns the arena the parsed request lives in (the condition's needle
+/// points into it).
 const Waiter = struct {
     deadline_id: u64,
     conn: *Conn,
@@ -281,9 +328,13 @@ const Waiter = struct {
     arena_state: *std.heap.ArenaAllocator,
     condition: ops.WaitCondition,
     state: ops.WaitState,
-    /// Absolute timeout deadline; `maxInt(i64)` (never inserted in the
-    /// deadline table) when the wait has no timeout. `duration` waits use
-    /// their completion time as the deadline entry instead.
+    /// Absolute timeout deadline in ms; `maxInt(i64)` when the wait has
+    /// no timeout. The deadline-table entry under `deadline_id` is this
+    /// value for text/exit waits, the completion time for `duration`
+    /// waits, and the next re-check time (clamped to the timeout) for
+    /// idle waits — idle needs scheduled re-evaluation since nothing
+    /// event-driven fires when a session simply stays quiet.
+    timeout_deadline_ms: i64,
     id: ?i64,
     format: ops.WaitFormat,
 };
@@ -311,21 +362,24 @@ const LoopServer = struct {
     deadlines: DeadlineTable,
     conns: std.AutoHashMapUnmanaged(std.posix.socket_t, *Conn) = .{},
     waiters: std.ArrayListUnmanaged(*Waiter) = .{},
-    /// PTY master fds currently registered for POLLOUT because their
-    /// session's pending-input buffer is non-empty. Reconciled against
-    /// the registry every iteration by `syncPendingInput`.
-    master_write_fds: std.AutoHashMapUnmanaged(std.posix.fd_t, void) = .{},
+    /// PTY master fds currently in the poll set, mapped to their session.
+    /// Read interest is constant while registered; write interest tracks
+    /// whether the session has queued input. Reconciled against the
+    /// registry every iteration by `syncSessionPtys`.
+    session_fds: std.AutoHashMapUnmanaged(std.posix.fd_t, *Session) = .{},
     next_waiter_deadline_id: u64 = first_waiter_deadline_id,
-    /// True while accepts are suspended after EMFILE/ENFILE; the next
-    /// housekeeping tick re-registers the listen fd.
+    /// True while accepts are suspended after EMFILE/ENFILE; the
+    /// listen-resume deadline re-registers the listen fd.
     listen_paused: bool = false,
     /// True while the empty-shutdown deadline entry is in the table.
     empty_armed: bool = false,
+    /// True while the reap-retry deadline entry is in the table.
+    reap_armed: bool = false,
 
     fn deinit(self: *LoopServer) void {
-        // Waiters first — they hold session borrows that must be released
-        // while the registry is still alive. Their conns are torn down by
-        // the sweep below.
+        // Waiters first — they reference sessions that must still be
+        // alive (the registry outlives this deinit). Their conns are torn
+        // down by the sweep below.
         for (self.waiters.items) |waiter| {
             waiter.conn.waiter = null;
             self.destroyWaiter(waiter);
@@ -346,27 +400,16 @@ const LoopServer = struct {
             self.alloc.destroy(conn);
         }
         self.conns.deinit(self.alloc);
-        self.master_write_fds.deinit(self.alloc);
+        self.session_fds.deinit(self.alloc);
 
         self.loop.deinit();
         self.deadlines.deinit();
     }
 
-    /// The recurring 25ms tick: drain terminal event queues (log writes,
-    /// attach broadcasts, lifecycle transitions, auto-remove sweep),
-    /// re-evaluate parked waiters against the fresh state, resume accepts
-    /// after an EMFILE pause, and keep the empty-shutdown deadline in sync
-    /// with whether the server has anything left to do.
-    fn housekeeping(self: *LoopServer, now: i64) void {
-        self.registry.drainAll();
-        self.evaluateWaiters();
-
-        if (self.listen_paused) {
-            if (self.loop.registerFd(self.listen_fd, .{})) {
-                self.listen_paused = false;
-            } else |_| {} // retry next tick
-        }
-
+    /// Keep the empty-shutdown deadline in sync with whether the server
+    /// has anything left to do. Runs once per iteration (the explicit
+    /// successor of the old housekeeping tick's arm/cancel logic).
+    fn checkEmptyTimer(self: *LoopServer, now: i64) void {
         const empty = self.serverIsEmpty();
         if (empty and !self.empty_armed) {
             if (self.deadlines.insert(empty_shutdown_deadline_id, now + self.empty_grace_ms)) {
@@ -376,6 +419,25 @@ const LoopServer = struct {
             _ = self.deadlines.cancel(empty_shutdown_deadline_id);
             self.empty_armed = false;
         }
+    }
+
+    /// Retry a paused listen fd after EMFILE/ENFILE; re-arm the resume
+    /// deadline while the registration keeps failing.
+    fn retryListen(self: *LoopServer, now: i64) void {
+        if (!self.listen_paused) return;
+        if (self.loop.registerFd(self.listen_fd, .{})) {
+            self.listen_paused = false;
+        } else |_| {
+            self.deadlines.insert(listen_resume_deadline_id, now + listen_resume_ms) catch {};
+        }
+    }
+
+    /// Arm the short waitpid-retry deadline (idempotent).
+    fn armReapRetry(self: *LoopServer, now: i64) void {
+        if (self.reap_armed) return;
+        if (self.deadlines.insert(reap_retry_deadline_id, now + reap_retry_ms)) {
+            self.reap_armed = true;
+        } else |_| {}
     }
 
     /// Empty means: no running sessions (zombies don't count — see
@@ -397,13 +459,17 @@ const LoopServer = struct {
                 error.WouldBlock => return,
                 error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => {
                     // EMFILE/ENFILE: accept produced no fd, so there is no
-                    // socket to answer on. Pause accepts until the next
-                    // housekeeping tick instead of spinning on a listen fd
+                    // socket to answer on. Pause accepts and retry on the
+                    // resume deadline instead of spinning on a listen fd
                     // that will stay readable; existing connections keep
-                    // being served (PRD §6).
+                    // being served.
                     std.debug.print("accept failed: {s} — pausing accepts\n", .{@errorName(err)});
                     _ = self.loop.deregisterFd(self.listen_fd);
                     self.listen_paused = true;
+                    self.deadlines.insert(
+                        listen_resume_deadline_id,
+                        std.time.milliTimestamp() + listen_resume_ms,
+                    ) catch {};
                     return;
                 },
                 error.ConnectionAborted => continue,
@@ -422,12 +488,12 @@ const LoopServer = struct {
     }
 
     fn adoptConn(self: *LoopServer, fd: std.posix.socket_t) !void {
-        // A session deleted earlier in this iteration closed its master
-        // fd, and this accept may have recycled the same fd number while
-        // the stale write-interest registration is still pending its
-        // `syncPendingInput` reconciliation. Clear it so registerFd below
+        // A session killed/deleted earlier in this iteration closed its
+        // master fd, and this accept may have recycled the same fd number
+        // while the stale registration is still pending its
+        // `syncSessionPtys` reconciliation. Clear it so registerFd below
         // doesn't see a duplicate.
-        if (self.master_write_fds.remove(fd)) _ = self.loop.deregisterFd(fd);
+        if (self.session_fds.remove(fd)) _ = self.loop.deregisterFd(fd);
 
         const conn = try self.alloc.create(Conn);
         errdefer self.alloc.destroy(conn);
@@ -437,11 +503,22 @@ const LoopServer = struct {
         try self.loop.registerFd(fd, .{});
     }
 
+    /// Readiness on a session's PTY master fd. Which bits fired doesn't
+    /// matter: POLLOUT means queued input can flush, POLLIN/POLLHUP mean
+    /// output (or EOF) is readable — service both unconditionally, they
+    /// are cheap no-ops when not applicable.
+    fn ptyReady(self: *LoopServer, fd: std.posix.fd_t) void {
+        const sess = self.session_fds.get(fd) orelse return;
+        sess.flushPendingInput();
+        switch (self.registry.servicePty(sess)) {
+            .open, .reaped, .broken => {},
+            // EOF observed but the child isn't reapable yet — retry on a
+            // short deadline instead of polling a drained fd.
+            .reap_pending => self.armReapRetry(std.time.milliTimestamp()),
+        }
+    }
+
     fn connReady(self: *LoopServer, fd: std.posix.socket_t, revents: i16) void {
-        // Readiness on an fd that isn't a conn (a PTY master fd armed for
-        // POLLOUT by `syncPendingInput`) needs no per-event handling: the
-        // wakeup alone is the point — the end-of-iteration sync flushes
-        // every session's pending input.
         if ((revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0) {
             if (self.conns.get(fd)) |conn| self.dropConn(conn);
             return;
@@ -468,7 +545,7 @@ const LoopServer = struct {
     /// subscriber leaves the session's broadcast list).
     fn dropConn(self: *LoopServer, conn: *Conn) void {
         if (conn.state == .attached) {
-            conn.attach_client.?.closed.store(true, .release);
+            conn.attach_client.?.closed = true;
             return self.reapAttachConn(conn);
         }
         self.teardownConn(conn);
@@ -523,7 +600,7 @@ const LoopServer = struct {
         while (std.mem.indexOfScalar(u8, conn.inbuf.items, '\n')) |nl| {
             const line = conn.inbuf.items[0..nl];
             server_attach.dispatchAttachFrame(client, line) catch {
-                client.closed.store(true, .release);
+                client.closed = true;
                 self.reapAttachConn(conn);
                 return false;
             };
@@ -532,7 +609,7 @@ const LoopServer = struct {
             conn.inbuf.shrinkRetainingCapacity(rest_len);
         }
         if (conn.inbuf.items.len > max_request_line_bytes) {
-            client.closed.store(true, .release);
+            client.closed = true;
             self.reapAttachConn(conn);
             return false;
         }
@@ -677,14 +754,13 @@ const LoopServer = struct {
         const sess = self.registry.resolveOrSole(session_ref) catch |err| {
             return .{ .response = try encodeErrorLine(self.alloc, id, err) };
         };
-        var borrow_held = true;
-        defer if (borrow_held) self.registry.release(sess);
 
-        // First evaluation mirrors `runWait`'s first iteration — drain,
-        // evaluate, then the doomed check — so an already-satisfied wait
-        // answers without parking, and a satisfied-and-doomed session
-        // (wait_for_exit on a `--remove` session) still reports success.
-        self.registry.drainAll();
+        // First evaluation mirrors `runWait`'s first iteration — service
+        // the PTY, evaluate, then the doomed check — so an already-
+        // satisfied wait answers without parking, and a satisfied-and-
+        // doomed session (wait_for_exit on a `--remove` session) still
+        // reports success.
+        _ = self.registry.servicePty(sess);
         var state = ops.WaitState.init(sess, start_ms);
         const first = ops.evaluateWaitCondition(arena, condition, sess, &state) catch |err| {
             return .{ .response = try encodeErrorLine(self.alloc, id, err) };
@@ -699,10 +775,14 @@ const LoopServer = struct {
         }
 
         // Park. `duration` waits never time out — their deadline entry is
-        // the completion time; other kinds get their timeout deadline
-        // (none at all when the timeout is disabled).
+        // the completion time. Idle waits arm their next re-check time
+        // (idleness elapses without any event to wake the loop), clamped
+        // to the timeout. Text/exit waits arm the timeout alone (none at
+        // all when the timeout is disabled) — PTY output and exits wake
+        // them event-side.
         const entry_ms: ?i64 = switch (condition) {
             .duration => |duration_ms| start_ms + @as(i64, @intCast(duration_ms)),
+            .idle => |cfg| @min(idleWakeMs(sess, cfg, start_ms), plan.deadline),
             else => if (plan.deadline == std.math.maxInt(i64)) null else plan.deadline,
         };
         const waiter = try self.alloc.create(Waiter);
@@ -714,6 +794,7 @@ const LoopServer = struct {
             .arena_state = arena_state,
             .condition = condition,
             .state = state,
+            .timeout_deadline_ms = plan.deadline,
             .id = id,
             .format = plan.format,
         };
@@ -724,15 +805,14 @@ const LoopServer = struct {
 
         conn.waiter = waiter;
         conn.state = .waiting;
-        borrow_held = false; // the waiter owns the session borrow now
-        regex_owned = false; // and the compiled regex
+        regex_owned = false; // the waiter owns the compiled regex now
         return .parked;
     }
 
     /// Re-evaluate every parked waiter against current session state.
-    /// Called after each housekeeping drain and after each iteration's
-    /// dispatches, so PTY output, kills, and deletes resolve waits on the
-    /// iteration that produced them (within the drain's 25ms cadence).
+    /// Called after each iteration's PTY reads and dispatches (and again
+    /// after deadline expiries), so output, exits, kills, and deletes
+    /// resolve waits in the same iteration that produced them.
     fn evaluateWaiters(self: *LoopServer) void {
         var i: usize = 0;
         while (i < self.waiters.items.len) {
@@ -769,36 +849,61 @@ const LoopServer = struct {
     }
 
     /// A waiter's deadline fired: completion for `duration` waits, the
-    /// timeout for everything else (matching `runWait`, which reported
-    /// timeout without a final re-evaluation — the last one was at most a
-    /// housekeeping interval ago).
+    /// scheduled re-check (and possibly the timeout) for idle waits, and
+    /// the timeout for text/exit waits (whose satisfaction is event-
+    /// driven and was re-evaluated on the iteration it happened).
     fn waiterDeadlineExpired(self: *LoopServer, deadline_id: u64, now: i64) void {
         for (self.waiters.items, 0..) |waiter, i| {
             if (waiter.deadline_id != deadline_id) continue;
-            if (waiter.condition == .duration) {
-                const maybe_result = ops.evaluateWaitCondition(
-                    waiter.arena_state.allocator(),
-                    waiter.condition,
-                    waiter.sess,
-                    &waiter.state,
-                ) catch |err| {
+            switch (waiter.condition) {
+                .duration, .idle => {
+                    const maybe_result = ops.evaluateWaitCondition(
+                        waiter.arena_state.allocator(),
+                        waiter.condition,
+                        waiter.sess,
+                        &waiter.state,
+                    ) catch |err| {
+                        _ = self.waiters.swapRemove(i);
+                        self.finishWaiterError(waiter, err);
+                        return;
+                    };
+                    if (maybe_result) |result| {
+                        _ = self.waiters.swapRemove(i);
+                        self.finishWaiter(waiter, result);
+                        return;
+                    }
+                    if (waiter.condition == .idle and now >= waiter.timeout_deadline_ms) {
+                        _ = self.waiters.swapRemove(i);
+                        self.finishWaiter(waiter, .{
+                            .timed_out = true,
+                            .elapsed_ms = now - waiter.state.start_ms,
+                        });
+                        return;
+                    }
+                    // Not satisfied yet: re-arm. For `duration`, clock
+                    // jitter left the sleep a hair short (+1ms). For
+                    // `idle`, fresh output moved the reference — arm the
+                    // next possible satisfaction time, clamped to the
+                    // timeout.
+                    const next: i64 = switch (waiter.condition) {
+                        .duration => now + 1,
+                        .idle => |cfg| @min(idleWakeMs(waiter.sess, cfg, now), waiter.timeout_deadline_ms),
+                        else => unreachable,
+                    };
+                    self.deadlines.insert(deadline_id, next) catch {
+                        // Can't re-arm (OOM): fail the wait rather than
+                        // park it forever with no wake-up scheduled.
+                        _ = self.waiters.swapRemove(i);
+                        self.finishWaiterError(waiter, error.OutOfMemory);
+                    };
+                },
+                else => {
                     _ = self.waiters.swapRemove(i);
-                    self.finishWaiterError(waiter, err);
-                    return;
-                };
-                if (maybe_result) |result| {
-                    _ = self.waiters.swapRemove(i);
-                    self.finishWaiter(waiter, result);
-                } else {
-                    // Clock jitter left the duration a hair short; re-arm.
-                    self.deadlines.insert(deadline_id, now + 1) catch {};
-                }
-            } else {
-                _ = self.waiters.swapRemove(i);
-                self.finishWaiter(waiter, .{
-                    .timed_out = true,
-                    .elapsed_ms = now - waiter.state.start_ms,
-                });
+                    self.finishWaiter(waiter, .{
+                        .timed_out = true,
+                        .elapsed_ms = now - waiter.state.start_ms,
+                    });
+                },
             }
             return;
         }
@@ -838,11 +943,12 @@ const LoopServer = struct {
         }
     }
 
-    /// Release everything a waiter owns: its deadline entry, its session
-    /// borrow, its compiled regex, and its request arena.
+    /// Release everything a waiter owns: its deadline entry, its
+    /// compiled regex, and its request arena. (The session outlives the
+    /// waiter structurally — doomed sessions are only freed once no
+    /// waiter references them.)
     fn destroyWaiter(self: *LoopServer, waiter: *Waiter) void {
         _ = self.deadlines.cancel(waiter.deadline_id);
-        self.registry.release(waiter.sess);
         ops.freeWaitConditionRegex(waiter.condition);
         waiter.arena_state.deinit();
         self.alloc.destroy(waiter.arena_state);
@@ -976,7 +1082,8 @@ const LoopServer = struct {
                     break;
                 }
             }
-            if (!client.disconnect_logged.swap(true, .acq_rel)) {
+            if (!client.disconnect_logged) {
+                client.disconnect_logged = true;
                 var arena_state = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_state.deinit();
                 log_mod.logAttachDisconnectEvent(arena_state.allocator(), sess, client.client_id);
@@ -1028,7 +1135,6 @@ const LoopServer = struct {
     fn tryPromotePendingWatch(self: *LoopServer, conn: *Conn) void {
         const name = conn.pending_watch_name orelse return;
         const sess = self.registry.findByName(name) orelse return;
-        defer self.registry.release(sess);
 
         const client = server_attach.promoteWatchSubscriber(self.alloc, sess, conn.stream) catch {
             return self.teardownConn(conn);
@@ -1041,42 +1147,91 @@ const LoopServer = struct {
         if (client.pending.items.len > 0) self.loop.armWrite(conn.stream.handle);
     }
 
-    /// Once-per-iteration input sync: flush every session's pending-input
-    /// buffer and reconcile POLLOUT interest on PTY master fds so a
-    /// wedged child's fd wakes the loop the moment it drains its tty
-    /// input queue. Sessions freed during this iteration simply drop out
-    /// of the desired set and get deregistered here.
-    fn syncPendingInput(self: *LoopServer) void {
-        var pending_fds: std.ArrayListUnmanaged(std.posix.fd_t) = .{};
-        defer pending_fds.deinit(self.alloc);
-        self.registry.flushPendingInputAll(self.alloc, &pending_fds);
+    /// Once-per-iteration PTY sync: reconcile the poll set with the
+    /// registry — every live session's master fd polls for POLLIN, with
+    /// POLLOUT armed exactly while its pending-input buffer is non-empty
+    /// (so a wedged child's fd wakes the loop the moment it drains its
+    /// tty input queue). Sessions that died, were killed, or were doomed
+    /// this iteration drop out of the desired set and get deregistered
+    /// here — before the deferred-free phase, so `session_fds` never
+    /// holds a pointer across a free. Also keeps the waitpid-retry
+    /// deadline armed while any dead child remains unreaped.
+    fn syncSessionPtys(self: *LoopServer, now: i64) void {
+        var desired: std.ArrayListUnmanaged(SessionRegistry.PtyInterest) = .{};
+        defer desired.deinit(self.alloc);
+        self.registry.collectPtyInterest(self.alloc, &desired);
 
-        // Deregister armed fds whose buffer drained (or whose session is
-        // gone).
+        // Deregister fds no longer wanted.
         var stale: std.ArrayListUnmanaged(std.posix.fd_t) = .{};
         defer stale.deinit(self.alloc);
-        var it = self.master_write_fds.keyIterator();
+        var it = self.session_fds.keyIterator();
         while (it.next()) |fd_ptr| {
             const fd = fd_ptr.*;
-            const still_pending = for (pending_fds.items) |p| {
-                if (p == fd) break true;
+            const still_wanted = for (desired.items) |d| {
+                if (d.fd == fd) break true;
             } else false;
-            if (!still_pending) stale.append(self.alloc, fd) catch {};
+            if (!still_wanted) stale.append(self.alloc, fd) catch {};
         }
         for (stale.items) |fd| {
             _ = self.loop.deregisterFd(fd);
-            _ = self.master_write_fds.remove(fd);
+            _ = self.session_fds.remove(fd);
         }
 
-        for (pending_fds.items) |fd| {
-            if (self.master_write_fds.contains(fd)) continue;
-            self.loop.registerFd(fd, .{ .read = false, .write = true }) catch continue;
-            self.master_write_fds.put(self.alloc, fd, {}) catch {
-                _ = self.loop.deregisterFd(fd);
-            };
+        for (desired.items) |d| {
+            if (self.session_fds.getPtr(d.fd)) |slot| {
+                slot.* = d.sess;
+                if (d.write) self.loop.armWrite(d.fd) else self.loop.disarmWrite(d.fd);
+            } else {
+                self.loop.registerFd(d.fd, .{ .read = true, .write = d.write }) catch continue;
+                self.session_fds.put(self.alloc, d.fd, d.sess) catch {
+                    _ = self.loop.deregisterFd(d.fd);
+                };
+            }
+        }
+
+        // Kill paths close the master fd without going through
+        // `ptyReady`, so the reap retry has to be (re)armed here too.
+        if (!self.reap_armed and self.registry.anyReapPending()) {
+            self.armReapRetry(now);
+        }
+    }
+
+    /// Deferred-free phase: free doomed sessions, except those still
+    /// referenced by a parked waiter. Non-duration waiters on doomed
+    /// sessions were already resolved by `evaluateWaiters` this
+    /// iteration; `duration` waiters deliberately survive dooming (a
+    /// duration wait completes even if the session is deleted mid-sleep)
+    /// and their session's storage must survive with them — it is freed
+    /// on the iteration the duration completes.
+    fn freeDoomedSessions(self: *LoopServer) void {
+        const doomed = &self.registry.doomed;
+        var i: usize = 0;
+        outer: while (i < doomed.items.len) {
+            const sess = doomed.items[i];
+            for (self.waiters.items) |waiter| {
+                if (waiter.sess == sess) {
+                    i += 1;
+                    continue :outer;
+                }
+            }
+            _ = doomed.swapRemove(i);
+            sess.deinit();
+            self.registry.alloc.destroy(sess);
         }
     }
 };
+
+/// The earliest instant an idle wait could possibly be satisfied, given
+/// the current screen-change reference — the loop arms this as the
+/// waiter's re-check deadline. Always at least `now + 1` so a re-arm can
+/// never busy-loop on an already-passed instant.
+fn idleWakeMs(sess: *Session, cfg: anytype, now: i64) i64 {
+    const reference = if (cfg.floor_ms) |floor|
+        @max(sess.getLastScreenChange(), floor)
+    else
+        sess.getLastScreenChange();
+    return @max(reference + cfg.idle_ms, now + 1);
+}
 
 fn encodeErrorLine(alloc: Allocator, id: ?i64, err: anyerror) ![]u8 {
     return encodeResponse(alloc, .{ .id = id, .ok = false, .@"error" = requestErrorMessage(err) });
@@ -1219,13 +1374,12 @@ pub fn dispatchRequest(
     }
 
     const session_ref = try readOptionalString(object, "session");
+    // The resolved pointer is valid for the duration of this dispatch,
+    // guaranteed structurally: nothing else runs on this thread, and a
+    // handler that deletes the session (`delete`, or state the `--remove`
+    // sweep will act on later) only unpublishes it — the storage is freed
+    // in the loop's deferred-free phase, never mid-dispatch.
     const sess = try registry.resolveOrSole(session_ref);
-    // `resolveOrSole` handed us a borrow (refcount incremented under the
-    // registry lock). Release it on every exit path — normal return AND
-    // error return from any handler below — so a concurrent `delete` or
-    // `--remove` sweep can unpublish the session immediately while the
-    // storage stays alive until this borrow (the last one) is dropped.
-    defer registry.release(sess);
 
     return switch (entry.handler) {
         .registry, .registry_obj => unreachable, // dispatched above

@@ -1,14 +1,14 @@
-//! Broadcast frames from a session's drain loop out to every live
-//! `hty attach` client subscribed to that session.
+//! Broadcast frames from a session's PTY output dispatch out to every
+//! live `hty attach` client subscribed to that session.
 //!
-//! All functions here run on the server's event-loop thread (the drain
-//! step), which is the only thread that ever touches a session's
-//! attach-client list — no locking needed.
+//! All functions here run on the server's event-loop thread (or the
+//! single test thread), which is the only thread that ever touches a
+//! session's attach-client list — no locking needed.
 //!
 //! Broadcasts never block: `tryWriteFrame` uses non-blocking sends and a
 //! bounded per-client pending buffer, so a client that stops reading can't
-//! wedge the drain loop. Overflowing the bound marks the client closed and
-//! it gets reaped like any other drop.
+//! wedge the loop. Overflowing the bound marks the client closed and it
+//! gets reaped like any other drop.
 
 const std = @import("std");
 const session_mod = @import("session.zig");
@@ -56,9 +56,10 @@ pub fn broadcastExitedToAttach(sess: *Session, code: ?i32) void {
 }
 
 /// Give every attached client a chance to drain bytes buffered by an
-/// earlier would-block send. Called once per drain tick so a client that
-/// stalled during a burst catches back up (or errors out and gets reaped)
-/// even when the session emits no further output.
+/// earlier would-block send. Called from the in-process pump so a client
+/// that stalled during a burst catches back up (or errors out and gets
+/// reaped) even when the session emits no further output; loop-owned
+/// clients flush on POLLOUT instead.
 pub fn flushPendingToAttach(sess: *Session) void {
     for (sess.attach_clients.items) |client| client.flushPending();
 }
@@ -91,7 +92,8 @@ pub fn reapClosedAttachClients(sess: *Session) void {
     // Emit the disconnect event before deinit so the client_id is still
     // valid.
     for (reaped.items) |client| {
-        if (!client.disconnect_logged.swap(true, .acq_rel)) {
+        if (!client.disconnect_logged) {
+            client.disconnect_logged = true;
             var arena_state = std.heap.ArenaAllocator.init(sess.alloc);
             defer arena_state.deinit();
             log_mod.logAttachDisconnectEvent(arena_state.allocator(), sess, client.client_id);

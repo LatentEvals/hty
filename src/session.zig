@@ -20,47 +20,37 @@ pub const SessionStatus = enum { running, exited, failed, killed };
 /// (a) refuse to send if nothing is enabled, and (b) pick the right
 /// encoding when it is.
 ///
-/// Readers touch each field through atomics (acquire load), writers update
-/// with release store from inside `drainAll` under `registry.mutex`. No
-/// session-local lock exists for mouse state — the atomics are enough
-/// since each field is independent and a torn read across fields is
-/// harmless (the client would just see a momentarily-stale combination
-/// on the next snapshot).
+/// Plain fields: writers (the loop's PTY output dispatch) and readers
+/// (`send_mouse` / `snapshot` handlers) all run on the single server
+/// thread.
 pub const MouseState = struct {
     /// `CSI ?1000` — button-event mode (press/release only, no motion).
-    x10: std.atomic.Value(bool),
+    x10: bool = false,
     /// `CSI ?1002` — button-event + drag motion while pressed.
-    button_event: std.atomic.Value(bool),
+    button_event: bool = false,
     /// `CSI ?1003` — any-event motion (even without a button pressed).
-    any_event: std.atomic.Value(bool),
+    any_event: bool = false,
     /// `CSI ?1006` — SGR extended encoding. Independent of the event
     /// mode — apps typically enable 1000/1002/1003 *and* 1006 together.
-    sgr: std.atomic.Value(bool),
+    sgr: bool = false,
 
     pub fn init() MouseState {
-        return .{
-            .x10 = .init(false),
-            .button_event = .init(false),
-            .any_event = .init(false),
-            .sgr = .init(false),
-        };
+        return .{};
     }
 
     /// True if any event-set mode is on (1000/1002/1003). This is the
     /// gate `send --click` checks.
     pub fn isEnabled(self: *const MouseState) bool {
-        return self.x10.load(.acquire) or
-            self.button_event.load(.acquire) or
-            self.any_event.load(.acquire);
+        return self.x10 or self.button_event or self.any_event;
     }
 
     /// Snapshot all four flags to a plain struct for serialization.
     pub fn snapshot(self: *const MouseState) MouseStateSnapshot {
         return .{
-            .x10 = self.x10.load(.acquire),
-            .button_event = self.button_event.load(.acquire),
-            .any_event = self.any_event.load(.acquire),
-            .sgr = self.sgr.load(.acquire),
+            .x10 = self.x10,
+            .button_event = self.button_event,
+            .any_event = self.any_event,
+            .sgr = self.sgr,
         };
     }
 };
@@ -83,8 +73,8 @@ pub const MouseStateSnapshot = struct {
 /// ignored; this is a lenient sniffer, not a full VT parser (the real
 /// VT is Ghostty's job — we just tee a byte-level view to learn about
 /// mouse modes). Chunks that split a sequence mid-way are still picked
-/// up by the next raw_bytes drain event on the following drainAll pass.
-/// In practice apps emit the toggle as one write, so a split is rare.
+/// up when the next output chunk is dispatched. In practice apps emit
+/// the toggle as one write, so a split is rare.
 pub fn applyMouseModeTogglesFromOutput(mouse: *MouseState, bytes: []const u8) void {
     var i: usize = 0;
     while (i + 2 < bytes.len) {
@@ -124,10 +114,10 @@ pub fn applyMouseModeTogglesFromOutput(mouse: *MouseState, bytes: []const u8) vo
             if (tok.len == 0) continue;
             const n = std.fmt.parseInt(u32, tok, 10) catch continue;
             switch (n) {
-                1000 => mouse.x10.store(enable, .release),
-                1002 => mouse.button_event.store(enable, .release),
-                1003 => mouse.any_event.store(enable, .release),
-                1006 => mouse.sgr.store(enable, .release),
+                1000 => mouse.x10 = enable,
+                1002 => mouse.button_event = enable,
+                1003 => mouse.any_event = enable,
+                1006 => mouse.sgr = enable,
                 else => {},
             }
         }
@@ -138,30 +128,30 @@ pub fn applyMouseModeTogglesFromOutput(mouse: *MouseState, bytes: []const u8) vo
 test "applyMouseModeTogglesFromOutput: enable 1000 + 1006" {
     var m = MouseState.init();
     applyMouseModeTogglesFromOutput(&m, "\x1b[?1000h\x1b[?1006h");
-    try std.testing.expect(m.x10.load(.acquire));
-    try std.testing.expect(m.sgr.load(.acquire));
-    try std.testing.expect(!m.button_event.load(.acquire));
+    try std.testing.expect(m.x10);
+    try std.testing.expect(m.sgr);
+    try std.testing.expect(!m.button_event);
 }
 
 test "applyMouseModeTogglesFromOutput: disable 1002" {
     var m = MouseState.init();
-    m.button_event.store(true, .release);
+    m.button_event = true;
     applyMouseModeTogglesFromOutput(&m, "junk \x1b[?1002l tail");
-    try std.testing.expect(!m.button_event.load(.acquire));
+    try std.testing.expect(!m.button_event);
 }
 
 test "applyMouseModeTogglesFromOutput: combined params" {
     var m = MouseState.init();
     applyMouseModeTogglesFromOutput(&m, "\x1b[?1002;1006h");
-    try std.testing.expect(m.button_event.load(.acquire));
-    try std.testing.expect(m.sgr.load(.acquire));
+    try std.testing.expect(m.button_event);
+    try std.testing.expect(m.sgr);
 }
 
 test "applyMouseModeTogglesFromOutput: 1015 is ignored" {
     var m = MouseState.init();
     applyMouseModeTogglesFromOutput(&m, "\x1b[?1015h");
-    try std.testing.expect(!m.x10.load(.acquire));
-    try std.testing.expect(!m.sgr.load(.acquire));
+    try std.testing.expect(!m.x10);
+    try std.testing.expect(!m.sgr);
 }
 
 pub fn statusName(status: SessionStatus) []const u8 {
@@ -174,13 +164,6 @@ pub fn statusName(status: SessionStatus) []const u8 {
 }
 
 pub const Session = struct {
-    /// Sentinel for "exit code not set" inside the atomic storage. POSIX
-    /// exit codes are 0-255 and the session's own status atomic tells the
-    /// reader whether the code is meaningful at all, so using INT_MIN here
-    /// is only a defence-in-depth if someone reads exit_code directly
-    /// without checking status first.
-    pub const no_exit_code: i32 = std.math.minInt(i32);
-
     /// Upper bound on unflushed input bytes queued for the PTY master
     /// (raw bytes, post hex-decode). Interactive input is human-scale;
     /// once a child has 64 KiB of unconsumed input it has stopped reading
@@ -196,63 +179,48 @@ pub const Session = struct {
     args_joined: []u8,
     created_at_ms: i64,
 
-    /// Lifecycle fields mutated by the server's drain loop (accept thread)
-    /// and read by worker threads running wait / snapshot handlers. Stored
-    /// as atomics so readers don't need to hold a lock while polling.
-    /// Writers use release ordering; readers use acquire. When `status`
-    /// transitions to a terminal state, `exit_code` must be written first
-    /// so the release-acquire pair publishes both together.
-    last_screen_change_at_ms_atomic: std.atomic.Value(i64),
-    status_atomic: std.atomic.Value(u8),
-    exit_code_atomic: std.atomic.Value(i32),
+    /// Lifecycle fields. Plain values: everything that reads or writes
+    /// them — PTY dispatch, wait evaluation, RPC handlers — runs on the
+    /// single server thread (or the single test thread).
+    last_screen_change_at_ms: i64,
+    status: SessionStatus = .running,
+    exit_code: ?i32 = null,
 
     /// When true, the registry automatically removes this session once the
     /// child process exits (success, failure, signal, or `hty kill`).
-    /// Opt-in via `hty run --remove`. The auto-removal path in
-    /// `SessionRegistry.drainAll` treats this identically to `hty delete`
-    /// — same teardown, same filesystem cleanup. In-flight wait/snapshot
-    /// handlers are protected by the refcount (`ref_count` below), not by
-    /// timing: removal unpublishes the session immediately and the last
-    /// borrow holder frees it.
+    /// Opt-in via `hty run --remove`. The auto-remove sweep treats this
+    /// identically to `hty delete` — same teardown, same filesystem
+    /// cleanup. In-flight waiters are protected structurally: removal
+    /// unpublishes the session immediately and the storage is freed in
+    /// the loop's deferred-free phase, never mid-dispatch.
     remove_on_exit: bool = false,
     /// Unix-epoch milliseconds at which this session was first observed in
     /// a non-`running` state. `0` means "still running / not yet stamped."
-    /// Set by the drain loop on exit/failure transitions and by
-    /// `handleKill` when it flips status to `.killed`. Read by the drain
-    /// loop's auto-remove sweep to decide eligibility.
-    terminal_at_ms_atomic: std.atomic.Value(i64) = .init(0),
+    /// Set on exit/failure transitions and by `handleKill` when it flips
+    /// status to `.killed`. Read by the auto-remove sweep to decide
+    /// eligibility.
+    terminal_at_ms: i64 = 0,
 
-    /// Number of live borrows of this session pointer held by in-flight
-    /// handlers (RPC workers, attach setup). Guarded by
-    /// `SessionRegistry.mutex`: incremented by the registry's resolve
-    /// paths, decremented by `SessionRegistry.release`. When the count
-    /// drops to zero and `doomed_atomic` is set, the releaser frees the
-    /// session — ownership, not timing, decides the lifetime.
-    ref_count: u32 = 0,
-    /// Set (under `SessionRegistry.mutex`) when the session has been
-    /// unpublished from the registry maps (`hty delete` or the `--remove`
-    /// sweep) but destruction is deferred because handlers still hold
-    /// borrows. Stored as an atomic so wait loops can check it lock-free
-    /// between polls and bail out instead of running to their timeout
-    /// against a deleted session.
-    doomed_atomic: std.atomic.Value(bool) = .init(false),
+    /// True once the session has been unpublished from the registry maps
+    /// (`hty delete` or the `--remove` sweep). The storage stays valid
+    /// until the deferred-free phase, so parked waiters can observe the
+    /// flag and resolve with a structured error instead of touching a
+    /// freed session.
+    doomed: bool = false,
+
+    /// Server-side view of the PTY master fd's read state. `.open` while
+    /// the loop should poll it for output; `.eof` after read returned
+    /// 0/EIO (child gone or going — reap pending or done); `.broken`
+    /// after an unexpected read error marked the session failed.
+    pty_state: enum { open, eof, broken } = .open,
 
     /// Mouse-input mode flags inferred from the PTY output stream.
-    /// Mutated from `drainAll` when raw_bytes events arrive; read by
+    /// Mutated by PTY output dispatch when raw bytes arrive; read by
     /// `handleSendMouse` (to gate on enable + pick an encoding) and by
     /// `handleSnapshot` (to expose the state to clients).
-    mouse_state: MouseState = .{
-        .x10 = .{ .raw = false },
-        .button_event = .{ .raw = false },
-        .any_event = .{ .raw = false },
-        .sgr = .{ .raw = false },
-    },
+    mouse_state: MouseState = .{},
 
     log_file: ?std.fs.File = null,
-    /// Serializes writes to `log_file`. Held by every log helper in `log.zig`
-    /// since multiple threads (drain, PTY readers) call into the log writers
-    /// concurrently until phase 3 puts PTY fds on the loop.
-    log_mutex: std.Thread.Mutex = .{},
 
     /// Active `hty attach` clients subscribed to this session's output.
     /// Only ever touched from the server's event-loop thread (broadcasts,
@@ -266,64 +234,58 @@ pub const Session = struct {
     /// anyway, and input must never stall the event loop).
     pending_input: std.ArrayListUnmanaged(u8) = .{},
 
-    pub fn initAtomics(now_ms: i64) struct {
-        last_screen_change_at_ms_atomic: std.atomic.Value(i64),
-        status_atomic: std.atomic.Value(u8),
-        exit_code_atomic: std.atomic.Value(i32),
-    } {
-        return .{
-            .last_screen_change_at_ms_atomic = .init(now_ms),
-            .status_atomic = .init(@intFromEnum(SessionStatus.running)),
-            .exit_code_atomic = .init(no_exit_code),
-        };
-    }
-
     pub fn getStatus(self: *const Session) SessionStatus {
-        return @enumFromInt(self.status_atomic.load(.acquire));
+        return self.status;
     }
 
     pub fn setStatus(self: *Session, new_status: SessionStatus) void {
-        self.status_atomic.store(@intFromEnum(new_status), .release);
+        self.status = new_status;
     }
 
     pub fn getExitCode(self: *const Session) ?i32 {
-        const v = self.exit_code_atomic.load(.acquire);
-        return if (v == no_exit_code) null else v;
+        return self.exit_code;
     }
 
-    /// Set the exit code. The caller must set `status` to a non-running
-    /// value afterwards (the status store is the release barrier that
-    /// publishes the code to readers).
-    pub fn setExitCode(self: *Session, code: i32) void {
-        self.exit_code_atomic.store(code, .release);
+    pub fn setExitCode(self: *Session, code: ?i32) void {
+        self.exit_code = code;
     }
 
     pub fn getLastScreenChange(self: *const Session) i64 {
-        return self.last_screen_change_at_ms_atomic.load(.acquire);
+        return self.last_screen_change_at_ms;
     }
 
     pub fn touchLastScreenChange(self: *Session, now_ms: i64) void {
-        self.last_screen_change_at_ms_atomic.store(now_ms, .release);
+        self.last_screen_change_at_ms = now_ms;
     }
 
-    /// Stamp `terminal_at_ms_atomic` the first time the session leaves the
+    /// A successful resize repaints the screen, which historically
+    /// emitted a screen_update event that reset the idle clock. Server
+    /// terminals queue no events, so resize paths bump the stamp
+    /// explicitly (gated the same way the event emission was).
+    pub fn touchAfterResize(self: *Session) void {
+        if (self.terminal.config.emit_screen_updates) {
+            self.touchLastScreenChange(std.time.milliTimestamp());
+        }
+    }
+
+    /// Stamp `terminal_at_ms` the first time the session leaves the
     /// running state. Idempotent: subsequent calls are no-ops so the stamp
     /// records the first observed transition, not a later `hty kill`
-    /// racing against an already-exited session.
+    /// against an already-exited session.
     pub fn markTerminal(self: *Session, now_ms: i64) void {
-        _ = self.terminal_at_ms_atomic.cmpxchgStrong(0, now_ms, .release, .monotonic);
+        if (self.terminal_at_ms == 0) self.terminal_at_ms = now_ms;
     }
 
     pub fn getTerminalAt(self: *const Session) i64 {
-        return self.terminal_at_ms_atomic.load(.acquire);
+        return self.terminal_at_ms;
     }
 
     /// True once the session has been unpublished from the registry and is
-    /// awaiting its last borrow release. Handlers holding a borrow may
-    /// still touch the memory safely, but should treat the session as
-    /// deleted for every observable purpose.
+    /// awaiting the deferred free. Code holding the pointer may still
+    /// touch the memory safely within the current iteration, but should
+    /// treat the session as deleted for every observable purpose.
     pub fn isDoomed(self: *const Session) bool {
-        return self.doomed_atomic.load(.acquire);
+        return self.doomed;
     }
 
     /// Queue raw input bytes for the PTY. This is the single fan-in point
@@ -411,7 +373,8 @@ pub const Session = struct {
         const clients_snapshot = self.attach_clients.toOwnedSlice(self.alloc) catch &.{};
         for (clients_snapshot) |client| {
             client.shutdown();
-            if (!client.disconnect_logged.swap(true, .acq_rel)) {
+            if (!client.disconnect_logged) {
+                client.disconnect_logged = true;
                 var arena_state = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_state.deinit();
                 log_mod.logAttachDisconnectEvent(arena_state.allocator(), self, client.client_id);
@@ -447,8 +410,8 @@ pub fn setStreamNonBlocking(fd: std.posix.socket_t) !void {
     _ = try std.posix.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
 }
 
-/// One live `hty attach` connection's broadcast subscription. The drain
-/// step broadcasts raw PTY bytes to each attach_client on the owning
+/// One live `hty attach` connection's broadcast subscription. PTY output
+/// dispatch broadcasts raw bytes to each attach_client on the owning
 /// session through the client's bounded outbound buffer; inbound frames
 /// are parsed by the event loop's connection state machine (there is no
 /// per-client reader thread).
@@ -475,11 +438,11 @@ pub const AttachClient = struct {
     /// connects with disconnects even when multiple clients overlap.
     /// Format: `attach-<uuidv7>`. Owned by this struct; freed on deinit.
     client_id: []u8,
-    closed: std.atomic.Value(bool) = .init(false),
+    closed: bool = false,
     /// Set true once the `attach_disconnect` log event has been emitted.
     /// Used to avoid double-emitting when both the loop's reap path and
     /// the session-deinit path run on the same client.
-    disconnect_logged: std.atomic.Value(bool) = .init(false),
+    disconnect_logged: bool = false,
     /// If true, the client is a `hty watch` subscriber: it sits on the
     /// same broadcast list as a full attach client, receives the same
     /// initial snapshot and live output/exit frames, but any `input` /
@@ -499,11 +462,12 @@ pub const AttachClient = struct {
     session_gone: bool = false,
 
     pub fn isClosed(self: *const AttachClient) bool {
-        return self.closed.load(.acquire);
+        return self.closed;
     }
 
     pub fn shutdown(self: *AttachClient) void {
-        if (self.closed.swap(true, .acq_rel)) return;
+        if (self.closed) return;
+        self.closed = true;
         // Shutting down the socket makes the peer see EOF promptly; the
         // loop (or reaper) frees the client on its next pass.
         std.posix.shutdown(self.stream.handle, .both) catch {};
@@ -530,8 +494,9 @@ pub const AttachClient = struct {
     }
 
     /// Give this client a chance to drain its pending buffer. Called on
-    /// POLLOUT and once per drain tick so a client that stalled during a
-    /// burst catches back up even when the session emits no further output.
+    /// POLLOUT (and from the in-process pump) so a client that stalled
+    /// during a burst catches back up even when the session emits no
+    /// further output.
     pub fn flushPending(self: *AttachClient) void {
         if (self.isClosed()) return;
         _ = self.flushPendingInner();
@@ -568,7 +533,7 @@ pub const AttachClient = struct {
             ) catch |err| switch (err) {
                 error.WouldBlock => return written,
                 else => {
-                    self.closed.store(true, .release);
+                    self.closed = true;
                     return null;
                 },
             };
@@ -583,11 +548,11 @@ pub const AttachClient = struct {
     /// buffered without bound.
     fn queuePending(self: *AttachClient, bytes: []const u8) bool {
         if (self.pending.items.len + bytes.len > max_pending_bytes) {
-            self.closed.store(true, .release);
+            self.closed = true;
             return false;
         }
         self.pending.appendSlice(self.alloc, bytes) catch {
-            self.closed.store(true, .release);
+            self.closed = true;
             return false;
         };
         return true;

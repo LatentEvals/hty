@@ -107,6 +107,8 @@ pub fn handleAttachConnection(
     };
 
     const session_ref = readOptionalString(object, "session") catch null;
+    // The resolved pointer is valid for the duration of this call —
+    // session frees are deferred to the loop's end-of-iteration phase.
     const sess = registry.resolveOrSole(session_ref) catch |err| {
         // Pre-creation pending path: if read_only and the ref is a
         // non-empty name string that doesn't resolve, park the
@@ -129,11 +131,6 @@ pub fn handleAttachConnection(
         try writeAttachError(stream, requestErrorMessage(err));
         return .done;
     };
-    // Borrow from `resolveOrSole` — released on every exit path of this
-    // function. By the time we return, the AttachClient (if any) is
-    // registered on the session's attach list, and its owner (the loop
-    // conn or the caller) manages its lifecycle from there.
-    defer registry.release(sess);
 
     // Optional resize on attach so the PTY matches the observer's terminal.
     // Watch subscribers are read-only — their terminal size is informational
@@ -146,6 +143,7 @@ pub fn handleAttachConnection(
                     const cols: u16 = @intCast(@max(1, cv.integer));
                     sess.terminal.resize(rows, cols) catch {};
                     logResizeEvent(arena, sess, rows, cols);
+                    sess.touchAfterResize();
                 }
             }
         }
@@ -323,6 +321,7 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         const cols: u16 = @intCast(@max(1, cols_val.integer));
         client.session.terminal.resize(rows, cols) catch {};
         logResizeEvent(arena, client.session, rows, cols);
+        client.session.touchAfterResize();
         return;
     }
 

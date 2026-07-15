@@ -91,6 +91,10 @@ pub fn handleSpawn(
             .cwd = cwd,
             .emit_raw_bytes = emit_raw_bytes,
             .emit_screen_updates = emit_screen_updates,
+            // Server sessions have no reader thread and no event queue:
+            // the event loop (or the in-process pump) reads the master
+            // fd itself and dispatches output synchronously.
+            .run_reader_thread = false,
         },
     );
     errdefer terminal.deinit();
@@ -160,13 +164,6 @@ fn posix_getpid() c_int {
 }
 
 pub fn handleList(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Response {
-    // Build the summary list under the registry lock so we don't see a
-    // session being removed mid-iteration. `buildSessionSummary` only
-    // reads atomic/immutable session fields, so holding the lock across
-    // it is fine — no session-local locks acquired inside.
-    registry.mutex.lock();
-    defer registry.mutex.unlock();
-
     const summaries = try arena.alloc(SessionSummary, registry.by_id.count());
     var it = registry.by_id.valueIterator();
     var index: usize = 0;
@@ -371,6 +368,7 @@ pub fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap
     const cols = try readRequiredU16(object, "cols");
     try sess.terminal.resize(rows, cols);
     logResizeEvent(arena, sess, rows, cols);
+    sess.touchAfterResize();
     return .{ .id = id, .ok = true };
 }
 
@@ -711,17 +709,19 @@ pub fn evaluateWaitCondition(
     return null;
 }
 
-/// The single deadline-loop / drain / poll shell shared by all wait ops:
-/// loop { check deadline; drainAll; evaluateWaitCondition; sleep 25ms }.
+/// The single deadline-loop / pump / poll shell shared by all wait ops:
+/// loop { check deadline; pump; evaluateWaitCondition; poll the PTY }.
 /// All condition checking lives in `evaluateWaitCondition`; this shell
 /// only owns the schedule and the two lifecycle policies below.
 ///
 /// Only the in-process dispatch path (`processRequestLine`, used by
 /// single-threaded tests) still blocks here — the socket server parks
-/// waits in its event loop's waiter table instead. Drain before each
-/// sleep: in-process callers have no server loop, so the wait handlers
-/// remain the only thing flushing events into the log and updating
-/// session state on that path.
+/// waits in its event loop's waiter table instead. Pump before each
+/// evaluation: in-process callers have no server loop, so the wait
+/// handlers remain the only thing servicing PTY output into the log and
+/// session state on that path. The inter-poll wait is a `poll(2)` on the
+/// session's master fd (capped at 25ms), so fresh output re-evaluates
+/// immediately instead of waiting out a fixed sleep.
 ///
 /// `duration` conditions are a plain sleep on the wire, not a poll of
 /// session state, so two policies don't apply to them (historical
@@ -748,23 +748,42 @@ fn runWait(
             };
         }
 
-        registry.drainAll();
+        registry.pump();
 
         if (try evaluateWaitCondition(arena, condition, sess, &state)) |result| {
             return result;
         }
 
-        // A concurrent `hty delete` (or the `--remove` sweep inside the
-        // drainAll above) unpublished this session while we were waiting.
-        // Our borrow keeps the memory valid, but the session is gone for
-        // every observable purpose — surface the same structured error a
-        // fresh resolve would, instead of polling a corpse until timeout.
-        // Checked *after* the condition so a wait that was satisfied on
-        // the same drain tick that doomed the session (e.g. wait_for_exit
-        // on a `--remove` session) still reports its success.
+        // An `hty delete` dispatched between polls (or the `--remove`
+        // sweep inside the pump above) unpublished this session while we
+        // were waiting. The deferred free keeps the memory valid, but the
+        // session is gone for every observable purpose — surface the same
+        // structured error a fresh resolve would, instead of polling a
+        // corpse until timeout. Checked *after* the condition so a wait
+        // satisfied by the same pump that doomed the session (e.g.
+        // wait_for_exit on a `--remove` session) still reports success.
         if (!is_duration and sess.isDoomed()) return error.SessionNotFound;
 
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        waitForPtyOrTick(sess, 25);
+    }
+}
+
+/// Block until the session's PTY has output ready or `timeout_ms`
+/// elapses, whichever comes first — the in-process substitute for the
+/// event loop's readiness wakeup. Sessions whose PTY is gone (killed,
+/// reaped, broken) just wait out the tick.
+fn waitForPtyOrTick(sess: *Session, timeout_ms: i32) void {
+    const term = sess.terminal;
+    if (!term.closed and !term.reaped and sess.pty_state == .open) {
+        var pfds = [_]std.posix.pollfd{.{
+            .fd = term.master_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&pfds, timeout_ms) catch {};
+    } else {
+        var none = [_]std.posix.pollfd{};
+        _ = std.posix.poll(&none, timeout_ms) catch {};
     }
 }
 
