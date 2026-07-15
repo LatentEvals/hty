@@ -2024,6 +2024,59 @@ test "concurrency: long wait_for_text does not block concurrent list (LatentEval
     _ = try expectTestOk(kill_parsed);
 }
 
+test "oversized request line gets a structured error and the server keeps serving" {
+    const alloc = std.testing.allocator;
+    const max_request_line_bytes = @import("server.zig").max_request_line_bytes;
+
+    const harness = try startServerHarness(alloc, "bigreq");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // 1. Open a raw connection and pour in more than the cap with no
+    //    newline. The server must reply with a structured error instead
+    //    of buffering the flood until it OOMs.
+    {
+        const stream = try std.net.connectUnixSocket(harness.socket_path);
+        defer stream.close();
+
+        const filler = try alloc.alloc(u8, 64 * 1024);
+        defer alloc.free(filler);
+        @memset(filler, 'a');
+
+        var sent: usize = 0;
+        while (sent <= max_request_line_bytes + filler.len) : (sent += filler.len) {
+            // The server may respond and close mid-flood once it crosses
+            // the cap; a broken pipe here means the error response is
+            // already on its way, so stop writing and go read it.
+            stream.writeAll(filler) catch break;
+        }
+
+        var buf = std.array_list.Managed(u8).init(alloc);
+        defer buf.deinit();
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = stream.read(&chunk) catch break;
+            if (n == 0) break;
+            try buf.appendSlice(chunk[0..n]);
+            if (std.mem.indexOfScalar(u8, buf.items, '\n') != null) break;
+        }
+        const newline = std.mem.indexOfScalar(u8, buf.items, '\n') orelse buf.items.len;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items[0..newline], .{});
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+        try std.testing.expectEqual(false, obj.get("ok").?.bool);
+        try std.testing.expectEqualStrings("request too large", obj.get("error").?.string);
+    }
+
+    // 2. A fresh connection must still get normal service.
+    var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+    defer parsed.deinit();
+    _ = try expectTestOk(parsed);
+}
+
 test "concurrency: server shuts down cleanly while a wait handler is in flight" {
     const alloc = std.testing.allocator;
 

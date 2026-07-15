@@ -26,6 +26,8 @@ Every request is a JSON object with an `"op"` field naming the operation, plus a
 
 You can include an optional integer `"id"` field on any request. The server echoes it back in the response for request-response correlation.
 
+Request lines are capped at 1 MiB. A request that exceeds the cap (or never sends a newline) gets `{"ok": false, "error": "request too large"}` and the connection is closed.
+
 ## Response format
 
 Every response is a JSON object with a boolean `"ok"` field. A successful response may include a `"snapshot"`, `"event"`, `"session"`, or `"sessions"` field depending on the operation. A failed response includes an `"error"` string.

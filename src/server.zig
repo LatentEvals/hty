@@ -27,6 +27,13 @@ const handleAttachConnection = server_attach.handleAttachConnection;
 
 const empty_grace_ms: i64 = 10_000;
 
+/// Maximum size of one request line. Real requests are well under 4 KiB;
+/// 1 MiB leaves generous headroom for large `send_text` payloads while
+/// preventing a client that never sends a newline from growing the read
+/// buffer until the server OOMs. Oversized requests get a structured
+/// `request too large` error and the connection is closed.
+pub const max_request_line_bytes: usize = 1024 * 1024;
+
 /// Optional configuration for the server accept loop. Production uses the
 /// defaults; tests pass a short `empty_grace_ms` and/or a `stop_signal`
 /// they can flip externally so the loop exits promptly.
@@ -252,15 +259,19 @@ pub fn handleConnection(
     defer buffer.deinit();
 
     var chunk: [4096]u8 = undefined;
-    while (true) {
+    while (std.mem.indexOfScalar(u8, buffer.items, '\n') == null) {
+        if (buffer.items.len > max_request_line_bytes) return respondTooLarge(alloc, conn);
         const n = try conn.stream.read(&chunk);
         if (n == 0) break;
         try buffer.appendSlice(chunk[0..n]);
-        if (std.mem.indexOfScalar(u8, buffer.items, '\n') != null) break;
     }
 
     const newline = std.mem.indexOfScalar(u8, buffer.items, '\n') orelse buffer.items.len;
     const line = buffer.items[0..newline];
+
+    // The in-loop check bounds growth chunk-by-chunk; this catches a line
+    // that crossed the cap in the same chunk that carried its newline.
+    if (line.len > max_request_line_bytes) return respondTooLarge(alloc, conn);
 
     if (std.mem.trim(u8, line, " \t\r").len == 0) {
         const empty = try encodeResponse(alloc, .{ .ok = false, .@"error" = "empty request" });
@@ -280,6 +291,16 @@ pub fn handleConnection(
     }
 
     const response = try processRequestLine(alloc, registry, line);
+    defer alloc.free(response);
+    _ = try conn.stream.writeAll(response);
+    return .done;
+}
+
+/// Reply with the structured over-cap error and signal the caller to close
+/// the connection. Split out so both cap checks in `handleConnection` share
+/// one response path.
+fn respondTooLarge(alloc: Allocator, conn: *std.net.Server.Connection) !ConnectionResult {
+    const response = try encodeResponse(alloc, .{ .ok = false, .@"error" = "request too large" });
     defer alloc.free(response);
     _ = try conn.stream.writeAll(response);
     return .done;
