@@ -859,7 +859,10 @@ test "replay reproduces the live grid for a colored cat session" {
         defer parsed.deinit();
         const obj = try expectTestOk(parsed);
         const snap = obj.get("snapshot") orelse return error.InvalidResponse;
-        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const snap_obj = switch (snap) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
         const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
         if (ansi_val != .string) return error.InvalidResponse;
         break :blk try alloc.dupe(u8, ansi_val.string);
@@ -987,7 +990,10 @@ test "replay reproduces the live grid across a mid-session resize" {
         defer parsed.deinit();
         const obj = try expectTestOk(parsed);
         const snap = obj.get("snapshot") orelse return error.InvalidResponse;
-        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const snap_obj = switch (snap) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
         const ansi_val = snap_obj.get("screen_ansi") orelse return error.InvalidResponse;
         if (ansi_val != .string) return error.InvalidResponse;
         break :blk try alloc.dupe(u8, ansi_val.string);
@@ -1145,7 +1151,10 @@ pub fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
     defer parsed.deinit();
     const obj = try expectTestOk(parsed);
     const session = obj.get("session") orelse return error.InvalidResponse;
-    const session_obj = switch (session) { .object => |o| o, else => return error.InvalidResponse };
+    const session_obj = switch (session) {
+        .object => |o| o,
+        else => return error.InvalidResponse,
+    };
     const id_val = session_obj.get("id") orelse return error.InvalidResponse;
     if (id_val != .string) return error.InvalidResponse;
     return try alloc.dupe(u8, id_val.string);
@@ -1460,7 +1469,10 @@ test "resize op changes dimensions visible in the next snapshot" {
         defer parsed.deinit();
         const obj = try expectTestOk(parsed);
         const snap = obj.get("snapshot") orelse return error.InvalidResponse;
-        const snap_obj = switch (snap) { .object => |o| o, else => return error.InvalidResponse };
+        const snap_obj = switch (snap) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
         const rows_val = snap_obj.get("rows") orelse return error.InvalidResponse;
         const cols_val = snap_obj.get("cols") orelse return error.InvalidResponse;
         try std.testing.expectEqual(@as(i64, 20), rows_val.integer);
@@ -1750,55 +1762,57 @@ test "named sessions stay reserved across registry restarts until delete" {
 // Concurrency tests (LatentEvals/hty#14)
 // ===========================================================================
 //
-// Three layers, from fastest to most realistic:
+// The server is a single-threaded event loop, so "concurrency" here means
+// concurrent *clients*: every test in this section runs the real server
+// loop in a background thread on a temporary Unix socket and races client
+// threads against it through the wire protocol.
 //
-// 1. In-process: drive processRequestLine from two threads on a shared
-//    registry. Proves the mutex design doesn't deadlock and produces
-//    coherent map state.
+// 1. Parallel clients: two client threads hammer snapshot/list against
+//    the same session. Proves interleaved socket traffic produces
+//    coherent responses.
 //
-// 2. Socket-level: run the full server loop in a background thread on a
-//    temporary Unix socket. Two clients issue interleaved RPCs. One
-//    client runs a `wait_for_text` that will time out; the other must
-//    still get a `list` response within a generous but sub-wait budget.
-//    This is the "before: fails, after: passes" test for #14.
+// 2. Parked waits: `wait_for_text` handlers park in the loop's waiter
+//    table instead of occupying a thread — a fresh `list` must complete
+//    within budget while waits are pending (the #14 regression, plus the
+//    N=8 event-loop variant).
 //
 // 3. Shutdown-while-busy: ensures `runServerWithOpts` unwinds cleanly
-//    when a worker is mid-RPC, by joining the worker pool before
-//    registry teardown.
+//    while a wait is parked.
 
 const runServerWithOpts = @import("server.zig").runServerWithOpts;
-const dispatchRequest = @import("server.zig").dispatchRequest;
 
-test "concurrency: two workers drive the same registry without crashing" {
+test "concurrency: parallel socket clients drive the same server without crashing" {
     const alloc = std.testing.allocator;
 
-    const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-conc-inproc-{d}", .{std.time.nanoTimestamp()});
-    defer alloc.free(log_dir);
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
-    const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
-    defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    const harness = try startServerHarness(alloc, "concpar");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
 
-    var registry = SessionRegistry.init(alloc);
-    defer registry.deinit();
-    registry.log_dir = log_dir;
+    // Spawn a session we can poke at from both clients.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "concurrent",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
 
-    // Spawn a session we can poke at from both threads.
-    const uuid = try spawnCatSession(&registry, "concurrent");
-    defer alloc.free(uuid);
-
-    const ThreadCtx = struct {
-        reg: *SessionRegistry,
+    const ClientCtx = struct {
+        alloc: std.mem.Allocator,
+        socket_path: []const u8,
         op: []const u8,
         success: std.atomic.Value(bool) = .init(false),
 
         fn run(self: *@This()) void {
             var i: usize = 0;
             while (i < 20) : (i += 1) {
-                // Each call builds its own arena inside processRequestLine,
-                // so nothing is shared between iterations.
-                var parsed = testRequest(self.reg, .{
+                // Each request is its own connection, exactly like a real
+                // `hty` CLI invocation.
+                var parsed = socketRequest(self.alloc, self.socket_path, .{
                     .op = self.op,
                     .session = "concurrent",
                 }) catch return;
@@ -1809,16 +1823,23 @@ test "concurrency: two workers drive the same registry without crashing" {
         }
     };
 
-    var ctx_a = ThreadCtx{ .reg = &registry, .op = "snapshot" };
-    var ctx_b = ThreadCtx{ .reg = &registry, .op = "list" };
+    var ctx_a = ClientCtx{ .alloc = alloc, .socket_path = harness.socket_path, .op = "snapshot" };
+    var ctx_b = ClientCtx{ .alloc = alloc, .socket_path = harness.socket_path, .op = "list" };
 
-    const ta = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx_a});
-    const tb = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx_b});
+    const ta = try std.Thread.spawn(.{}, ClientCtx.run, .{&ctx_a});
+    const tb = try std.Thread.spawn(.{}, ClientCtx.run, .{&ctx_b});
     ta.join();
     tb.join();
 
     try std.testing.expect(ctx_a.success.load(.acquire));
     try std.testing.expect(ctx_b.success.load(.acquire));
+
+    var del_parsed = try socketRequest(alloc, harness.socket_path, .{
+        .op = "delete",
+        .session = "concurrent",
+    });
+    defer del_parsed.deinit();
+    _ = try expectTestOk(del_parsed);
 }
 
 // Shared harness for the socket-level concurrency tests: spins up a real
@@ -2134,6 +2155,81 @@ test "concurrency: long wait_for_text does not block concurrent list (LatentEval
     });
     defer kill_parsed.deinit();
     _ = try expectTestOk(kill_parsed);
+}
+
+test "concurrency: eight parked waits do not stall a fresh list (event loop)" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "parked8");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .program = "/bin/cat",
+            .name = "parked",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Eight clients park long waits for a needle that never appears. On
+    // the event loop each one is a waiter-table entry, not an occupied
+    // thread — the server must stay fully responsive underneath them.
+    const WaitCtx = struct {
+        alloc: std.mem.Allocator,
+        socket_path: []const u8,
+        timed_out: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var parsed = socketRequest(self.alloc, self.socket_path, .{
+                .op = "wait_for_text",
+                .session = "parked",
+                .text = "impossible-needle-that-will-never-match",
+                .timeout_ms = 2000,
+            }) catch return;
+            defer parsed.deinit();
+            const object = expectTestOk(parsed) catch return;
+            const to_val = object.get("timed_out") orelse return;
+            if (to_val == .bool and to_val.bool) self.timed_out.store(true, .release);
+        }
+    };
+
+    var ctxs: [8]WaitCtx = undefined;
+    var threads: [8]std.Thread = undefined;
+    for (&ctxs, 0..) |*ctx, i| {
+        ctx.* = .{ .alloc = alloc, .socket_path = harness.socket_path };
+        threads[i] = try std.Thread.spawn(.{}, WaitCtx.run, .{ctx});
+    }
+
+    // Let all eight waits reach the server and park.
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // A fresh connection's `list` must complete within its usual budget —
+    // with thread-per-connection this held because threads are cheap;
+    // with the loop it holds because parked waits don't run at all.
+    const start = std.time.milliTimestamp();
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    const elapsed = std.time.milliTimestamp() - start;
+    try std.testing.expect(elapsed < 500);
+
+    // Every wait must still resolve with its own timeout response.
+    for (&threads) |t| t.join();
+    for (&ctxs) |*ctx| try std.testing.expect(ctx.timed_out.load(.acquire));
+
+    var del_parsed = try socketRequest(alloc, harness.socket_path, .{
+        .op = "delete",
+        .session = "parked",
+    });
+    defer del_parsed.deinit();
+    _ = try expectTestOk(del_parsed);
 }
 
 test "oversized request line gets a structured error and the server keeps serving" {
@@ -3792,23 +3888,17 @@ test "issue #29: watch against existing session receives started + initial snaps
 
     // Simulate a watch connection with a socketpair. We drive
     // handleAttachConnection directly (no real accept loop) to keep the
-    // test hermetic. It's given a fake Connection whose stream is the
-    // server-side half of the pair.
+    // test hermetic. It is given the server-side half of the pair.
     const pair = try makeSocketPair();
     // Note: the peer is explicitly closed below after we're done reading
     // from it — not via defer — so the server's reader thread can notice
     // EOF while the session is still alive, without double-close.
 
-    var conn: std.net.Server.Connection = .{
-        .stream = pair.local,
-        .address = undefined,
-    };
-
     const line = "{\"op\":\"watch\",\"session\":\"watchexist\"}";
     const result = try server_attach_mod.handleAttachConnection(
         alloc,
         &registry,
-        &conn,
+        pair.local,
         line,
         true, // read_only
     );
@@ -3886,16 +3976,11 @@ test "issue #29: watch pre-creation promotes on spawn" {
     const pair = try makeSocketPair();
     // Close the peer explicitly after reading — no defer (double-close).
 
-    var conn: std.net.Server.Connection = .{
-        .stream = pair.local,
-        .address = undefined,
-    };
-
     const line = "{\"op\":\"watch\",\"session\":\"ghostname\"}";
     const result = try server_attach_mod.handleAttachConnection(
         alloc,
         &registry,
-        &conn,
+        pair.local,
         line,
         true,
     );
@@ -4028,15 +4113,11 @@ test "issue #29: promoted watcher streams live output (regression: post-promotio
     const pair = try makeSocketPair();
     // Close explicitly at end (not via defer — avoids double close).
 
-    var conn: std.net.Server.Connection = .{
-        .stream = pair.local,
-        .address = undefined,
-    };
     const watch_line = "{\"op\":\"watch\",\"session\":\"streamfoo\"}";
     const result = try server_attach_mod.handleAttachConnection(
         alloc,
         &registry,
-        &conn,
+        pair.local,
         watch_line,
         true,
     );
@@ -4979,63 +5060,83 @@ test "spawn without --remove keeps the session after exit" {
 
 test "delete during wait_for_text: wait returns structured error, no UAF" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
-    defer registry.deinit();
+
+    const harness = try startServerHarness(alloc, "delwait");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
 
     {
-        var parsed = try testRequest(&registry, .{
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
             .op = "spawn",
             .program = "/bin/cat",
             .name = "del-mid-wait",
             .rows = 8,
             .cols = 24,
-            .emit_raw_bytes = false,
         });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
 
-    // Run the wait on a worker thread, exactly like a real RPC worker
-    // would: the handler borrows the session at resolve time and polls
-    // it for up to 5s.
+    // Park a wait through the real socket protocol: the loop borrows the
+    // session at resolve time and holds the waiter for up to 5s.
     const WaiterCtx = struct {
-        registry: *SessionRegistry,
-        response: ?[]u8 = null,
-    };
-    var ctx = WaiterCtx{ .registry = &registry };
-    const Waiter = struct {
-        fn run(c: *WaiterCtx) void {
-            const req =
-                "{\"op\":\"wait_for_text\",\"session\":\"del-mid-wait\"," ++
-                "\"text\":\"never-appears\",\"timeout_ms\":5000}";
-            c.response = processRequestLine(std.testing.allocator, c.registry, req) catch null;
+        alloc: std.mem.Allocator,
+        socket_path: []const u8,
+        not_found: std.atomic.Value(bool) = .init(false),
+        timed_out: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var parsed = socketRequest(self.alloc, self.socket_path, .{
+                .op = "wait_for_text",
+                .session = "del-mid-wait",
+                .text = "never-appears",
+                .timeout_ms = 5000,
+            }) catch return;
+            defer parsed.deinit();
+            const object = switch (parsed.value) {
+                .object => |o| o,
+                else => return,
+            };
+            if (object.get("error")) |err_val| {
+                if (err_val == .string and std.mem.indexOf(u8, err_val.string, "session not found") != null) {
+                    self.not_found.store(true, .release);
+                }
+            }
+            if (object.get("timed_out")) |to_val| {
+                if (to_val == .bool and to_val.bool) self.timed_out.store(true, .release);
+            }
         }
     };
-    const waiter_thread = try std.Thread.spawn(.{}, Waiter.run, .{&ctx});
+    var ctx = WaiterCtx{ .alloc = alloc, .socket_path = harness.socket_path };
+    const waiter_thread = try std.Thread.spawn(.{}, WaiterCtx.run, .{&ctx});
 
-    // Give the wait a few poll iterations to get in flight, then delete
-    // the session out from under it from this thread.
-    std.Thread.sleep(120 * std.time.ns_per_ms);
+    // Give the wait time to park, then delete the session out from under
+    // it. The loop resolves the parked waiter with the structured error
+    // in the same iteration the delete dispatches.
+    std.Thread.sleep(150 * std.time.ns_per_ms);
     {
-        var parsed = try testRequest(&registry, .{ .op = "delete", .session = "del-mid-wait" });
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "delete", .session = "del-mid-wait" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
 
     waiter_thread.join();
-    const response = ctx.response orelse return error.WaitRequestFailed;
-    defer alloc.free(response);
 
     // The wait must complete with a structured result: the "session not
     // found" error from the doomed check (normal case), or — under
-    // extreme scheduling — its own timeout. Never a crash: the debug
-    // allocator trips if the handler touched freed session memory.
-    const not_found = std.mem.indexOf(u8, response, "session not found") != null;
-    const timed_out = std.mem.indexOf(u8, response, "\"timed_out\":true") != null;
-    try std.testing.expect(not_found or timed_out);
+    // extreme scheduling — its own timeout. Never a crash or a hang.
+    try std.testing.expect(ctx.not_found.load(.acquire) or ctx.timed_out.load(.acquire));
 
     // And the session really is gone.
-    try std.testing.expectEqual(@as(usize, 0), sessionCount(&registry));
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const sessions = object.get("sessions") orelse return error.InvalidResponse;
+        try std.testing.expectEqual(@as(usize, 0), sessions.array.items.len);
+    }
 }
 
 test "handler error mid-op releases the session borrow" {

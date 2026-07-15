@@ -22,6 +22,7 @@ const keyToBytes = @import("keys.zig").keyToBytes;
 
 const protocol = @import("protocol.zig");
 const Response = protocol.Response;
+const encodeResponse = protocol.encodeResponse;
 const SessionSummary = protocol.SessionSummary;
 const EventPayload = protocol.EventPayload;
 const WaitPayload = protocol.WaitPayload;
@@ -371,7 +372,7 @@ pub fn handleResize(arena: Allocator, sess: *Session, object: std.json.ObjectMap
 /// `wait_for_*` ops and the fused `wait_and_snapshot` op — parse their
 /// request fields into one of these and run the same `runWait` loop; only
 /// the response formatting differs per surface.
-const WaitCondition = union(enum) {
+pub const WaitCondition = union(enum) {
     /// Sleep a fixed number of milliseconds, then complete. Never times
     /// out (the fused op's `duration` kind ignores the deadline).
     duration: u64,
@@ -396,7 +397,7 @@ const WaitCondition = union(enum) {
 /// the satisfied outcomes (`matched` non-null, with `text`/`exit` detail
 /// when the condition provides it); `runWait` produces the `timed_out`
 /// ones.
-const WaitResult = struct {
+pub const WaitResult = struct {
     matched: ?[]const u8 = null,
     elapsed_ms: i64 = 0,
     timed_out: bool = false,
@@ -416,11 +417,183 @@ fn compileWaitRegex(arena: Allocator, pattern: []const u8) !*HtyRegex {
     return re;
 }
 
+/// The four RPC ops that can wait. Every one of them is parsed by
+/// `planWait` into the same `WaitCondition` core; the kind decides which
+/// request fields to read and which response shape (`WaitFormat`) applies.
+pub const WaitOpKind = enum { text, idle, exit, fused };
+
+/// Map an op name to its wait kind, or null for non-wait ops. The event
+/// loop uses this to decide whether a request parks the connection as a
+/// waiter instead of dispatching synchronously through the op table.
+pub fn waitOpKind(op: []const u8) ?WaitOpKind {
+    if (std.mem.eql(u8, op, "wait_for_text")) return .text;
+    if (std.mem.eql(u8, op, "wait_for_idle")) return .idle;
+    if (std.mem.eql(u8, op, "wait_for_exit")) return .exit;
+    if (std.mem.eql(u8, op, "wait_and_snapshot")) return .fused;
+    return null;
+}
+
+/// Which wire shape a wait outcome is formatted into: the standalone
+/// `wait_for_*` shape or the fused `wait_and_snapshot` shape (with or
+/// without the snapshot payload).
+pub const WaitFormat = enum { standalone, fused_bare, fused_snapshot };
+
+/// A parsed wait request: what to wait for, until when, and how to format
+/// the outcome. `condition == null` only for the fused op's
+/// `wait_kind: "none"` — no wait at all; the caller answers immediately.
+pub const WaitPlan = struct {
+    condition: ?WaitCondition,
+    /// Absolute timeout deadline (ms). `maxInt(i64)` means no timeout
+    /// (fused `timeout_ms: 0`); `duration` conditions ignore it entirely.
+    deadline: i64,
+    format: WaitFormat,
+};
+
+/// Parse the wait-defining fields of a request into a `WaitPlan`,
+/// preserving each op's historical field names, defaults, and parse
+/// order. Shared by the blocking handlers below (which feed the plan to
+/// `runWait`) and the event loop (which parks a waiter with it). A
+/// compiled regex in the returned condition is owned by the caller —
+/// free it with `freeWaitConditionRegex`.
+pub fn planWait(
+    arena: Allocator,
+    kind: WaitOpKind,
+    object: std.json.ObjectMap,
+    start_ms: i64,
+) !WaitPlan {
+    switch (kind) {
+        .text => {
+            const needle = try readRequiredString(object, "text");
+            const use_regex = try readOptionalBool(object, "regex", false);
+            const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
+            const compiled: ?*HtyRegex = if (use_regex) try compileWaitRegex(arena, needle) else null;
+            return .{
+                .condition = .{
+                    .text = .{
+                        .needle = needle,
+                        .regex = compiled,
+                        // Historical wire shape: the standalone op reports
+                        // matched="text" even in regex mode.
+                        .matched_label = "text",
+                    },
+                },
+                .deadline = start_ms + @as(i64, @intCast(timeout_ms)),
+                .format = .standalone,
+            };
+        },
+        .idle => {
+            const idle_ms_field = try readOptionalU64(object, "idle_ms", 250);
+            const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
+            return .{
+                .condition = .{ .idle = .{
+                    .idle_ms = @intCast(idle_ms_field),
+                    .floor_ms = null,
+                } },
+                .deadline = start_ms + @as(i64, @intCast(timeout_ms)),
+                .format = .standalone,
+            };
+        },
+        .exit => {
+            const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
+            return .{
+                .condition = .exit,
+                .deadline = start_ms + @as(i64, @intCast(timeout_ms)),
+                .format = .standalone,
+            };
+        },
+        .fused => {
+            const wait_kind_opt = try readOptionalString(object, "wait_kind");
+            const wait_kind = wait_kind_opt orelse "none";
+            const include_snapshot = try readOptionalBool(object, "snapshot", false);
+            const timeout_ms_field = try readOptionalU64(object, "timeout_ms", 30_000);
+            const format: WaitFormat = if (include_snapshot) .fused_snapshot else .fused_bare;
+            // timeout_ms == 0 means "no timeout" — pin the deadline at the
+            // largest representable value so the wait never trips it.
+            const deadline: i64 = if (timeout_ms_field == 0)
+                std.math.maxInt(i64)
+            else
+                start_ms + @as(i64, @intCast(timeout_ms_field));
+
+            if (std.mem.eql(u8, wait_kind, "none")) {
+                return .{ .condition = null, .deadline = deadline, .format = format };
+            }
+            const condition: WaitCondition = blk: {
+                if (std.mem.eql(u8, wait_kind, "duration")) {
+                    break :blk .{ .duration = try readOptionalU64(object, "duration_ms", 0) };
+                }
+                if (std.mem.eql(u8, wait_kind, "idle")) {
+                    const idle_ms_field = try readOptionalU64(object, "idle_ms", 100);
+                    // Race fix: if the session was already idle before this
+                    // op started, treat op-start as the idle reference.
+                    break :blk .{ .idle = .{ .idle_ms = @intCast(idle_ms_field), .floor_ms = start_ms } };
+                }
+                if (std.mem.eql(u8, wait_kind, "text") or std.mem.eql(u8, wait_kind, "regex")) {
+                    const needle = try readRequiredString(object, "text");
+                    const use_regex = std.mem.eql(u8, wait_kind, "regex");
+                    const compiled: ?*HtyRegex = if (use_regex) try compileWaitRegex(arena, needle) else null;
+                    break :blk .{ .text = .{
+                        .needle = needle,
+                        .regex = compiled,
+                        .matched_label = if (use_regex) "regex" else "text",
+                    } };
+                }
+                if (std.mem.eql(u8, wait_kind, "exit")) {
+                    break :blk .exit;
+                }
+                return error.InvalidFieldValue;
+            };
+            return .{ .condition = condition, .deadline = deadline, .format = format };
+        },
+    }
+}
+
+/// Free the compiled regex a `planWait` condition may own. Safe on every
+/// condition kind; a no-op when there is nothing to free.
+pub fn freeWaitConditionRegex(condition: WaitCondition) void {
+    switch (condition) {
+        .text => |cfg| if (cfg.regex) |re| hty_regex_free(re),
+        else => {},
+    }
+}
+
+/// Encode a completed wait (match, exit, duration, or timeout) into the
+/// wire bytes of its surface's response shape. Used by the event loop to
+/// answer parked waiters; the returned line is owned by the caller. Any
+/// memory `result` references (e.g. the duped needle) only needs to stay
+/// alive for the duration of this call — the encoded line is a full copy.
+pub fn encodeWaitOutcome(
+    alloc: Allocator,
+    id: ?i64,
+    sess: *Session,
+    format: WaitFormat,
+    result: WaitResult,
+) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const response = switch (format) {
+        .standalone => try standaloneWaitResponse(arena, id, sess, result),
+        .fused_bare, .fused_snapshot => try buildFusedResponse(
+            arena,
+            id,
+            sess,
+            format == .fused_snapshot,
+            result.matched,
+            result.elapsed_ms,
+            result.timed_out,
+            result.text,
+            result.exit,
+        ),
+    };
+    return encodeResponse(alloc, response);
+}
+
 /// Per-waiter evaluation state carried between `evaluateWaitCondition`
-/// calls. One instance lives for the lifetime of a wait — today on
-/// `runWait`'s stack, later in the event loop's waiter table — and holds
-/// everything a re-evaluation needs besides the condition itself.
-const WaitState = struct {
+/// calls. One instance lives for the lifetime of a wait — on `runWait`'s
+/// stack for in-process dispatch, or in the event loop's waiter table for
+/// parked connections — and holds everything a re-evaluation needs
+/// besides the condition itself.
+pub const WaitState = struct {
     /// When the wait began; the reference point for `duration` conditions
     /// and for `elapsed_ms` in every outcome.
     start_ms: i64,
@@ -434,7 +607,7 @@ const WaitState = struct {
     /// change stamp, so for those every evaluation scans unconditionally.
     track_screen_changes: bool,
 
-    fn init(sess: *const Session, start_ms: i64) WaitState {
+    pub fn init(sess: *const Session, start_ms: i64) WaitState {
         return .{
             .start_ms = start_ms,
             .track_screen_changes = sess.terminal.config.emit_screen_updates,
@@ -448,10 +621,10 @@ const WaitState = struct {
 /// Pure and loop-agnostic by design: no sleeps, no drains, no deadline
 /// bookkeeping, and no I/O beyond session snapshot/status reads. The
 /// caller owns the schedule — when to drain, when to re-evaluate, and
-/// when to give up. Today that caller is `runWait`'s 25ms poll shell;
-/// the event loop's waiter table will call this on PTY-output and timer
-/// events instead.
-fn evaluateWaitCondition(
+/// when to give up. In-process dispatch calls it from `runWait`'s 25ms
+/// poll shell; the server's event loop calls it from the waiter table
+/// after each housekeeping drain and on deadline expiry.
+pub fn evaluateWaitCondition(
     arena: Allocator,
     condition: WaitCondition,
     sess: *Session,
@@ -537,13 +710,12 @@ fn evaluateWaitCondition(
 /// All condition checking lives in `evaluateWaitCondition`; this shell
 /// only owns the schedule and the two lifecycle policies below.
 ///
-/// Drain before each sleep. The accept thread also drains every 25ms,
-/// but in-process test callers drive `processRequestLine` directly
-/// with no accept loop, so the wait handlers remain the only thing
-/// flushing events into the log and updating session state. Each
-/// drainAll acquires the registry lock briefly and releases before
-/// the sleep, so concurrent workers are not serialized behind the
-/// wait.
+/// Only the in-process dispatch path (`processRequestLine`, used by
+/// single-threaded tests) still blocks here — the socket server parks
+/// waits in its event loop's waiter table instead. Drain before each
+/// sleep: in-process callers have no server loop, so the wait handlers
+/// remain the only thing flushing events into the log and updating
+/// session state on that path.
 ///
 /// `duration` conditions are a plain sleep on the wire, not a poll of
 /// session state, so two policies don't apply to them (historical
@@ -637,6 +809,27 @@ fn standaloneWaitResponse(
     });
 }
 
+/// Shared body of the three standalone `wait_for_*` handlers: parse the
+/// request into a `WaitPlan`, run the blocking wait shell, format the
+/// standalone response. (The event loop bypasses this — it calls
+/// `planWait` itself and parks a waiter instead of blocking.)
+fn runStandaloneWait(
+    arena: Allocator,
+    registry: *SessionRegistry,
+    sess: *Session,
+    object: std.json.ObjectMap,
+    id: ?i64,
+    kind: WaitOpKind,
+) !Response {
+    const start_ms = std.time.milliTimestamp();
+    const plan = try planWait(arena, kind, object, start_ms);
+    const condition = plan.condition.?; // standalone kinds always wait
+    defer freeWaitConditionRegex(condition);
+
+    const result = try runWait(arena, registry, sess, condition, start_ms, plan.deadline);
+    return try standaloneWaitResponse(arena, id, sess, result);
+}
+
 pub fn handleWaitForText(
     arena: Allocator,
     registry: *SessionRegistry,
@@ -644,23 +837,7 @@ pub fn handleWaitForText(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    const needle = try readRequiredString(object, "text");
-    const use_regex = try readOptionalBool(object, "regex", false);
-    const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const start_ms = std.time.milliTimestamp();
-    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
-
-    const compiled_regex: ?*HtyRegex = if (use_regex) try compileWaitRegex(arena, needle) else null;
-    defer if (compiled_regex) |re| hty_regex_free(re);
-
-    const result = try runWait(arena, registry, sess, .{ .text = .{
-        .needle = needle,
-        .regex = compiled_regex,
-        // Historical wire shape: the standalone op reports matched="text"
-        // even in regex mode.
-        .matched_label = "text",
-    } }, start_ms, deadline);
-    return try standaloneWaitResponse(arena, id, sess, result);
+    return runStandaloneWait(arena, registry, sess, object, id, .text);
 }
 
 /// Match a regex against a terminal snapshot using bounded temporary memory.
@@ -696,16 +873,7 @@ pub fn handleWaitForIdle(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    const idle_ms_field = try readOptionalU64(object, "idle_ms", 250);
-    const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const start_ms = std.time.milliTimestamp();
-    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
-
-    const result = try runWait(arena, registry, sess, .{ .idle = .{
-        .idle_ms = @intCast(idle_ms_field),
-        .floor_ms = null,
-    } }, start_ms, deadline);
-    return try standaloneWaitResponse(arena, id, sess, result);
+    return runStandaloneWait(arena, registry, sess, object, id, .idle);
 }
 
 pub fn handleWaitForExit(
@@ -715,12 +883,7 @@ pub fn handleWaitForExit(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    const timeout_ms = try readOptionalU64(object, "timeout_ms", 10_000);
-    const start_ms = std.time.milliTimestamp();
-    const deadline = start_ms + @as(i64, @intCast(timeout_ms));
-
-    const result = try runWait(arena, registry, sess, .exit, start_ms, deadline);
-    return try standaloneWaitResponse(arena, id, sess, result);
+    return runStandaloneWait(arena, registry, sess, object, id, .exit);
 }
 
 /// Server-side fused wait+snapshot op. The client-side commands `hty send`
@@ -755,53 +918,15 @@ pub fn handleWaitAndSnapshot(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    const wait_kind_opt = try readOptionalString(object, "wait_kind");
-    const wait_kind = wait_kind_opt orelse "none";
-    const include_snapshot = try readOptionalBool(object, "snapshot", false);
-    const timeout_ms_field = try readOptionalU64(object, "timeout_ms", 30_000);
     const start_ms = std.time.milliTimestamp();
+    const plan = try planWait(arena, .fused, object, start_ms);
+    const include_snapshot = plan.format == .fused_snapshot;
 
-    // timeout_ms == 0 means "no timeout" — pin the deadline at the largest
-    // representable value so the loop never trips it.
-    const deadline: i64 = if (timeout_ms_field == 0)
-        std.math.maxInt(i64)
-    else
-        start_ms + @as(i64, @intCast(timeout_ms_field));
-
-    if (std.mem.eql(u8, wait_kind, "none")) {
+    const condition = plan.condition orelse
         return try buildFusedResponse(arena, id, sess, include_snapshot, null, 0, false, null, null);
-    }
+    defer freeWaitConditionRegex(condition);
 
-    var compiled_regex: ?*HtyRegex = null;
-    defer if (compiled_regex) |re| hty_regex_free(re);
-
-    const condition: WaitCondition = blk: {
-        if (std.mem.eql(u8, wait_kind, "duration")) {
-            break :blk .{ .duration = try readOptionalU64(object, "duration_ms", 0) };
-        }
-        if (std.mem.eql(u8, wait_kind, "idle")) {
-            const idle_ms_field = try readOptionalU64(object, "idle_ms", 100);
-            // Race fix: if the session was already idle before this op
-            // started, treat op-start as the idle reference instead.
-            break :blk .{ .idle = .{ .idle_ms = @intCast(idle_ms_field), .floor_ms = start_ms } };
-        }
-        if (std.mem.eql(u8, wait_kind, "text") or std.mem.eql(u8, wait_kind, "regex")) {
-            const needle = try readRequiredString(object, "text");
-            const use_regex = std.mem.eql(u8, wait_kind, "regex");
-            if (use_regex) compiled_regex = try compileWaitRegex(arena, needle);
-            break :blk .{ .text = .{
-                .needle = needle,
-                .regex = compiled_regex,
-                .matched_label = if (use_regex) "regex" else "text",
-            } };
-        }
-        if (std.mem.eql(u8, wait_kind, "exit")) {
-            break :blk .exit;
-        }
-        return error.InvalidFieldValue;
-    };
-
-    const result = try runWait(arena, registry, sess, condition, start_ms, deadline);
+    const result = try runWait(arena, registry, sess, condition, start_ms, plan.deadline);
     return try buildFusedResponse(
         arena,
         id,

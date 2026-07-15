@@ -28,7 +28,7 @@ const SessionRegistry = @import("registry.zig").SessionRegistry;
 pub const ConnectionResult = enum { done, attached };
 
 /// Distinguishes between the normal RPC path, an interactive attach, and
-/// a read-only watch. The accept loop uses this to decide whether to
+/// a read-only watch. The event loop uses this to decide whether to
 /// hand off socket ownership to `handleAttachConnection` and with which
 /// `read_only` setting.
 pub const AttachOp = enum { none, attach, watch };
@@ -56,8 +56,11 @@ pub fn detectAttachOp(alloc: Allocator, line: []const u8) AttachOp {
 /// resolve the session, register a subscriber, write the initial ack
 /// and snapshot frame, and spawn a reader thread that owns the socket
 /// for the rest of the attach lifetime. Returns `.attached` on success
-/// so the accept loop hands off socket ownership; `.done` on failure
-/// (the accept loop closes the connection).
+/// so the event loop hands off socket ownership; `.done` on failure
+/// (the event loop closes the connection). `stream` must be in blocking
+/// mode on entry — the ack/snapshot writes below rely on it; the socket
+/// is flipped non-blocking here once the client joins the broadcast
+/// list.
 ///
 /// `read_only` flips two behaviors: (1) the resulting `AttachClient` is
 /// marked read-only so `dispatchAttachFrame` drops input/resize frames,
@@ -68,7 +71,7 @@ pub fn detectAttachOp(alloc: Allocator, line: []const u8) AttachOp {
 pub fn handleAttachConnection(
     alloc: Allocator,
     registry: *SessionRegistry,
-    conn: *std.net.Server.Connection,
+    stream: std.net.Stream,
     line: []const u8,
     read_only: bool,
 ) !ConnectionResult {
@@ -77,13 +80,13 @@ pub fn handleAttachConnection(
     const arena = arena_state.allocator();
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch {
-        try writeAttachError(conn.stream, "invalid json");
+        try writeAttachError(stream, "invalid json");
         return .done;
     };
     const object = switch (parsed) {
         .object => |o| o,
         else => {
-            try writeAttachError(conn.stream, "request must be a JSON object");
+            try writeAttachError(stream, "request must be a JSON object");
             return .done;
         },
     };
@@ -99,11 +102,11 @@ pub fn handleAttachConnection(
         if (read_only and err == error.SessionNotFound) {
             if (session_ref) |name| {
                 if (name.len > 0) {
-                    return parkWatchSubscriber(registry, conn, name);
+                    return parkWatchSubscriber(registry, stream, name);
                 }
             }
         }
-        try writeAttachError(conn.stream, requestErrorMessage(err));
+        try writeAttachError(stream, requestErrorMessage(err));
         return .done;
     };
     // Borrow from `resolveOrSole` — released on every exit path of this
@@ -146,7 +149,7 @@ pub fn handleAttachConnection(
     client.* = .{
         .alloc = alloc,
         .session = sess,
-        .stream = conn.stream,
+        .stream = stream,
         .client_id = client_id,
         .read_only = read_only,
     };
@@ -167,14 +170,14 @@ pub fn handleAttachConnection(
 
     // Write the attach ack. Once this goes out the client flips into
     // streaming mode.
-    try writeAttachAck(conn.stream);
+    try writeAttachAck(stream);
 
     // Make the socket non-blocking from here on: every later write goes
     // through `tryWriteFrame`'s bounded-buffer path, and the drain step's
     // broadcasts must never block on a client that stopped reading. If
     // the fcntl fails (it shouldn't), drop the client rather than let a
     // blocking socket onto the broadcast list.
-    session_mod.setStreamNonBlocking(conn.stream.handle) catch {
+    session_mod.setStreamNonBlocking(stream.handle) catch {
         client.shutdown();
     };
 
@@ -234,24 +237,24 @@ pub fn writeAttachAckWaiting(stream: std.net.Stream) !void {
 
 /// Park a watch-style subscriber whose target session doesn't exist yet.
 /// Writes the waiting-ack, parks the socket on the registry's pending
-/// map, and returns `.attached` so the accept loop surrenders ownership
-/// of the stream. The socket is promoted to a real `AttachClient` the
+/// map, and returns `.attached` so the caller surrenders ownership of
+/// the stream. The socket is promoted to a real `AttachClient` the
 /// next time a session with a matching name is created.
 fn parkWatchSubscriber(
     registry: *SessionRegistry,
-    conn: *std.net.Server.Connection,
+    stream: std.net.Stream,
     name: []const u8,
 ) !ConnectionResult {
     // Send the waiting ack BEFORE parking so the client knows it's
     // subscribed. If the ack write fails the socket is already toast —
     // don't bother parking it.
-    writeAttachAckWaiting(conn.stream) catch {
+    writeAttachAckWaiting(stream) catch {
         return .done;
     };
-    _ = registry.parkPendingWatcher(name, conn.stream) catch {
+    _ = registry.parkPendingWatcher(name, stream) catch {
         // Parking failed (allocation or thread spawn). Best we can do is
         // write an error and let the client retry.
-        writeAttachError(conn.stream, "server busy; could not park pending watcher") catch {};
+        writeAttachError(stream, "server busy; could not park pending watcher") catch {};
         return .done;
     };
     return .attached;

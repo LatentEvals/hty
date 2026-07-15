@@ -156,21 +156,9 @@ pub fn build(b: *std.Build) void {
     const run_headless_tests = b.addRunArtifact(headless_tests);
     test_step.dependOn(&run_headless_tests.step);
 
-    // Event-loop core (src/loop.zig) is a standalone module with no
-    // importers yet, so Zig's test discovery can't reach it through
-    // lib.zig/headless.zig — give it its own test compilation until the
-    // server starts importing it.
-    const loop_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/loop.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-        .test_runner = test_runner,
-    });
-    const run_loop_tests = b.addRunArtifact(loop_tests);
-    test_step.dependOn(&run_loop_tests.step);
+    // Event-loop core (src/loop.zig) tests are discovered through the
+    // headless test module now that server.zig imports the loop; no
+    // standalone test compilation needed anymore.
 
     // Golden-frame VT tests. cwd is pinned to the build root so the test can
     // read/write `testdata/vt/*.golden` regardless of where `zig build` was
