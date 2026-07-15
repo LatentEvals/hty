@@ -348,14 +348,38 @@ pub const Session = struct {
     }
 };
 
+/// Put an attach/watch socket into non-blocking mode. Broadcast writes
+/// from the drain step (which holds `registry.mutex`) must never block on
+/// a client that stopped reading. The flag has to live on the fd itself:
+/// macOS ignores `MSG_DONTWAIT` on UNIX-domain sockets, so per-call flags
+/// are not enough. The attach reader loop compensates by blocking in
+/// `poll` instead of `read` (see `server_attach.attachReaderLoop`).
+pub fn setStreamNonBlocking(fd: std.posix.socket_t) !void {
+    const fl = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
+    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
+}
+
 /// One live `hty attach` connection. The main accept loop's drain step
 /// broadcasts raw PTY bytes to each attach_client on the owning session;
 /// a per-client reader thread reads input frames from the socket and
 /// forwards them back into the session's terminal.
 pub const AttachClient = struct {
+    /// Upper bound on bytes buffered for a client whose socket would block.
+    /// 1 MiB is generous — a full-screen ANSI frame is a few hundred KB at
+    /// worst — while bounding per-client memory. A client that falls further
+    /// behind is dropped (marked closed and reaped on the next drain pass):
+    /// drop-and-disconnect is the policy; observers never get to stall the
+    /// server or backpressure the PTY.
+    pub const max_pending_bytes: usize = 1 << 20;
+
     alloc: Allocator,
     session: *Session,
     stream: std.net.Stream,
+    /// Outbound bytes the socket wouldn't accept without blocking, waiting
+    /// to be flushed by the next write attempt or drain tick. Guarded by
+    /// `write_mutex`. Bounded by `max_pending_bytes`.
+    pending: std.ArrayListUnmanaged(u8) = .{},
     /// Opaque, self-describing id assigned by the server on accept. Appears
     /// in the session log in `attach_connect`, `attach_disconnect`, and
     /// `input` events whose origin is `"attach"`, so forensics can pair
@@ -390,15 +414,91 @@ pub const AttachClient = struct {
         std.posix.shutdown(self.stream.handle, .both) catch {};
     }
 
-    /// Best-effort write of a pre-framed JSONL line (with trailing '\n').
-    /// Marks the client closed on any write error so the broadcaster
-    /// will drop it on the next pass.
+    /// Best-effort, non-blocking write of a pre-framed JSONL line (with
+    /// trailing '\n'). Bytes the socket won't accept right now are queued
+    /// in `pending` (flushed on the next write or drain tick). Never blocks:
+    /// this runs from the drain step while `registry.mutex` is held, so a
+    /// stalled reader must not be able to wedge the server. Marks the
+    /// client closed — so the broadcaster drops it on the next pass — on
+    /// any real write error or when `pending` would exceed
+    /// `max_pending_bytes`.
     pub fn tryWriteFrame(self: *AttachClient, frame: []const u8) bool {
         if (self.isClosed()) return false;
         self.write_mutex.lock();
         defer self.write_mutex.unlock();
-        self.stream.writeAll(frame) catch {
-            _ = self.closed.store(true, .release);
+        // Anything already queued must go out before this frame so the
+        // client sees frames in broadcast order.
+        if (!self.flushPendingLocked()) return false;
+        var sent: usize = 0;
+        if (self.pending.items.len == 0) {
+            sent = self.sendNonBlockingLocked(frame) orelse return false;
+        }
+        if (sent < frame.len) return self.queuePendingLocked(frame[sent..]);
+        return true;
+    }
+
+    /// Give this client a chance to drain its pending buffer. Called once
+    /// per drain tick so a client that stalled during a burst catches back
+    /// up even when the session emits no further output.
+    pub fn flushPending(self: *AttachClient) void {
+        if (self.isClosed()) return;
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        _ = self.flushPendingLocked();
+    }
+
+    /// Caller holds `write_mutex`. Returns false if the client got marked
+    /// closed by a write error.
+    fn flushPendingLocked(self: *AttachClient) bool {
+        const len = self.pending.items.len;
+        if (len == 0) return true;
+        const n = self.sendNonBlockingLocked(self.pending.items) orelse return false;
+        if (n == 0) return true;
+        if (n < len) {
+            std.mem.copyForwards(u8, self.pending.items[0 .. len - n], self.pending.items[n..]);
+            self.pending.shrinkRetainingCapacity(len - n);
+        } else {
+            self.pending.clearRetainingCapacity();
+        }
+        return true;
+    }
+
+    /// Caller holds `write_mutex`. The socket is in non-blocking mode
+    /// (`setStreamNonBlocking`, done at attach setup) so a full socket
+    /// buffer surfaces as `error.WouldBlock` instead of stalling; the
+    /// MSG_DONTWAIT flag is belt-and-braces for platforms that honor it.
+    /// Returns the byte count the kernel accepted (0 when the buffer is
+    /// full), or null after marking the client closed on any real error.
+    fn sendNonBlockingLocked(self: *AttachClient, bytes: []const u8) ?usize {
+        var written: usize = 0;
+        while (written < bytes.len) {
+            const n = std.posix.send(
+                self.stream.handle,
+                bytes[written..],
+                std.posix.MSG.DONTWAIT,
+            ) catch |err| switch (err) {
+                error.WouldBlock => return written,
+                else => {
+                    self.closed.store(true, .release);
+                    return null;
+                },
+            };
+            if (n == 0) break;
+            written += n;
+        }
+        return written;
+    }
+
+    /// Caller holds `write_mutex`. Queue leftover bytes for a later flush;
+    /// a client too far behind (`max_pending_bytes`) is marked closed and
+    /// dropped instead of buffered without bound.
+    fn queuePendingLocked(self: *AttachClient, bytes: []const u8) bool {
+        if (self.pending.items.len + bytes.len > max_pending_bytes) {
+            self.closed.store(true, .release);
+            return false;
+        }
+        self.pending.appendSlice(self.alloc, bytes) catch {
+            self.closed.store(true, .release);
             return false;
         };
         return true;
@@ -408,6 +508,7 @@ pub const AttachClient = struct {
         self.shutdown();
         if (self.reader_thread) |t| t.join();
         self.stream.close();
+        self.pending.deinit(self.alloc);
         self.alloc.free(self.client_id);
         self.alloc.destroy(self);
     }

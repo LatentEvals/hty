@@ -3241,6 +3241,9 @@ fn registerAttachClient(
         .client_id = client_id,
     };
 
+    // Mirror production attach setup: broadcast sockets are non-blocking.
+    try session_mod_tests.setStreamNonBlocking(local.handle);
+
     sess.attach_mutex.lock();
     try sess.attach_clients.append(alloc, client);
     sess.attach_mutex.unlock();
@@ -4125,6 +4128,200 @@ test "issue #29: read-only input frames are dropped by the server" {
             const rows = ev.obj.get("rows") orelse continue;
             if (rows == .integer) try std.testing.expect(rows.integer != 99);
         }
+    }
+}
+
+// ============================================================================
+// Non-blocking attach broadcasts (hardening: stalled readers must not
+// wedge drainAll / registry.mutex)
+// ============================================================================
+
+test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops on overflow" {
+    const alloc = std.testing.allocator;
+
+    const pair = try makeSocketPair();
+    defer pair.peer.close();
+
+    // Build a bare AttachClient over the socketpair. tryWriteFrame /
+    // flushPending never touch `session`, so `undefined` is safe here and
+    // spares the test a full registry+PTY spawn.
+    const client_id = try alloc.dupe(u8, "attach-hardening-buffer-test");
+    errdefer alloc.free(client_id);
+    const client = try alloc.create(AttachClientTest);
+    client.* = .{
+        .alloc = alloc,
+        .session = undefined,
+        .stream = pair.local,
+        .client_id = client_id,
+    };
+    // As in production attach setup: the broadcast socket is non-blocking.
+    try session_mod_tests.setStreamNonBlocking(pair.local.handle);
+    defer client.deinit(); // closes pair.local, frees pending + client_id
+
+    // Phase 1: write 8 KiB frames without the peer reading until the
+    // kernel socket buffer fills and bytes start landing in `pending`,
+    // then a few more. Every write must report success (client under its
+    // buffer bound) and must not block.
+    var frame: [8192]u8 = undefined;
+    var expected = std.ArrayListUnmanaged(u8){};
+    defer expected.deinit(alloc);
+    var seq: u8 = 0;
+    while (true) {
+        @memset(&frame, 'a' + (seq % 26));
+        seq +%= 1;
+        try std.testing.expect(client.tryWriteFrame(&frame));
+        try expected.appendSlice(alloc, &frame);
+        client.write_mutex.lock();
+        const pending_len = client.pending.items.len;
+        client.write_mutex.unlock();
+        // Stop well under max_pending_bytes so nothing gets dropped.
+        if (pending_len >= 64 * 1024) break;
+        try std.testing.expect(expected.items.len < AttachClientTest.max_pending_bytes);
+    }
+
+    // Phase 2: drain from the peer while ticking flushPending (as drainAll
+    // does). Every byte must arrive, in write order.
+    var received: usize = 0;
+    var chunk: [8192]u8 = undefined;
+    var drain_timer = try std.time.Timer.start();
+    while (received < expected.items.len) {
+        try std.testing.expect(drain_timer.read() < 10 * std.time.ns_per_s);
+        client.flushPending();
+        const n = std.posix.recv(pair.peer.handle, &chunk, std.posix.MSG.DONTWAIT) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (n == 0) break;
+        try std.testing.expectEqualSlices(u8, expected.items[received..][0..n], chunk[0..n]);
+        received += n;
+    }
+    try std.testing.expectEqual(expected.items.len, received);
+    try std.testing.expect(!client.isClosed());
+
+    // Phase 3: stop reading entirely and flood. Once the socket buffer
+    // plus max_pending_bytes are exhausted, tryWriteFrame must give up
+    // (returning false) and mark the client closed — never block.
+    var dropped = false;
+    var i: usize = 0;
+    // 8 KiB per frame; the 1 MiB cap plus kernel buffer is < 1024 frames.
+    while (i < 1024) : (i += 1) {
+        if (!client.tryWriteFrame(&frame)) {
+            dropped = true;
+            break;
+        }
+    }
+    try std.testing.expect(dropped);
+    try std.testing.expect(client.isClosed());
+}
+
+test "hardening: stalled attach reader does not block drainAll; concurrent list completes and client is reaped" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "stalled-reader");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    // Spawn a session that bursts ~700 KB of output. Hex framing doubles
+    // that on the attach wire, so the stalled client below must blow
+    // through the kernel socket buffer plus the 1 MiB pending cap.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "stalled",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "head -c 700000 /dev/zero | tr '\\0' x; sleep 30" },
+            .rows = 24,
+            .cols = 200,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Attach a client whose peer end never reads a single byte —
+    // the pathological Ctrl-Z'd `hty watch`.
+    const pair = try makeSocketPair();
+    defer pair.peer.close();
+    const sess = try sessionByName(&registry, "stalled");
+    _ = try registerAttachClient(alloc, sess, pair.local);
+
+    // Tick drainAll on a background thread like the real accept loop.
+    // Before this hardening, the first broadcast that filled the stalled
+    // socket blocked inside writeAll while holding registry.mutex, so the
+    // ticker wedged and every RPC below hung forever.
+    var ticker = RegistryTicker{ .registry = &registry };
+    try ticker.start();
+    defer ticker.stopAndJoin();
+
+    // While the burst floods the broadcast path, `list` RPCs (which
+    // contend on registry.mutex with drainAll) must keep completing, and
+    // the overflowed client must get dropped + reaped. No per-call
+    // stopwatch inside the flood: a drain tick honestly ingesting the
+    // burst may hold registry.mutex for a while in Debug builds. The
+    // pre-fix failure mode — drainAll blocked forever inside writeAll on
+    // the stalled socket — makes the first `list` below never return
+    // (and `reaped` can never flip), so this loop still catches it.
+    var reaped = false;
+    var overall_timer = try std.time.Timer.start();
+    while (overall_timer.read() < 60 * std.time.ns_per_s) {
+        {
+            var parsed = try testRequest(&registry, .{ .op = "list" });
+            defer parsed.deinit();
+            _ = try expectTestOk(parsed);
+        }
+        sess.attach_mutex.lock();
+        const remaining = sess.attach_clients.items.len;
+        sess.attach_mutex.unlock();
+        if (remaining == 0) {
+            reaped = true;
+            break;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(reaped);
+
+    // Once the session goes quiet (burst fully ingested), drain ticks are
+    // cheap again and a concurrent `list` must meet its usual budget.
+    {
+        var idle = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "stalled",
+            .idle_ms = 300,
+            .timeout_ms = 60_000,
+        });
+        defer idle.deinit();
+        _ = try expectTestOk(idle);
+    }
+    var list_timer = try std.time.Timer.start();
+    {
+        var parsed = try testRequest(&registry, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(list_timer.read() < 2 * std.time.ns_per_s);
+
+    // The dropped client must have gotten an attach_disconnect event.
+    // (readAttachLog caps at 1 MiB; this log carries the whole burst as
+    // hex output events, so read it with a larger cap.)
+    {
+        const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/stalled.jsonl", .{log_dir});
+        defer alloc.free(link_path);
+        const file = try std.fs.openFileAbsolute(link_path, .{});
+        defer file.close();
+        const contents = try file.readToEndAlloc(alloc, 64 * 1024 * 1024);
+        defer alloc.free(contents);
+        try std.testing.expect(std.mem.indexOf(u8, contents, "\"kind\":\"attach_disconnect\"") != null);
+    }
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "stalled" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
     }
 }
 
