@@ -1096,8 +1096,8 @@ const LoopServer = struct {
     /// client got marked closed (broadcast overflow, exit broadcast,
     /// write error), keep POLLOUT armed exactly for subscribers with
     /// buffered frames, and promote pending watchers whose session now
-    /// exists (spawn turned into a state flip — the old PendingWatcher
-    /// promotion, minus the thread and self-pipe).
+    /// exists (spawn turned into a state flip — formerly a dedicated
+    /// watcher thread woken through a self-pipe).
     fn syncSubscribers(self: *LoopServer) void {
         var to_reap: std.ArrayListUnmanaged(*Conn) = .{};
         defer to_reap.deinit(self.alloc);
@@ -1130,8 +1130,8 @@ const LoopServer = struct {
 
     /// Promote a parked watch conn if a session with its exact name has
     /// appeared. Sends the `started` frame and the initial snapshot, then
-    /// flips the conn to `attached` — same wire sequence the old
-    /// PendingWatcher promotion produced.
+    /// flips the conn to `attached` — same wire sequence the pre-loop
+    /// watcher-promotion path produced.
     fn tryPromotePendingWatch(self: *LoopServer, conn: *Conn) void {
         const name = conn.pending_watch_name orelse return;
         const sess = self.registry.findByName(name) orelse return;

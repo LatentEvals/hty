@@ -4665,6 +4665,168 @@ test "event loop: pending-input overflow drops without stalling the server" {
     }
 }
 
+// Combined degradation (PRD close-out): the two pathological clients the
+// loop must isolate — a stalled attach reader and a wedged PTY child —
+// hit the server *concurrently*. Only the affected session/conn may
+// suffer (watcher reaped on overflow, wedged session's input dropped);
+// `list` keeps answering within budget throughout, and a third, healthy
+// session stays fully interactive.
+test "event loop: stalled reader + wedged child degrade only themselves; list keeps answering" {
+    const alloc = std.testing.allocator;
+
+    const harness = try startServerHarness(alloc, "degrade");
+    defer {
+        harness.deinit(alloc);
+        alloc.destroy(harness);
+    }
+
+    // Session 1 — wedged child: stops itself before exec'ing cat, so
+    // nothing ever reads its tty; input past the 64 KiB pending-input
+    // bound must be dropped, never stall the loop.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "deg-wedged",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "kill -STOP $$; exec cat" },
+            .rows = 24,
+            .cols = 80,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Session 2 — output burst (~700 KB; hex framing doubles it on the
+    // attach wire) that must blow the stalled watcher below through the
+    // kernel socket buffer plus the 1 MiB conn outbound cap.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "deg-burst",
+            .program = "/bin/sh",
+            .args = [_][]const u8{ "-c", "sleep 0.3; head -c 700000 /dev/zero | tr '\\0' x; sleep 30" },
+            .rows = 24,
+            .cols = 200,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Session 3 — healthy control: plain `cat` with tty echo.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "spawn",
+            .name = "deg-healthy",
+            .program = "/bin/cat",
+            .rows = 10,
+            .cols = 120,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // The stalled reader: watch the burst session over the real socket
+    // protocol, read the ack, then never read another byte.
+    const stalled = try openStreamingConn(harness.socket_path, "{\"op\":\"watch\",\"session\":\"deg-burst\"}");
+    defer stalled.close();
+    {
+        var reader = LineReader.init(alloc, stalled);
+        defer reader.deinit();
+        const ack = try reader.readLine(2000);
+        alloc.free(ack);
+    }
+
+    // While the burst floods the stalled watcher, flood the wedged
+    // session with 320 KiB of input (40 x 8 KiB frames — 5x past the
+    // 64 KiB bound), interleaving a `list` after every send. Every
+    // request must complete promptly; a stalled loop would hang the
+    // first blocked one forever.
+    var payload: [8192]u8 = undefined;
+    @memset(&payload, 'x');
+    var payload_hex: [16384]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (payload, 0..) |b, i| {
+        payload_hex[i * 2] = hex_chars[b >> 4];
+        payload_hex[i * 2 + 1] = hex_chars[b & 0xf];
+    }
+    var flood_timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        {
+            var parsed = try socketRequest(alloc, harness.socket_path, .{
+                .op = "send_bytes_hex",
+                .session = "deg-wedged",
+                .bytes_hex = @as([]const u8, &payload_hex),
+            });
+            defer parsed.deinit();
+            _ = try expectTestOk(parsed);
+        }
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(flood_timer.read() < 60 * std.time.ns_per_s);
+
+    // The stalled watcher — and only that conn — gets reaped: its
+    // `attach_disconnect` shows up in the burst session's log while
+    // `list` keeps answering.
+    var dropped = false;
+    var overall_timer = try std.time.Timer.start();
+    const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/deg-burst.jsonl", .{harness.log_dir});
+    defer alloc.free(link_path);
+    while (overall_timer.read() < 60 * std.time.ns_per_s) {
+        {
+            var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+            defer parsed.deinit();
+            _ = try expectTestOk(parsed);
+        }
+        const file = std.fs.openFileAbsolute(link_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer file.close();
+        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer alloc.free(contents);
+        if (std.mem.indexOf(u8, contents, "\"kind\":\"attach_disconnect\"") != null) {
+            dropped = true;
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(dropped);
+
+    // The healthy session never noticed: a send_text/wait_for_text
+    // round-trip through its tty echo completes normally.
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{
+            .op = "send_text",
+            .session = "deg-healthy",
+            .text = "HEALTHY-OK",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try expectTextFound(alloc, harness.socket_path, "deg-healthy", "HEALTHY-OK");
+
+    // And `list` still meets its usual budget.
+    var list_timer = try std.time.Timer.start();
+    {
+        var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    try std.testing.expect(list_timer.read() < 2 * std.time.ns_per_s);
+
+    for ([_][]const u8{ "deg-wedged", "deg-burst", "deg-healthy" }) |name| {
+        var kill_parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "kill", .session = name });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
 // With PTY fds on the loop, a parked `wait_for_text` must resolve in the
 // same iteration its output arrives: send input, and the tty echo wakes
 // poll, gets fed, and completes the waiter — no tick quantization. The
