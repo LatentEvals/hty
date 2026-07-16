@@ -1,20 +1,27 @@
 //! SessionRegistry — the server's top-level container for all active and
 //! zombie sessions. Owns a `by_id` map (UUID -> Session) and a `name_index`
-//! for the human-friendly alias lookup, plus a `drainAll` that pumps queued
-//! PTY events out to the log file, to attach broadcasters, and into session
-//! lifecycle bookkeeping.
+//! for the human-friendly alias lookup, plus the PTY servicing pipeline:
+//! the event loop (or the in-process `pump`) reads each session's master
+//! fd and dispatches output synchronously — VT feed, session log, attach
+//! broadcast, lifecycle transitions.
+//!
+//! Single-threaded by design: every function here runs on the server's
+//! one event-loop thread (or the single test thread). There are no locks,
+//! no atomics, and no refcounts — session lifetime is structural. Deleting
+//! a session (`remove`) unpublishes it from the maps immediately and parks
+//! it on the `doomed` list; the storage is freed in a deferred phase
+//! (`freeDoomed`, run by the loop at end of iteration and by `deinit`),
+//! never in the middle of a dispatch that may still hold the pointer.
 //!
 //! The registry does not own the log directory path — it's borrowed from
 //! the caller (usually `runServer`) and may be null in unit tests, which
-//! makes session spawn/drain hooks silently skip log-file operations.
+//! makes session spawn/servicing hooks silently skip log-file operations.
 
 const std = @import("std");
 const hty = @import("hty");
 const session_mod = @import("session.zig");
 const uuid_mod = @import("uuid.zig");
 const log_mod = @import("log.zig");
-// (hex/attach-client bring-up moved to server_attach.zig with the rest of
-// the subscriber machinery.)
 const attach = @import("attach.zig");
 
 const Allocator = std.mem.Allocator;
@@ -25,14 +32,15 @@ pub const SessionRegistry = struct {
     by_id: std.StringHashMapUnmanaged(*Session) = .{},
     name_index: std.StringHashMapUnmanaged(*Session) = .{},
     /// Absolute path to the session log directory. Borrowed from the caller
-    /// (runServer owns the allocation). If null, session spawn/drain hooks
-    /// skip log-file operations — used by unit tests.
+    /// (runServer owns the allocation). If null, session spawn/servicing
+    /// hooks skip log-file operations — used by unit tests.
     log_dir: ?[]const u8 = null,
-    /// Protects the two maps above against concurrent access from worker
-    /// threads running RPC handlers and the accept thread running drainAll.
-    /// Lock order: registry_mutex → (any session-local mutex). Never
-    /// acquired while holding a session-local lock.
-    mutex: std.Thread.Mutex = .{},
+    /// Sessions unpublished from the maps but not yet freed. `remove`
+    /// appends here; `freeDoomed` (the loop's end-of-iteration deferred-
+    /// free phase, or `deinit`) tears them down. Deferral guarantees a
+    /// `*Session` obtained by resolve stays valid for the remainder of
+    /// the current dispatch/iteration even if that dispatch deletes it.
+    doomed: std.ArrayListUnmanaged(*Session) = .{},
     /// Unix-epoch milliseconds at which this registry was created. Used by
     /// `hty info --json` to report the server's uptime.
     started_at_ms: i64 = 0,
@@ -45,7 +53,8 @@ pub const SessionRegistry = struct {
     }
 
     pub fn deinit(self: *SessionRegistry) void {
-        // No lock needed: callers must drop all references before deinit.
+        self.freeDoomed();
+        self.doomed.deinit(self.alloc);
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {
             sess_ptr.*.deinit();
@@ -64,17 +73,11 @@ pub const SessionRegistry = struct {
         args_joined_owned: []u8,
         name_owned: ?[]u8,
     ) !*Session {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         if (name_owned) |n| {
             if (self.name_index.contains(n)) return error.NameAlreadyExists;
             // `nameInUse` is a single O(1) access on the authoritative
             // by-name symlink (a one-time startup reconciliation covers
-            // logs from older hty versions). We hold the registry lock
-            // across it because the alternative — check without the lock,
-            // then take it — is TOCTOU-prone and session creation is
-            // cold-path.
+            // logs from older hty versions).
             if (log_mod.nameInUse(self.alloc, self.log_dir, n)) return error.NameAlreadyExists;
         }
 
@@ -82,7 +85,6 @@ pub const SessionRegistry = struct {
         errdefer self.alloc.destroy(sess);
 
         const now = std.time.milliTimestamp();
-        const atomics = Session.initAtomics(now);
         sess.* = .{
             .alloc = self.alloc,
             .id = undefined,
@@ -91,17 +93,13 @@ pub const SessionRegistry = struct {
             .program = program_owned,
             .args_joined = args_joined_owned,
             .created_at_ms = now,
-            .last_screen_change_at_ms_atomic = atomics.last_screen_change_at_ms_atomic,
-            .status_atomic = atomics.status_atomic,
-            .exit_code_atomic = atomics.exit_code_atomic,
+            .last_screen_change_at_ms = now,
         };
         uuid_mod.generateUuidV7(&sess.id);
 
-        // Server sessions write PTY input through the per-session pending
-        // buffer, which needs a non-blocking master fd (a child that stops
-        // reading its tty must surface WouldBlock, never stall the event
-        // loop). The library reader thread tolerates the flag by waiting
-        // in poll() when a read would block.
+        // Server sessions are serviced by the event loop (or the pump):
+        // the master fd must be non-blocking so reads stop at WouldBlock
+        // and queued input writes can never stall the loop.
         session_mod.setStreamNonBlocking(terminal.master_fd) catch {};
 
         try self.by_id.put(self.alloc, &sess.id, sess);
@@ -112,56 +110,18 @@ pub const SessionRegistry = struct {
     /// Exact-name lookup used by the event loop to promote parked
     /// `pending_watch` connections when their target session appears.
     /// Prefix/id resolution is deliberately not applied — promotion keys
-    /// on the exact name the watcher asked for, matching the semantics of
-    /// the old pending-watcher bucket. On a hit the session's refcount is
-    /// incremented; the caller borrows the pointer and MUST pair the call
-    /// with `release()`.
+    /// on the exact name the watcher asked for. The returned pointer is
+    /// valid for the current iteration (structural guarantee: frees are
+    /// deferred to the end-of-iteration phase).
     pub fn findByName(self: *SessionRegistry, name: []const u8) ?*Session {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sess = self.name_index.get(name) orelse return null;
-        sess.ref_count += 1;
-        return sess;
-    }
-
-    /// Flush every session's pending-input buffer as far as the master fd
-    /// allows, and collect the master fds of sessions that still have
-    /// queued input — the event loop arms POLLOUT on those so the next
-    /// writability wakes it for another flush.
-    pub fn flushPendingInputAll(
-        self: *SessionRegistry,
-        alloc: Allocator,
-        still_pending: *std.ArrayListUnmanaged(std.posix.fd_t),
-    ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var it = self.by_id.valueIterator();
-        while (it.next()) |sess_ptr| {
-            const sess = sess_ptr.*;
-            sess.flushPendingInput();
-            if (sess.hasPendingInput()) {
-                still_pending.append(alloc, sess.terminal.master_fd) catch {};
-            }
-        }
+        return self.name_index.get(name);
     }
 
     /// Resolve a session reference (full UUID, unique prefix, or name).
-    /// Returns null if no match. Returns error.AmbiguousPrefix if prefix matches 2+.
-    /// On a successful (non-null) resolve the session's refcount is
-    /// incremented — the caller borrows the pointer and MUST pair the call
-    /// with `release()` on every exit path.
+    /// Returns null if no match. Returns error.AmbiguousPrefix if prefix
+    /// matches 2+. The returned pointer is valid for the duration of the
+    /// current dispatch/iteration.
     pub fn resolve(self: *SessionRegistry, reference: []const u8) !?*Session {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sess = try self.resolveLocked(reference);
-        if (sess) |s| s.ref_count += 1;
-        return sess;
-    }
-
-    /// Caller must hold `self.mutex`. Used internally by `resolve` and by
-    /// operations like `resolveOrSole` that need to do multiple map reads
-    /// under a single lock.
-    fn resolveLocked(self: *SessionRegistry, reference: []const u8) !?*Session {
         if (self.by_id.get(reference)) |sess| return sess;
         if (self.name_index.get(reference)) |sess| return sess;
         var match_count: usize = 0;
@@ -177,153 +137,254 @@ pub const SessionRegistry = struct {
         return match;
     }
 
-    /// Resolve or pick the sole session when reference is null.
-    /// On success the session's refcount is incremented while `self.mutex`
-    /// is still held — the caller borrows the pointer and MUST pair the
-    /// call with `release()` on every exit path (typically via `defer`).
-    /// The borrow keeps the Session storage alive across a concurrent
-    /// `hty delete` / `--remove` sweep; those unpublish the session
-    /// immediately, but the memory is only freed once the last borrow is
-    /// released.
+    /// Resolve or pick the sole session when reference is null. The
+    /// returned pointer is valid for the duration of the current dispatch
+    /// — nothing else runs on this thread, and deletion defers the free
+    /// to the loop's end-of-iteration phase.
     pub fn resolveOrSole(self: *SessionRegistry, reference: ?[]const u8) !*Session {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const sess = blk: {
-            if (reference) |r| {
-                break :blk (try self.resolveLocked(r)) orelse return error.SessionNotFound;
-            }
-            if (self.by_id.count() == 0) return error.SessionNotFound;
-            if (self.by_id.count() > 1) return error.AmbiguousPrefix;
-            var it = self.by_id.valueIterator();
-            break :blk it.next().?.*;
-        };
-        sess.ref_count += 1;
-        return sess;
-    }
-
-    /// Drop a borrow acquired by `resolve` / `resolveOrSole`. If the
-    /// session was doomed (unpublished by `removeLocked`) and this was the
-    /// last borrow, the session is freed here. The free runs outside
-    /// `self.mutex`: nothing else can reach the session anymore (it's out
-    /// of both maps and the count is zero), and `Session.deinit` joins
-    /// attach reader threads, which we don't want serialized under the
-    /// registry lock.
-    pub fn release(self: *SessionRegistry, sess: *Session) void {
-        self.mutex.lock();
-        std.debug.assert(sess.ref_count > 0);
-        sess.ref_count -= 1;
-        const free_now = sess.ref_count == 0 and sess.isDoomed();
-        self.mutex.unlock();
-        if (free_now) {
-            sess.deinit();
-            self.alloc.destroy(sess);
+        if (reference) |r| {
+            return (try self.resolve(r)) orelse error.SessionNotFound;
         }
+        if (self.by_id.count() == 0) return error.SessionNotFound;
+        if (self.by_id.count() > 1) return error.AmbiguousPrefix;
+        var it = self.by_id.valueIterator();
+        return it.next().?.*;
     }
 
+    /// Unpublish a session: no resolve can find it afterwards, and it is
+    /// marked doomed so parked waiters resolve with the structured
+    /// session-not-found result. The storage is NOT freed here — it lands
+    /// on the doomed list and is torn down by `freeDoomed`.
     pub fn remove(self: *SessionRegistry, sess: *Session) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.removeLocked(sess);
-    }
-
-    /// Caller must hold `self.mutex`. Unpublishes the session from both
-    /// maps immediately — no new resolve can find it — and marks it
-    /// doomed. If no handler currently borrows the session it is torn
-    /// down and freed right here; otherwise the last `release()` frees
-    /// it. Used by the locked auto-remove sweep in `drainAll` and by the
-    /// public `remove` (which takes the lock first).
-    pub fn removeLocked(self: *SessionRegistry, sess: *Session) void {
         _ = self.by_id.remove(&sess.id);
         if (sess.name) |n| _ = self.name_index.remove(n);
-        sess.doomed_atomic.store(true, .release);
-        if (sess.ref_count == 0) {
+        sess.doomed = true;
+        self.doomed.append(self.alloc, sess) catch {
+            // Can't park it for deferred free (OOM): freeing immediately
+            // would risk a mid-dispatch UAF, leaking one session under
+            // memory exhaustion is the lesser evil.
+        };
+    }
+
+    /// Deferred-free phase: tear down every doomed session. The event
+    /// loop calls this at the end of each iteration (after waiters on
+    /// doomed sessions have been resolved); `deinit` calls it as a
+    /// backstop for the in-process path.
+    pub fn freeDoomed(self: *SessionRegistry) void {
+        for (self.doomed.items) |sess| {
             sess.deinit();
             self.alloc.destroy(sess);
         }
+        self.doomed.clearRetainingCapacity();
     }
 
-    /// Drain any queued events, updating last_screen_change_at, status, the
-    /// session log file, and any attached `hty attach` clients. Does **not**
-    /// remove sessions from the registry — ended sessions linger as records
-    /// that `hty list` / `hty logs` / `hty replay` can still find, until
-    /// explicitly removed with `hty delete`.
-    ///
-    /// Holds `registry.mutex` for the whole iteration so workers can't
-    /// remove a session mid-drain. The per-session work inside the loop
-    /// acquires session-local locks (terminal, log, attach) — these are
-    /// always taken after `registry.mutex`, matching the declared lock order.
-    pub fn drainAll(self: *SessionRegistry) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    /// Outcome of one `servicePty` pass, from the loop's point of view.
+    pub const PtyService = enum {
+        /// PTY still open; keep polling it.
+        open,
+        /// Child gone and reaped — exit fully processed (now or earlier).
+        reaped,
+        /// EOF observed (or the fd was closed by kill) but the child
+        /// wasn't reapable yet — retry shortly.
+        reap_pending,
+        /// PTY read failed; the session was marked failed and its fd is
+        /// no longer polled.
+        broken,
+    };
 
+    /// Service one session's PTY: read whatever the master fd has ready
+    /// (8 KiB chunks, until WouldBlock) and dispatch it synchronously; on
+    /// EOF/EIO, reap the child with waitpid(WNOHANG) and run the exit
+    /// transition. Also the reap-retry entry point for sessions whose fd
+    /// was closed by `kill`.
+    pub fn servicePty(self: *SessionRegistry, sess: *Session) PtyService {
+        const term = sess.terminal;
+        if (term.reaped) return .reaped;
+        if (!term.closed and sess.pty_state == .open) {
+            switch (self.pumpSession(sess)) {
+                .open => return .open,
+                .eof => {},
+                .broken => return .broken,
+            }
+        }
+        if (sess.pty_state == .broken) return .broken;
+        return if (self.reapSession(sess)) .reaped else .reap_pending;
+    }
+
+    const PumpResult = enum { open, eof, broken };
+
+    /// Drain readable PTY output into the dispatch pipeline. Bounded per
+    /// call: a child that produces output faster than we ingest it (a
+    /// `yes`-style firehose) must not pin the loop in this read loop —
+    /// after the cap the fd is still readable, so the next poll iteration
+    /// resumes right away with the other fds serviced in between.
+    fn pumpSession(self: *SessionRegistry, sess: *Session) PumpResult {
+        var buffer: [8192]u8 = undefined;
+        var chunks: usize = 0;
+        while (chunks < 32) : (chunks += 1) {
+            const n = std.posix.read(sess.terminal.master_fd, &buffer) catch |err| switch (err) {
+                error.WouldBlock => return .open,
+                error.InputOutput, error.NotOpenForReading => {
+                    sess.pty_state = .eof;
+                    return .eof;
+                },
+                else => {
+                    sess.pty_state = .broken;
+                    self.applyFailure(sess, err);
+                    return .broken;
+                },
+            };
+            if (n == 0) {
+                sess.pty_state = .eof;
+                return .eof;
+            }
+            self.dispatchOutput(sess, buffer[0..n]);
+        }
+        return .open;
+    }
+
+    /// Synchronous per-chunk output dispatch: mouse-mode sniffing, log
+    /// append, attach broadcast, VT feed (with title-change and bell
+    /// logging), and the screen-change stamp that wakes idle/text waiters.
+    fn dispatchOutput(self: *SessionRegistry, sess: *Session, bytes: []const u8) void {
+        const now = std.time.milliTimestamp();
+        // Sniff DEC private-mode toggles (CSI ? Pm h/l) out of the output
+        // stream so `hty send --click` knows which apps have opted into
+        // mouse input and which encoding they prefer. See issue #24.
+        session_mod.applyMouseModeTogglesFromOutput(&sess.mouse_state, bytes);
+        log_mod.logOutputEvent(sess, now, bytes);
+        attach.broadcastRawBytesToAttach(sess, bytes);
+        for (bytes) |byte| {
+            if (byte == 0x07) log_mod.logBellEvent(sess, now);
+        }
+        if (sess.terminal.feedOutput(bytes)) |title| {
+            defer self.alloc.free(title);
+            log_mod.logTitleEvent(sess, now, title);
+        }
+        if (sess.terminal.config.emit_screen_updates) {
+            sess.touchLastScreenChange(now);
+        }
+    }
+
+    /// Try to reap the session's child without blocking. Returns true
+    /// once the child has been reaped (by this call or earlier); false
+    /// when it hasn't exited yet (caller retries). On a successful reap
+    /// the exit transition runs immediately: status flip, exit log
+    /// record, attach broadcast, log close.
+    pub fn reapSession(self: *SessionRegistry, sess: *Session) bool {
+        const term = sess.terminal;
+        if (term.reaped) return true;
+        const result = std.posix.waitpid(term.child_pid, std.posix.W.NOHANG);
+        if (result.pid == 0) return false;
+        const status = result.status;
+        const code: ?i32 = if (std.posix.W.IFEXITED(status))
+            @as(i32, @intCast(std.posix.W.EXITSTATUS(status)))
+        else if (std.posix.W.IFSIGNALED(status))
+            -@as(i32, @intCast(std.posix.W.TERMSIG(status)))
+        else
+            null;
+        term.noteChildExit(code);
+        self.applyExit(sess, code);
+        return true;
+    }
+
+    /// Exit transition. Only fires from `.running` — if the session was
+    /// already marked `.killed` by handleKill, the child's death from the
+    /// SIGKILL must not overwrite that status (and killed sessions never
+    /// broadcast an exit frame, preserving the historical behavior).
+    fn applyExit(self: *SessionRegistry, sess: *Session, code: ?i32) void {
+        _ = self;
+        if (sess.getStatus() != .running) return;
+        const now = std.time.milliTimestamp();
+        sess.setExitCode(code);
+        sess.setStatus(.exited);
+        sess.markTerminal(now);
+        log_mod.logExitedEvent(sess, now, code);
+        attach.broadcastExitedToAttach(sess, code);
+        log_mod.closeLogFile(sess);
+        // Name stays reserved until `hty delete` so `hty replay NAME`
+        // still finds the session.
+    }
+
+    /// Failure transition for an unexpected master-fd read error.
+    fn applyFailure(self: *SessionRegistry, sess: *Session, err: anyerror) void {
+        _ = self;
+        if (sess.getStatus() != .running) return;
+        const now = std.time.milliTimestamp();
+        sess.setStatus(.failed);
+        sess.markTerminal(now);
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "pty read failed: {s}", .{@errorName(err)}) catch "pty read failed";
+        log_mod.logFailureEvent(sess, now, msg);
+        log_mod.closeLogFile(sess);
+    }
+
+    /// True while any session's dead (or killed) child still needs a
+    /// waitpid retry. The loop keeps a short retry deadline armed while
+    /// this holds.
+    pub fn anyReapPending(self: *SessionRegistry) bool {
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {
             const sess = sess_ptr.*;
-            while (sess.terminal.pollEvent()) |event| {
-                const now = std.time.milliTimestamp();
-                switch (event) {
-                    .screen_update => sess.touchLastScreenChange(now),
-                    .exited => |code| {
-                        // Only transition from .running — if the session
-                        // was already marked .killed by handleKill, don't
-                        // overwrite that with .exited when the child dies
-                        // from the SIGKILL.
-                        if (sess.getStatus() == .running) {
-                            // Write exit_code before status so the release
-                            // store on status publishes both atomically.
-                            sess.setExitCode(code orelse Session.no_exit_code);
-                            sess.setStatus(.exited);
-                            sess.markTerminal(now);
-                            log_mod.logDrainedEvent(sess, now, event);
-                            attach.broadcastExitedToAttach(sess, code);
-                            log_mod.closeLogFile(sess);
-                            // Name stays reserved until `hty delete` so
-                            // `hty replay NAME` still finds the session.
-                        }
-                    },
-                    .failure => {
-                        if (sess.getStatus() == .running) {
-                            sess.setStatus(.failed);
-                            sess.markTerminal(now);
-                            log_mod.logDrainedEvent(sess, now, event);
-                            log_mod.closeLogFile(sess);
-                        }
-                    },
-                    .raw_bytes => |bytes| {
-                        // Sniff DEC private-mode toggles (CSI ? Pm h/l)
-                        // out of the output stream so `hty send --click`
-                        // knows which apps have opted into mouse input
-                        // and which encoding they prefer. See issue #24.
-                        session_mod.applyMouseModeTogglesFromOutput(&sess.mouse_state, bytes);
-                        log_mod.logDrainedEvent(sess, now, event);
-                        attach.broadcastRawBytesToAttach(sess, bytes);
-                    },
-                    .title_changed, .bell => log_mod.logDrainedEvent(sess, now, event),
-                    else => {},
-                }
-                var owned = event;
-                owned.deinit(sess.alloc);
-            }
-            // Push out any bytes buffered for momentarily-slow attach
-            // clients (non-blocking; a client over its buffer bound is
-            // marked closed and picked up by the reap below).
-            attach.flushPendingToAttach(sess);
-            // Reap any self-owned attach clients that have closed (the
-            // event loop reaps conn-owned ones itself).
-            attach.reapClosedAttachClients(sess);
-            // Backstop flush for queued PTY input; the event loop also
-            // flushes on master-fd writability.
-            sess.flushPendingInput();
+            const term = sess.terminal;
+            if (!term.reaped and (term.closed or sess.pty_state == .eof)) return true;
         }
+        return false;
+    }
 
-        // Auto-remove sweep for `--remove` sessions whose child has
-        // exited. Removal is immediate: `removeLocked` unpublishes the
-        // session from the maps and any in-flight wait/snapshot handler
-        // is protected by the borrow it acquired at resolve time (the
-        // last release frees the storage). The sweep runs under
-        // `self.mutex`, same lock the maps + session teardown need, so
-        // racing `hty kill` / `hty delete` can't double-free: whichever
-        // path wins the mutex observes the other's state change.
+    /// Retry every pending reap once. Returns true when at least one
+    /// child still isn't reapable (retry again later).
+    pub fn retryReaps(self: *SessionRegistry) bool {
+        var pending = false;
+        var it = self.by_id.valueIterator();
+        while (it.next()) |sess_ptr| {
+            const sess = sess_ptr.*;
+            const term = sess.terminal;
+            if (term.reaped or !(term.closed or sess.pty_state == .eof)) continue;
+            if (!self.reapSession(sess)) pending = true;
+        }
+        return pending;
+    }
+
+    /// One entry the event loop should poll for a session PTY.
+    pub const PtyInterest = struct {
+        fd: std.posix.fd_t,
+        sess: *Session,
+        /// Arm POLLOUT: the session has queued input waiting for the
+        /// master fd to become writable.
+        write: bool,
+    };
+
+    /// Collect the master fds the loop should poll this iteration: every
+    /// live session's fd, with write interest exactly when input is
+    /// queued. Flushes pending input opportunistically along the way (the
+    /// backstop the old drain tick provided).
+    pub fn collectPtyInterest(
+        self: *SessionRegistry,
+        alloc: Allocator,
+        out: *std.ArrayListUnmanaged(PtyInterest),
+    ) void {
+        var it = self.by_id.valueIterator();
+        while (it.next()) |sess_ptr| {
+            const sess = sess_ptr.*;
+            const term = sess.terminal;
+            if (term.closed or term.reaped or sess.pty_state != .open) continue;
+            sess.flushPendingInput();
+            out.append(alloc, .{
+                .fd = term.master_fd,
+                .sess = sess,
+                .write = sess.hasPendingInput(),
+            }) catch {};
+        }
+    }
+
+    /// Auto-remove sweep for `--remove` sessions that have left the
+    /// running state. Removal is immediate at the map level (no resolve
+    /// can find the session afterwards) and mirrors `handleDelete`'s
+    /// filesystem cleanup; the storage free is deferred like any other
+    /// removal. Runs on the iteration that observes the exit (the loop's
+    /// end-of-iteration phase) and on every in-process pump.
+    pub fn autoRemoveSweep(self: *SessionRegistry) void {
         var to_remove: std.ArrayListUnmanaged(*Session) = .{};
         defer to_remove.deinit(self.alloc);
         var sweep_it = self.by_id.valueIterator();
@@ -357,8 +418,26 @@ pub const SessionRegistry = struct {
                     } else |_| {}
                 }
             }
-            self.removeLocked(sess);
+            self.remove(sess);
         }
+    }
+
+    /// In-process servicing shell: the loop-less equivalent of one event-
+    /// loop iteration's PTY phase, used by `processRequestLine`-driven
+    /// waits and tests. Services every session's PTY, gives attach
+    /// buffers a flush/reap pass, and runs the auto-remove sweep. Does
+    /// NOT free doomed sessions — in-process callers may still hold
+    /// pointers; `deinit` frees them.
+    pub fn pump(self: *SessionRegistry) void {
+        var it = self.by_id.valueIterator();
+        while (it.next()) |sess_ptr| {
+            const sess = sess_ptr.*;
+            _ = self.servicePty(sess);
+            attach.flushPendingToAttach(sess);
+            attach.reapClosedAttachClients(sess);
+            sess.flushPendingInput();
+        }
+        self.autoRemoveSweep();
     }
 
     /// Number of sessions still running. Exited/failed sessions are held in
@@ -366,8 +445,6 @@ pub const SessionRegistry = struct {
     /// or the server auto-shuts-down. Used by the auto-shutdown timer — we
     /// don't want zombies to block an otherwise-idle server from exiting.
     pub fn activeCount(self: *SessionRegistry) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         var count: usize = 0;
         var it = self.by_id.valueIterator();
         while (it.next()) |sess_ptr| {

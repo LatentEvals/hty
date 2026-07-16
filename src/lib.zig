@@ -41,6 +41,18 @@ pub const TerminalConfig = struct {
     emit_screen_updates: bool = true,
     cell_width: u32 = 9,
     cell_height: u32 = 18,
+    /// LIBRARY / SERVER SPLIT. When true (the default), `spawn` starts a
+    /// background reader thread that pumps `master_fd` into the VT stream
+    /// and publishes `OutputEvent`s through the mutex-guarded queue that
+    /// `pollEvent` drains — the embedding-friendly surface library users
+    /// consume. The hty server passes false: its single-threaded event
+    /// loop polls `master_fd` itself and feeds output synchronously via
+    /// `feedOutput`, so no thread is started and no events are queued
+    /// (nothing would ever drain them). Whether the library surface
+    /// should also expose fd-driven operation and deprecate the reader
+    /// thread + event queue outright is an open question, deliberately
+    /// deferred — embedders keep the thread for now.
+    run_reader_thread: bool = true,
 };
 
 pub const InputEvent = union(enum) {
@@ -122,6 +134,12 @@ pub const InteractiveTerminal = struct {
     events_head: usize = 0,
     closed: bool = false,
     exit_code: ?i32 = null,
+    /// True once the child has been reaped (waitpid succeeded). The
+    /// reader thread sets it after its blocking waitpid; on the
+    /// threadless server path the event loop sets it via `noteChildExit`
+    /// and `deinit` performs a final blocking reap when it is still
+    /// false (right after `kill()`'s SIGKILL, so the wait is prompt).
+    reaped: bool = false,
     last_title: ?[]u8 = null,
     /// Number of screen snapshots taken, full (`snapshot`) and plain
     /// (`plainSnapshot`) alike. Test-visible: the wait-loop tests assert
@@ -212,8 +230,10 @@ pub const InteractiveTerminal = struct {
         // exit would hang `wait_for_exit` until its timeout).
         try self.events.ensureTotalCapacity(alloc, initial_event_capacity);
 
-        self.pushEvent(.started);
-        self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
+        if (config.run_reader_thread) {
+            self.pushEvent(.started);
+            self.reader_thread = try std.Thread.spawn(.{}, readerThreadMain, .{self});
+        }
         return self;
     }
 
@@ -221,6 +241,12 @@ pub const InteractiveTerminal = struct {
         _ = self.kill() catch {};
         if (self.reader_thread) |thread| {
             thread.join();
+        } else if (!self.reaped) {
+            // Threadless (server-path) terminal whose child was never
+            // reaped: kill() above sent SIGKILL, so this blocking reap
+            // returns promptly and no zombie outlives the terminal.
+            _ = std.posix.waitpid(self.child_pid, 0);
+            self.reaped = true;
         }
 
         self.stream.deinit();
@@ -365,6 +391,42 @@ pub const InteractiveTerminal = struct {
         }
     }
 
+    /// Server-path output feed: the hty event loop reads `master_fd`
+    /// itself (`run_reader_thread = false`) and pushes each chunk through
+    /// here — VT feed plus title tracking, no events queued. Returns the
+    /// new title (caller-owned copy) when this chunk changed it, else
+    /// null. Single caller, single thread; the mutex is held only so the
+    /// library invariants stay uniform.
+    pub fn feedOutput(self: *InteractiveTerminal, bytes: []const u8) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.stream.nextSlice(bytes);
+
+        const current = self.terminal.getTitle() orelse "";
+        const last = self.last_title orelse "";
+        if (std.mem.eql(u8, current, last)) return null;
+
+        const owned = self.alloc.dupe(u8, current) catch return null;
+        if (self.last_title) |previous| self.alloc.free(previous);
+        self.last_title = owned;
+        return self.alloc.dupe(u8, current) catch null;
+    }
+
+    /// Server-path exit bookkeeping: the event loop observed EOF/EIO on
+    /// `master_fd` and reaped the child via waitpid. Records the exit
+    /// code, marks the child reaped, and closes the master fd (unless
+    /// `kill()` already did).
+    pub fn noteChildExit(self: *InteractiveTerminal, code: ?i32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.exit_code = code;
+        self.reaped = true;
+        if (!self.closed) {
+            self.closed = true;
+            std.posix.close(self.master_fd);
+        }
+    }
+
     fn readerThreadMain(self: *InteractiveTerminal) void {
         self.readerLoop() catch |err| {
             self.pushErrorFmt("reader loop failed: {}", .{err});
@@ -426,6 +488,7 @@ pub const InteractiveTerminal = struct {
 
         self.mutex.lock();
         self.exit_code = exit_code;
+        self.reaped = true;
         self.closed = true;
         self.pushEventUnlocked(.{ .exited = exit_code });
         self.mutex.unlock();
@@ -460,6 +523,14 @@ pub const InteractiveTerminal = struct {
     /// reserve (its own slot + 1), and `exited` — pushed exactly once, as
     /// the terminal's final event — consumes that spare without allocating.
     fn pushEventUnlocked(self: *InteractiveTerminal, event: OutputEvent) void {
+        // Threadless server-path terminals queue nothing: the server
+        // consumes output synchronously via `feedOutput` and never calls
+        // `pollEvent`, so queued events would only accumulate.
+        if (!self.config.run_reader_thread) {
+            var dropped = event;
+            dropped.deinit(self.alloc);
+            return;
+        }
         switch (event) {
             .exited => {
                 if (self.events.capacity > self.events.items.len) {
