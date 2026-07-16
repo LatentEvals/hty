@@ -142,7 +142,11 @@ pub const Loop = struct {
     /// `buildPollSet`/`waitReady` call.
     pub fn buildPollSet(self: *Loop) Allocator.Error![]posix.pollfd {
         self.pollfds.clearRetainingCapacity();
-        try self.pollfds.ensureTotalCapacity(self.alloc, self.entries.items.len);
+        // Capacity of at least 1 even with no registrations: the returned
+        // slice's pointer must be valid storage even at length 0, because
+        // aarch64-linux lowers poll(2) to ppoll, whose address check
+        // rejects a dangling pointer regardless of nfds (EFAULT).
+        try self.pollfds.ensureTotalCapacity(self.alloc, @max(1, self.entries.items.len));
         for (self.entries.items) |entry| {
             var events: i16 = 0;
             if (entry.interest.read) events |= posix.POLL.IN;

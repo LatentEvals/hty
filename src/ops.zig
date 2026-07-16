@@ -782,8 +782,13 @@ fn waitForPtyOrTick(sess: *Session, timeout_ms: i32) void {
         }};
         _ = std.posix.poll(&pfds, timeout_ms) catch {};
     } else {
-        var none = [_]std.posix.pollfd{};
-        _ = std.posix.poll(&none, timeout_ms) catch {};
+        // Pure tick. The pollfd storage must be a real allocation even
+        // though nfds is 0: aarch64-linux has no legacy poll syscall, and
+        // ppoll's address check rejects the non-canonical pointer a
+        // zero-length array carries (EFAULT → panic). One undefined
+        // element sliced to length 0 keeps the pointer valid.
+        var none: [1]std.posix.pollfd = undefined;
+        _ = std.posix.poll(none[0..0], timeout_ms) catch {};
     }
 }
 
