@@ -89,6 +89,16 @@ pub fn paintWaitingFrame(stdout_fd: std.posix.fd_t, name: []const u8) void {
 // Watch client
 // ============================================================================
 
+/// Global SIGWINCH flag, same atomic pattern as attach's `attach_resized`.
+/// The watch main loop checks it each tick; watch is read-only so it can't
+/// resize the PTY — instead it clears the local screen and asks the server
+/// for a fresh full-screen snapshot (LatentEvals/hty#84).
+var watch_resized = std.atomic.Value(bool).init(false);
+
+fn watchSigwinchHandler(_: i32) callconv(.c) void {
+    watch_resized.store(true, .release);
+}
+
 /// Shared state between the watch main thread and its reader thread.
 /// Mirrors `AttachClientState` in commands/attach.zig minus input plumbing.
 const WatchClientState = struct {
@@ -228,6 +238,23 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     }
     defer if (saved_termios) |st| std.posix.tcsetattr(stdin_fd, .FLUSH, st) catch {};
 
+    // Install SIGWINCH handler so terminal resizes trigger a repaint
+    // request instead of leaving a stale/blank view behind.
+    var sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = watchSigwinchHandler },
+        .mask = std.mem.zeroes(std.posix.sigset_t),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.c.SIG.WINCH, &sa, null);
+    defer {
+        var sa_reset: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.DFL },
+            .mask = std.mem.zeroes(std.posix.sigset_t),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.c.SIG.WINCH, &sa_reset, null);
+    }
+
     // If the server parked us, paint the waiting frame. Pass the user-
     // provided ref through as the display name. Empty/null ref can only
     // happen in sole-session mode, which never parks (the server
@@ -249,6 +276,21 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // flag. Watch is read-only so we never send input frames.
     var input_buf: [32]u8 = undefined;
     while (!shared.done.load(.acquire)) {
+        // On resize the local terminal reflows/clears the alt screen on
+        // its own; wipe the leftovers and ask the server for a full
+        // snapshot so the whole view repaints instead of waiting for
+        // incremental frames to overwrite it cell by cell. While still
+        // parked (no session yet) there is nothing to repaint — just
+        // redraw the waiting frame.
+        if (watch_resized.swap(false, .acq_rel)) {
+            if (!is_waiting or shared.started.load(.acquire)) {
+                _ = std.posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
+                stream.writeAll("{\"op\":\"repaint\"}\n") catch break;
+            } else {
+                paintWaitingFrame(stdout_fd, session_ref orelse "");
+            }
+        }
+
         if (stdin_is_tty) {
             var poll_fd: c.pollfd = .{
                 .fd = stdin_fd,
