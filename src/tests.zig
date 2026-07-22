@@ -3945,6 +3945,116 @@ test "issue #29: watch against existing session receives started + initial snaps
     }
 }
 
+test "issue #84: watch client sending repaint receives a full-screen output snapshot" {
+    const alloc = std.testing.allocator;
+    const log_dir = try setupAttachLogDir(alloc, "watch-repaint");
+    defer alloc.free(log_dir);
+    defer std.fs.cwd().deleteTree(log_dir) catch {};
+
+    var registry = SessionRegistry.init(alloc);
+    defer registry.deinit();
+    registry.log_dir = log_dir;
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "spawn",
+            .name = "repaintwatch",
+            .program = "/bin/cat",
+            .rows = 8,
+            .cols = 24,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // Put recognizable content on the screen before the watcher connects
+    // so both the initial snapshot and the repaint snapshot carry it.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "repaintwatch",
+            .text = "hello repaint\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "repaintwatch",
+            .text = "hello repaint",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    const pair = try makeSocketPair();
+    // Peer is closed explicitly below (not via defer) — see the note in
+    // the issue #29 watch test above.
+
+    const line = "{\"op\":\"watch\",\"session\":\"repaintwatch\"}";
+    const result = try server_attach_mod.handleAttachConnection(
+        alloc,
+        &registry,
+        pair.local,
+        line,
+        true, // read_only
+    );
+    const watch_client = switch (result) {
+        .attached => |client| client,
+        else => return error.ExpectedAttached,
+    };
+    try std.testing.expect(watch_client.read_only);
+
+    var reader = LineReader.init(alloc, pair.peer);
+    defer reader.deinit();
+
+    // Ack, then the initial snapshot.
+    const ack = try reader.readLine(1000);
+    alloc.free(ack);
+    const initial = try expectFrameKind(alloc, &reader, "output", 1000);
+    defer alloc.free(initial);
+    try std.testing.expect(std.mem.indexOf(u8, initial, "hello repaint") != null);
+
+    // The read-only client asks for a repaint. No pump runs in between,
+    // so the very next frame must be the snapshot: kind=output carrying
+    // the full current screen — byte-identical to the initial snapshot
+    // because the screen hasn't changed.
+    try server_attach_mod.dispatchAttachFrame(watch_client, "{\"op\":\"repaint\"}");
+    const repainted = try expectFrameKind(alloc, &reader, "output", 1000);
+    defer alloc.free(repainted);
+    try std.testing.expect(std.mem.indexOf(u8, repainted, "hello repaint") != null);
+    try std.testing.expectEqualSlices(u8, initial, repainted);
+
+    // repaint must not resize the PTY: the screen is still 8x24.
+    {
+        var parsed = try testRequest(&registry, .{ .op = "snapshot", .session = "repaintwatch" });
+        defer parsed.deinit();
+        const obj = try expectTestOk(parsed);
+        const snap = obj.get("snapshot") orelse return error.InvalidResponse;
+        const snap_obj = switch (snap) {
+            .object => |o| o,
+            else => return error.InvalidResponse,
+        };
+        const cells = snap_obj.get("cells") orelse return error.InvalidResponse;
+        try std.testing.expect(cells == .array);
+        try std.testing.expectEqual(@as(usize, 8), cells.array.items.len);
+        try std.testing.expectEqual(@as(usize, 24), cells.array.items[0].array.items.len);
+    }
+
+    const sess = try sessionByName(&registry, "repaintwatch");
+    pair.peer.close();
+    watch_client.shutdown();
+    attach_mod.reapClosedAttachClients(sess);
+
+    {
+        var kill_parsed = try testRequest(&registry, .{ .op = "kill", .session = "repaintwatch" });
+        defer kill_parsed.deinit();
+        _ = try expectTestOk(kill_parsed);
+    }
+}
+
 /// Open a raw attach-style connection against a harness server: connect
 /// to the Unix socket and write the request line. The caller reads
 /// frames off the returned stream (and owns/closes it).

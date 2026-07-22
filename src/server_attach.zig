@@ -325,6 +325,19 @@ pub fn dispatchAttachFrame(client: *AttachClient, line: []const u8) !void {
         return;
     }
 
+    if (std.mem.eql(u8, op, "repaint")) {
+        // Re-send the full current screen (the same snapshot frame the
+        // client got on initial connect). Watch clients request this
+        // after a local terminal resize: they're read-only, so their
+        // SIGWINCH can't resize the PTY, and without a repaint path the
+        // resize-disturbed regions would stay blank until the watched
+        // app happened to redraw them (LatentEvals/hty#84). Allowed for
+        // read-only clients by design; never touches the PTY size or
+        // the session's input log.
+        sendSnapshotFrame(client);
+        return;
+    }
+
     if (std.mem.eql(u8, op, "detach")) {
         return error.Detach;
     }
