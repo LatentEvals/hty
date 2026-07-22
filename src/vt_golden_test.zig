@@ -262,6 +262,18 @@ test "golden: UTF-8 codepoint split across chunk boundaries" {
     );
 }
 
+test "golden: narrow char overwrites a wide glyph's spacer tail" {
+    // Print a wide emoji (cols 1-2), then move onto its spacer tail and
+    // print a narrow char. The engine must clear the orphaned wide cell.
+    // This exact sequence crashed release builds when ghostty-vt was
+    // compiled with its integrity checks on but the root binary's
+    // runtime safety off (mismatched optimize modes): the spacer-tail
+    // fixup in `Terminal.print` was compiled out while the page
+    // integrity check in `Screen.clearCells` wasn't, panicking the
+    // server on emoji-dense TUI repaints.
+    try runGoldenCase("narrow_over_spacer_tail", "🏆\x1b[1;2Hx", 24, 80);
+}
+
 test "golden: mode-set escapes (bracketed paste) are silently consumed" {
     // The paste/mouse toggles must not leak visible bytes into the grid.
     try runGoldenCase(

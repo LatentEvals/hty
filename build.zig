@@ -89,7 +89,21 @@ pub fn build(b: *std.Build) void {
         lib_mod.linkSystemLibrary("util", .{});
     }
 
-    if (b.lazyDependency("ghostty", .{})) |dep| {
+    // Forward target/optimize so ghostty-vt compiles in the same mode as
+    // the rest of the binary. Without this the dependency falls back to
+    // its own defaults (Debug), which enables ghostty's slow_runtime_safety
+    // page-integrity checks while the fixup code that keeps those checks
+    // green is gated on `std.debug.runtime_safety` — resolved against the
+    // *root* module's mode. In a release build that combination (checks on,
+    // fixup off) makes `Terminal.print` panic with
+    // `error.InvalidSpacerTailLocation` the moment a program overwrites the
+    // right half of a wide glyph with a narrow one — e.g. an emoji-dense
+    // TUI repainting a row — killing the whole server. It also silently
+    // shipped a Debug-mode VT hot path inside release binaries.
+    if (b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
         lib_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
     }
 
