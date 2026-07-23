@@ -2,6 +2,7 @@
 //! to a session.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -75,7 +76,7 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var text: ?[]const u8 = null;
     var raw_text: ?[]const u8 = null;
@@ -271,7 +272,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // same way they did before). We return before the keyboard token
     // pipeline below.
     if (mouse_mode_count == 1) {
-        try runMouseMode(alloc, session_ref, .{
+        try runMouseMode(alloc, io, session_ref, .{
             .click_row = click_row,
             .click_col = click_col,
             .scroll_dir = scroll_dir,
@@ -302,7 +303,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             const idle_ms: u64 = if (wait_until_idle_ms_str) |s| parseIdleArg(s) catch 100 else 100;
             const duration_ms: u64 = if (wait_duration_str) |d| common.parseDurationMs(d) catch 0 else 0;
             const needle: ?[]const u8 = wait_until_text orelse wait_until_regex;
-            try issueFusedWait(alloc, .{
+            try issueFusedWait(alloc, io, .{
                 .session_ref = session_ref,
                 .wait_kind = wait_kind,
                 .needle = needle,
@@ -415,37 +416,37 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // Execute the token list.
     for (token_list.slice()) |token| {
         if (token.kind == .delay) {
-            std.Thread.sleep(token.delay_ms * std.time.ns_per_ms);
+            sys.sleep(token.delay_ms * std.time.ns_per_ms);
             continue;
         }
 
-        var payload_buf = std.array_list.Managed(u8).init(alloc);
+        var payload_buf: std.Io.Writer.Allocating = .init(alloc);
         defer payload_buf.deinit();
-        var writer = payload_buf.writer();
+        const writer = &payload_buf.writer;
 
         switch (token.kind) {
             .text => {
                 try writer.writeAll("{\"op\":\"send_text\",\"text\":");
-                try common.writeJsonString(writer.any(), token.value);
+                try common.writeJsonString(writer, token.value);
             },
             .key => {
                 try writer.writeAll("{\"op\":\"send_key\",\"key\":");
-                try common.writeJsonString(writer.any(), token.value);
+                try common.writeJsonString(writer, token.value);
             },
             .bytes_hex => {
                 try writer.writeAll("{\"op\":\"send_bytes_hex\",\"bytes_hex\":");
-                try common.writeJsonString(writer.any(), token.value);
+                try common.writeJsonString(writer, token.value);
             },
             .delay => unreachable,
         }
 
         if (session_ref) |sr| {
             try writer.writeAll(",\"session\":");
-            try common.writeJsonString(writer.any(), sr);
+            try common.writeJsonString(writer, sr);
         }
         try writer.writeAll("}");
 
-        const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+        const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
         defer alloc.free(response_line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -493,7 +494,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 
         const needle: ?[]const u8 = wait_until_text orelse wait_until_regex;
 
-        try issueFusedWait(alloc, .{
+        try issueFusedWait(alloc, io, .{
             .session_ref = session_ref,
             .wait_kind = wait_kind,
             .needle = needle,
@@ -532,47 +533,48 @@ const MouseModeParams = struct {
 /// modes. The first RPC may fail with `MouseNotEnabled` — surface the
 /// error identically to other send ops and exit with the generic error
 /// code.
-fn runMouseMode(alloc: Allocator, session_ref: ?[]const u8, p: MouseModeParams) !void {
-    if (p.delay_before_ms > 0) std.Thread.sleep(p.delay_before_ms * std.time.ns_per_ms);
+fn runMouseMode(alloc: Allocator, io: std.Io, session_ref: ?[]const u8, p: MouseModeParams) !void {
+    if (p.delay_before_ms > 0) sys.sleep(p.delay_before_ms * std.time.ns_per_ms);
 
     if (p.click_row) |row| {
         const col = p.click_col.?;
-        try sendMouseEvent(alloc, session_ref, "press", p.button, row, col);
-        try sendMouseEvent(alloc, session_ref, "release", p.button, row, col);
+        try sendMouseEvent(alloc, io, session_ref, "press", p.button, row, col);
+        try sendMouseEvent(alloc, io, session_ref, "release", p.button, row, col);
     } else if (p.scroll_dir) |dir| {
         const wheel_btn: []const u8 = if (std.mem.eql(u8, dir, "up")) "wheel_up" else "wheel_down";
         var n: u32 = 0;
         while (n < p.scroll_amount) : (n += 1) {
-            try sendMouseEvent(alloc, session_ref, "press", wheel_btn, p.scroll_at_row, p.scroll_at_col);
+            try sendMouseEvent(alloc, io, session_ref, "press", wheel_btn, p.scroll_at_row, p.scroll_at_col);
         }
     }
 
-    if (p.delay_after_ms > 0) std.Thread.sleep(p.delay_after_ms * std.time.ns_per_ms);
+    if (p.delay_after_ms > 0) sys.sleep(p.delay_after_ms * std.time.ns_per_ms);
 }
 
 fn sendMouseEvent(
     alloc: Allocator,
+    io: std.Io,
     session_ref: ?[]const u8,
     event: []const u8,
     button: []const u8,
     row: u32,
     col: u32,
 ) !void {
-    var buf = std.array_list.Managed(u8).init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    var writer = buf.writer();
+    const writer = &buf.writer;
     try writer.writeAll("{\"op\":\"send_mouse\",\"event\":");
-    try common.writeJsonString(writer.any(), event);
+    try common.writeJsonString(writer, event);
     try writer.writeAll(",\"button\":");
-    try common.writeJsonString(writer.any(), button);
+    try common.writeJsonString(writer, button);
     try writer.print(",\"row\":{d},\"col\":{d}", .{ row, col });
     if (session_ref) |s| {
         try writer.writeAll(",\"session\":");
-        try common.writeJsonString(writer.any(), s);
+        try common.writeJsonString(writer, s);
     }
     try writer.writeAll("}");
 
-    const response_line = try common.sendRawRequest(alloc, buf.items);
+    const response_line = try common.sendRawRequest(alloc, io, buf.writer.buffered());
     defer alloc.free(response_line);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -616,13 +618,13 @@ pub const FusedRequest = struct {
 /// Build and send the wait_and_snapshot RPC. Returns the parsed JSON
 /// response; caller is responsible for `parsed.deinit()` and for inspecting
 /// the response (success / timeout / error) and formatting the output.
-pub fn sendFusedWait(alloc: Allocator, req: FusedRequest) !std.json.Parsed(std.json.Value) {
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
+pub fn sendFusedWait(alloc: Allocator, io: std.Io, req: FusedRequest) !std.json.Parsed(std.json.Value) {
+    var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
-    var writer = payload_buf.writer();
+    const writer = &payload_buf.writer;
 
     try writer.writeAll("{\"op\":\"wait_and_snapshot\",\"wait_kind\":");
-    try common.writeJsonString(writer.any(), req.wait_kind);
+    try common.writeJsonString(writer, req.wait_kind);
     try writer.print(",\"timeout_ms\":{d},\"snapshot\":{s}", .{
         req.timeout_ms,
         if (req.snapshot) "true" else "false",
@@ -633,15 +635,15 @@ pub fn sendFusedWait(alloc: Allocator, req: FusedRequest) !std.json.Parsed(std.j
         try writer.print(",\"duration_ms\":{d}", .{req.duration_ms});
     } else if (std.mem.eql(u8, req.wait_kind, "text") or std.mem.eql(u8, req.wait_kind, "regex")) {
         try writer.writeAll(",\"text\":");
-        try common.writeJsonString(writer.any(), req.needle.?);
+        try common.writeJsonString(writer, req.needle.?);
     }
     if (req.session_ref) |s| {
         try writer.writeAll(",\"session\":");
-        try common.writeJsonString(writer.any(), s);
+        try common.writeJsonString(writer, s);
     }
     try writer.writeAll("}");
 
-    const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+    const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
     defer alloc.free(response_line);
 
     return std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -662,8 +664,8 @@ const FusedWaitParams = struct {
 /// Build and issue the wait_and_snapshot RPC, then format the response
 /// according to --json / --ansi / default flags. Exits the process on
 /// timeout (code 3) or server-reported error.
-pub fn issueFusedWait(alloc: Allocator, params: FusedWaitParams) !void {
-    var parsed = try sendFusedWait(alloc, .{
+pub fn issueFusedWait(alloc: Allocator, io: std.Io, params: FusedWaitParams) !void {
+    var parsed = try sendFusedWait(alloc, io, .{
         .session_ref = params.session_ref,
         .wait_kind = params.wait_kind,
         .needle = params.needle,
@@ -725,9 +727,9 @@ pub fn emitFusedJson(
     include_snapshot: bool,
     extra_session_field: ?[]const u8,
 ) !void {
-    var buf = std.array_list.Managed(u8).init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    var writer = buf.writer();
+    const writer = &buf.writer;
 
     try writer.writeAll("{\"ok\":true");
 
@@ -755,7 +757,7 @@ pub fn emitFusedJson(
     try writer.writeAll(",\"matched\":");
     if (matched_val) |m| {
         switch (m) {
-            .string => |s| try common.writeJsonString(writer.any(), s),
+            .string => |s| try common.writeJsonString(writer, s),
             else => try writer.writeAll("null"),
         }
     } else {
@@ -774,7 +776,7 @@ pub fn emitFusedJson(
     }
 
     try writer.writeAll("}");
-    try common.printLine(buf.items);
+    try common.printLine(buf.writer.buffered());
 }
 
 const SeqToken = struct {

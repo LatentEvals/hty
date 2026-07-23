@@ -8,6 +8,7 @@
 //! `headless.zig` is responsible for tolerating malformed/truncated lines.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 const session_mod = @import("session.zig");
 const hex_mod = @import("hex.zig");
@@ -22,14 +23,14 @@ const getString = json_mod.getString;
 /// Single-writer by construction: every log helper runs on the server's
 /// one thread (or the single test thread), so lines cannot interleave.
 pub fn writeLogEvent(sess: *Session, line: []const u8) void {
-    const log_file = sess.log_file orelse return;
-    log_file.writeAll(line) catch return;
-    log_file.writeAll("\n") catch return;
+    const log_fd = sess.log_file orelse return;
+    sys.writeAll(log_fd, line) catch return;
+    sys.writeAll(log_fd, "\n") catch return;
 }
 
 pub fn closeLogFile(sess: *Session) void {
-    if (sess.log_file) |*f| {
-        f.close();
+    if (sess.log_file) |fd| {
+        sys.close(fd);
         sess.log_file = null;
     }
 }
@@ -54,21 +55,14 @@ pub fn openSessionLog(
         return;
     };
 
-    const file = std.fs.createFileAbsolute(log_path, .{
-        .truncate = false,
-        .mode = 0o600,
-    }) catch |err| {
+    // O.APPEND replaces the old create-then-seekFromEnd dance atomically.
+    const fd = sys.open(log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600) catch |err| {
         std.debug.print("session log open failed ({s}): {s}\n", .{ log_path, @errorName(err) });
-        return;
-    };
-    file.seekFromEnd(0) catch |err| {
-        std.debug.print("session log seek failed: {s}\n", .{@errorName(err)});
-        file.close();
         return;
     };
 
     const spawn_payload = .{
-        .t = std.time.milliTimestamp(),
+        .t = sys.milliTimestamp(),
         .kind = "spawn",
         .program = program,
         .args = args,
@@ -77,11 +71,11 @@ pub fn openSessionLog(
         .cols = cols,
     };
     const line = std.json.Stringify.valueAlloc(arena, spawn_payload, .{}) catch {
-        file.close();
+        sys.close(fd);
         return;
     };
 
-    sess.log_file = file;
+    sess.log_file = fd;
     writeLogEvent(sess, line);
 
     if (sess.name) |name| {
@@ -105,13 +99,13 @@ fn createByNameSymlink(
     // Relative target so the link keeps working if the log dir is moved.
     const target = try std.fmt.allocPrint(arena, "../{s}.jsonl", .{id});
 
-    std.fs.deleteFileAbsolute(link_path) catch |err| switch (err) {
+    sys.unlink(link_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
     const target_z = try arena.dupeZ(u8, target);
     const link_z = try arena.dupeZ(u8, link_path);
-    try std.posix.symlink(target_z, link_z);
+    try sys.symlink(target_z, link_z);
 }
 
 // The typed event writers below are called directly by PTY output
@@ -194,7 +188,7 @@ pub fn logInputEvent(
     const hex = hex_mod.encodeHex(arena, bytes) catch return;
     const line = if (client_id) |cid|
         std.json.Stringify.valueAlloc(arena, .{
-            .t = std.time.milliTimestamp(),
+            .t = sys.milliTimestamp(),
             .kind = "input",
             .origin = origin,
             .client_id = cid,
@@ -202,7 +196,7 @@ pub fn logInputEvent(
         }, .{}) catch return
     else
         std.json.Stringify.valueAlloc(arena, .{
-            .t = std.time.milliTimestamp(),
+            .t = sys.milliTimestamp(),
             .kind = "input",
             .origin = origin,
             .bytes_hex = hex,
@@ -213,7 +207,7 @@ pub fn logInputEvent(
 pub fn logAttachConnectEvent(arena: Allocator, sess: *Session, client_id: []const u8) void {
     if (sess.log_file == null) return;
     const line = std.json.Stringify.valueAlloc(arena, .{
-        .t = std.time.milliTimestamp(),
+        .t = sys.milliTimestamp(),
         .kind = "attach_connect",
         .client_id = client_id,
     }, .{}) catch return;
@@ -223,7 +217,7 @@ pub fn logAttachConnectEvent(arena: Allocator, sess: *Session, client_id: []cons
 pub fn logAttachDisconnectEvent(arena: Allocator, sess: *Session, client_id: []const u8) void {
     if (sess.log_file == null) return;
     const line = std.json.Stringify.valueAlloc(arena, .{
-        .t = std.time.milliTimestamp(),
+        .t = sys.milliTimestamp(),
         .kind = "attach_disconnect",
         .client_id = client_id,
     }, .{}) catch return;
@@ -233,7 +227,7 @@ pub fn logAttachDisconnectEvent(arena: Allocator, sess: *Session, client_id: []c
 pub fn logKilledEvent(arena: Allocator, sess: *Session) void {
     if (sess.log_file == null) return;
     const line = std.json.Stringify.valueAlloc(arena, .{
-        .t = std.time.milliTimestamp(),
+        .t = sys.milliTimestamp(),
         .kind = "killed",
     }, .{}) catch return;
     writeLogEvent(sess, line);
@@ -242,7 +236,7 @@ pub fn logKilledEvent(arena: Allocator, sess: *Session) void {
 pub fn logResizeEvent(arena: Allocator, sess: *Session, rows: u16, cols: u16) void {
     if (sess.log_file == null) return;
     const line = std.json.Stringify.valueAlloc(arena, .{
-        .t = std.time.milliTimestamp(),
+        .t = sys.milliTimestamp(),
         .kind = "resize",
         .rows = rows,
         .cols = cols,
@@ -272,12 +266,12 @@ pub fn nameInUse(alloc: Allocator, log_dir: ?[]const u8, name: []const u8) bool 
 /// older on-disk state. Best-effort and silent on per-file failures, like
 /// all log-dir maintenance. Runs before the server accepts requests, so it
 /// never races spawn/delete.
-pub fn reconcileByNameLinks(alloc: Allocator, log_dir: []const u8) void {
-    var root = std.fs.openDirAbsolute(log_dir, .{ .iterate = true }) catch return;
-    defer root.close();
+pub fn reconcileByNameLinks(io: std.Io, alloc: Allocator, log_dir: []const u8) void {
+    var root = std.Io.Dir.openDirAbsolute(io, log_dir, .{ .iterate = true }) catch return;
+    defer root.close(io);
 
     var it = root.iterate();
-    while (it.next() catch return) |entry| {
+    while (it.next(io) catch return) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
@@ -305,13 +299,13 @@ pub fn reconcileByNameLinks(alloc: Allocator, log_dir: []const u8) void {
 /// or the session is unnamed. Returned slice lives in `arena`.
 fn spawnHeaderName(arena: Allocator, log_dir: []const u8, file_name: []const u8) ?[]const u8 {
     const path = std.fmt.allocPrint(arena, "{s}/{s}", .{ log_dir, file_name }) catch return null;
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch return null;
-    defer file.close();
+    const fd = sys.open(path, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer sys.close(fd);
 
     var line_buf = std.array_list.Managed(u8).init(arena);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = file.read(&chunk) catch return null;
+        const n = std.posix.read(fd, &chunk) catch return null;
         if (n == 0) break;
         if (std.mem.indexOfScalar(u8, chunk[0..n], '\n')) |nl| {
             line_buf.appendSlice(chunk[0..nl]) catch return null;
@@ -332,6 +326,6 @@ fn spawnHeaderName(arena: Allocator, log_dir: []const u8, file_name: []const u8)
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    sys.access(path, sys.F_OK) catch return false;
     return true;
 }

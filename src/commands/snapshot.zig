@@ -17,7 +17,7 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var json_output = false;
     var ansi_output = false;
@@ -35,16 +35,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         }
     }
 
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
+    var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
-    try payload_buf.appendSlice("{\"op\":\"snapshot\"");
+    try payload_buf.writer.writeAll("{\"op\":\"snapshot\"");
     if (session_ref) |s| {
-        try payload_buf.appendSlice(",\"session\":");
-        try common.writeJsonString(payload_buf.writer().any(), s);
+        try payload_buf.writer.writeAll(",\"session\":");
+        try common.writeJsonString(&payload_buf.writer, s);
     }
-    try payload_buf.appendSlice("}");
+    try payload_buf.writer.writeAll("}");
 
-    const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+    const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
     defer alloc.free(response_line);
 
     if (json_output) {

@@ -27,7 +27,7 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var wait_text: ?[]const u8 = null;
     var use_regex = false;
@@ -77,13 +77,13 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         std.process.exit(common.ExitCode.generic);
     }
 
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
+    var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
-    var writer = payload_buf.writer();
+    const writer = &payload_buf.writer;
 
     if (wait_text) |t| {
         try writer.print("{{\"op\":\"wait_for_text\",\"text\":", .{});
-        try common.writeJsonString(writer.any(), t);
+        try common.writeJsonString(writer, t);
         if (use_regex) try writer.writeAll(",\"regex\":true");
         try writer.print(",\"timeout_ms\":{d}", .{timeout_ms});
     } else if (idle_ms) |ms| {
@@ -94,11 +94,11 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 
     if (session_ref) |s| {
         try writer.writeAll(",\"session\":");
-        try common.writeJsonString(writer.any(), s);
+        try common.writeJsonString(writer, s);
     }
     try writer.writeAll("}");
 
-    const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+    const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
     defer alloc.free(response_line);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});

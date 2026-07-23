@@ -8,6 +8,7 @@
 //! it.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 const Allocator = std.mem.Allocator;
 
@@ -220,19 +221,19 @@ pub const Session = struct {
     /// `handleSnapshot` (to expose the state to clients).
     mouse_state: MouseState = .{},
 
-    log_file: ?std.fs.File = null,
+    log_file: ?sys.fd_t = null,
 
     /// Active `hty attach` clients subscribed to this session's output.
     /// Only ever touched from the server's event-loop thread (broadcasts,
     /// attach setup, reaping) — no lock needed.
-    attach_clients: std.ArrayListUnmanaged(*AttachClient) = .{},
+    attach_clients: std.ArrayListUnmanaged(*AttachClient) = .empty,
 
     /// Input bytes accepted for the PTY that the master fd wouldn't take
     /// without blocking, waiting to be flushed on writability. Bounded by
     /// `max_pending_input_bytes`; overflow is dropped (a child that has
     /// stopped reading its tty with 64 KiB of unconsumed input is wedged
     /// anyway, and input must never stall the event loop).
-    pending_input: std.ArrayListUnmanaged(u8) = .{},
+    pending_input: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn getStatus(self: *const Session) SessionStatus {
         return self.status;
@@ -264,7 +265,7 @@ pub const Session = struct {
     /// explicitly (gated the same way the event emission was).
     pub fn touchAfterResize(self: *Session) void {
         if (self.terminal.config.emit_screen_updates) {
-            self.touchLastScreenChange(std.time.milliTimestamp());
+            self.touchLastScreenChange(sys.milliTimestamp());
         }
     }
 
@@ -305,7 +306,7 @@ pub const Session = struct {
         var index: usize = 0;
         if (self.pending_input.items.len == 0) {
             while (index < bytes.len) {
-                const n = std.posix.write(self.terminal.master_fd, bytes[index..]) catch |err| switch (err) {
+                const n = sys.write(self.terminal.master_fd, bytes[index..]) catch |err| switch (err) {
                     error.WouldBlock => break,
                     else => return err,
                 };
@@ -336,7 +337,7 @@ pub const Session = struct {
         if (len == 0) return;
         var written: usize = 0;
         while (written < len) {
-            const n = std.posix.write(self.terminal.master_fd, self.pending_input.items[written..]) catch |err| switch (err) {
+            const n = sys.write(self.terminal.master_fd, self.pending_input.items[written..]) catch |err| switch (err) {
                 error.WouldBlock => break,
                 else => {
                     self.pending_input.clearRetainingCapacity();
@@ -389,8 +390,8 @@ pub const Session = struct {
 
         self.pending_input.deinit(self.alloc);
 
-        if (self.log_file) |*f| {
-            f.close();
+        if (self.log_file) |fd| {
+            sys.close(fd);
             self.log_file = null;
         }
         self.terminal.deinit();
@@ -405,9 +406,9 @@ pub const Session = struct {
 /// The flag has to live on the fd itself: macOS ignores `MSG_DONTWAIT` on
 /// UNIX-domain sockets, so per-call flags are not enough.
 pub fn setStreamNonBlocking(fd: std.posix.socket_t) !void {
-    const fl = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const fl = try sys.fcntl(fd, std.posix.F.GETFL, 0);
     const nonblock: usize = @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }));
-    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
+    _ = try sys.fcntl(fd, std.posix.F.SETFL, fl | nonblock);
 }
 
 /// One live `hty attach` connection's broadcast subscription. PTY output
@@ -427,11 +428,11 @@ pub const AttachClient = struct {
 
     alloc: Allocator,
     session: *Session,
-    stream: std.net.Stream,
+    stream: sys.Stream,
     /// Outbound bytes the socket wouldn't accept without blocking, waiting
     /// to be flushed on POLLOUT (or the next write attempt / drain tick).
     /// Bounded by `max_pending_bytes`.
-    pending: std.ArrayListUnmanaged(u8) = .{},
+    pending: std.ArrayListUnmanaged(u8) = .empty,
     /// Opaque, self-describing id assigned by the server on accept. Appears
     /// in the session log in `attach_connect`, `attach_disconnect`, and
     /// `input` events whose origin is `"attach"`, so forensics can pair
@@ -470,7 +471,7 @@ pub const AttachClient = struct {
         self.closed = true;
         // Shutting down the socket makes the peer see EOF promptly; the
         // loop (or reaper) frees the client on its next pass.
-        std.posix.shutdown(self.stream.handle, .both) catch {};
+        sys.shutdown(self.stream.handle, .both) catch {};
     }
 
     /// Best-effort, non-blocking write of a pre-framed JSONL line (with
@@ -526,7 +527,7 @@ pub const AttachClient = struct {
     fn sendNonBlocking(self: *AttachClient, bytes: []const u8) ?usize {
         var written: usize = 0;
         while (written < bytes.len) {
-            const n = std.posix.send(
+            const n = sys.send(
                 self.stream.handle,
                 bytes[written..],
                 std.posix.MSG.DONTWAIT,

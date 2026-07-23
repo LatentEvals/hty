@@ -6,6 +6,7 @@
 //! live frames. See LatentEvals/hty#29.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -62,11 +63,11 @@ pub const alt_screen_exit =
     "\x1b[?7h"; // autowrap back on
 
 pub fn enterAltScreen(stdout_fd: std.posix.fd_t) !void {
-    _ = try std.posix.write(stdout_fd, alt_screen_enter);
+    _ = try sys.write(stdout_fd, alt_screen_enter);
 }
 
 pub fn leaveAltScreen(stdout_fd: std.posix.fd_t) void {
-    _ = std.posix.write(stdout_fd, alt_screen_exit) catch {};
+    _ = sys.write(stdout_fd, alt_screen_exit) catch {};
 }
 
 /// Paint a centered "Waiting for session <name>…" frame to stdout.
@@ -82,7 +83,7 @@ pub fn paintWaitingFrame(stdout_fd: std.posix.fd_t, name: []const u8) void {
         "\x1b[2J\x1b[H\x1b[2mWaiting for session '{s}'… (Ctrl-C to cancel)\x1b[0m",
         .{name},
     ) catch return;
-    _ = std.posix.write(stdout_fd, msg) catch {};
+    _ = sys.write(stdout_fd, msg) catch {};
 }
 
 // ============================================================================
@@ -95,14 +96,14 @@ pub fn paintWaitingFrame(stdout_fd: std.posix.fd_t, name: []const u8) void {
 /// for a fresh full-screen snapshot (LatentEvals/hty#84).
 var watch_resized = std.atomic.Value(bool).init(false);
 
-fn watchSigwinchHandler(_: i32) callconv(.c) void {
+fn watchSigwinchHandler(_: std.posix.SIG) callconv(.c) void {
     watch_resized.store(true, .release);
 }
 
 /// Shared state between the watch main thread and its reader thread.
 /// Mirrors `AttachClientState` in commands/attach.zig minus input plumbing.
 const WatchClientState = struct {
-    stream: std.net.Stream,
+    stream: sys.Stream,
     done: std.atomic.Value(bool) = .init(false),
     /// Set true by the reader when a `{"kind":"started"}` frame arrives.
     /// The main thread doesn't use this — it only matters inside the
@@ -113,32 +114,32 @@ const WatchClientState = struct {
     waiting: bool = false,
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     const session_ref: ?[]const u8 = if (args.len > 0 and !std.mem.startsWith(u8, args[0], "--")) args[0] else null;
 
     const stdin_fd = std.posix.STDIN_FILENO;
     const stdout_fd = std.posix.STDOUT_FILENO;
-    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    const stdin_is_tty = sys.isatty(stdin_fd);
 
     const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
     // Connect and send the subscribe op before flipping the terminal into
     // raw mode so parse errors land on the user's normal terminal.
-    var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {
+    var stream = ensure.ensureServer(alloc, io, socket_path, .{}) catch {
         try common.printErr("hty watch: cannot connect to server");
         std.process.exit(common.ExitCode.generic);
     };
 
-    var request_buf = std.array_list.Managed(u8).init(alloc);
+    var request_buf: std.Io.Writer.Allocating = .init(alloc);
     defer request_buf.deinit();
-    try request_buf.appendSlice("{\"op\":\"watch\"");
+    try request_buf.writer.writeAll("{\"op\":\"watch\"");
     if (session_ref) |s| {
-        try request_buf.appendSlice(",\"session\":");
-        try common.writeJsonString(request_buf.writer().any(), s);
+        try request_buf.writer.writeAll(",\"session\":");
+        try common.writeJsonString(&request_buf.writer, s);
     }
-    try request_buf.appendSlice("}\n");
-    stream.writeAll(request_buf.items) catch {
+    try request_buf.writer.writeAll("}\n");
+    stream.writeAll(request_buf.writer.buffered()) catch {
         stream.close();
         try common.printErr("hty watch: failed to send watch request");
         std.process.exit(common.ExitCode.generic);
@@ -284,7 +285,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         // redraw the waiting frame.
         if (watch_resized.swap(false, .acq_rel)) {
             if (!is_waiting or shared.started.load(.acquire)) {
-                _ = std.posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
+                _ = sys.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
                 stream.writeAll("{\"op\":\"repaint\"}\n") catch break;
             } else {
                 paintWaitingFrame(stdout_fd, session_ref orelse "");
@@ -312,14 +313,14 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         } else {
             // No TTY: can't poll for Ctrl-C. Sleep briefly so we don't
             // busy-loop and let the reader signal `done` on its own.
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+            sys.sleep(25 * std.time.ns_per_ms);
         }
     }
 
     // Shut down the reader and clean up.
     shared.done.store(true, .release);
     _ = stream.writeAll("{\"op\":\"detach\"}\n") catch {};
-    std.posix.shutdown(stream.handle, .both) catch {};
+    sys.shutdown(stream.handle, .both) catch {};
     reader_thread.join();
     stream.close();
 }
@@ -380,7 +381,7 @@ fn handleWatchServerFrame(
         shared.started.store(true, .release);
         if (shared.waiting) {
             shared.waiting = false;
-            _ = std.posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
+            _ = sys.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
         }
         return;
     }
@@ -390,7 +391,7 @@ fn handleWatchServerFrame(
         if (hex_val != .string) return;
         const bytes = hex.decodeHex(alloc, hex_val.string) catch return;
         defer alloc.free(bytes);
-        _ = std.posix.write(stdout_fd, bytes) catch {};
+        _ = sys.write(stdout_fd, bytes) catch {};
         return;
     }
 

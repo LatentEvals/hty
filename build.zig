@@ -242,7 +242,7 @@ fn collectGitInfo(b: *std.Build) GitInfo {
 /// commit.
 fn runGitLine(b: *std.Build, argv: []const []const u8) ?[]const u8 {
     var code: u8 = undefined;
-    const raw = b.runAllowFail(argv, &code, .Ignore) catch return null;
+    const raw = b.runAllowFail(argv, &code, .ignore) catch return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) return null;
     // Duplicate so we keep the trimmed slice after `raw` escapes this fn
@@ -255,7 +255,7 @@ fn runGitLine(b: *std.Build, argv: []const []const u8) ?[]const u8 {
 /// `git status --porcelain` dirty-check where empty = clean).
 fn runGitLineAllowEmpty(b: *std.Build, argv: []const []const u8) ?[]const u8 {
     var code: u8 = undefined;
-    const raw = b.runAllowFail(argv, &code, .Ignore) catch return null;
+    const raw = b.runAllowFail(argv, &code, .ignore) catch return null;
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return b.allocator.dupe(u8, trimmed) catch null;
 }

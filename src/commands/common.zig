@@ -6,6 +6,7 @@
 //! mapping, and the canonical `ExitCode` constants) moved here.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const paths = @import("../paths.zig");
@@ -35,8 +36,8 @@ pub fn resolveSocketPathOrExit(alloc: Allocator) []u8 {
 
 /// Connect via ensureServer, exiting cleanly on the failures it has already
 /// diagnosed on stderr; anything unexpected still propagates.
-pub fn connectOrExit(alloc: Allocator, socket_path: []const u8) !std.net.Stream {
-    return ensure.ensureServer(alloc, socket_path, .{}) catch |err| switch (err) {
+pub fn connectOrExit(alloc: Allocator, io: std.Io, socket_path: []const u8) !sys.Stream {
+    return ensure.ensureServer(alloc, io, socket_path, .{}) catch |err| switch (err) {
         error.ServerUnreachable,
         error.ServerStartupFailed,
         error.StateDirNotWritable,
@@ -48,11 +49,11 @@ pub fn connectOrExit(alloc: Allocator, socket_path: []const u8) !std.net.Stream 
 
 /// Send a structured request value to the server; return the parsed JSON
 /// response. The caller owns the Parsed value.
-pub fn sendRequest(alloc: Allocator, request_value: anytype) !std.json.Parsed(std.json.Value) {
+pub fn sendRequest(alloc: Allocator, io: std.Io, request_value: anytype) !std.json.Parsed(std.json.Value) {
     const socket_path = resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = try connectOrExit(alloc, socket_path);
+    var stream = try connectOrExit(alloc, io, socket_path);
     defer stream.close();
 
     const payload = try std.json.Stringify.valueAlloc(alloc, request_value, .{});
@@ -78,11 +79,11 @@ pub fn sendRequest(alloc: Allocator, request_value: anytype) !std.json.Parsed(st
 
 /// Low-level: send a pre-built JSON string to the server; return raw response.
 /// Caller owns the returned slice.
-pub fn sendRawRequest(alloc: Allocator, request_json: []const u8) ![]u8 {
+pub fn sendRawRequest(alloc: Allocator, io: std.Io, request_json: []const u8) ![]u8 {
     const socket_path = resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = try connectOrExit(alloc, socket_path);
+    var stream = try connectOrExit(alloc, io, socket_path);
     defer stream.close();
 
     try stream.writeAll(request_json);
@@ -107,26 +108,22 @@ pub fn printJsonLine(object: anytype) !void {
     const alloc = std.heap.c_allocator;
     const json = try std.json.Stringify.valueAlloc(alloc, object, .{});
     defer alloc.free(json);
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(json);
-    _ = try stdout.writeAll("\n");
+    try sys.writeAll(std.posix.STDOUT_FILENO, json);
+    try sys.writeAll(std.posix.STDOUT_FILENO, "\n");
 }
 
 pub fn printLine(text: []const u8) !void {
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(text);
-    _ = try stdout.writeAll("\n");
+    try sys.writeAll(std.posix.STDOUT_FILENO, text);
+    try sys.writeAll(std.posix.STDOUT_FILENO, "\n");
 }
 
 pub fn printRaw(text: []const u8) !void {
-    var stdout = std.fs.File.stdout();
-    _ = try stdout.writeAll(text);
+    try sys.writeAll(std.posix.STDOUT_FILENO, text);
 }
 
 pub fn printErr(text: []const u8) !void {
-    var stderr = std.fs.File.stderr();
-    _ = try stderr.writeAll(text);
-    _ = try stderr.writeAll("\n");
+    try sys.writeAll(std.posix.STDERR_FILENO, text);
+    try sys.writeAll(std.posix.STDERR_FILENO, "\n");
 }
 
 pub fn printErrFmt(comptime fmt: []const u8, args: anytype) !void {
@@ -205,7 +202,7 @@ pub fn parseDurationMs(text: []const u8) !u64 {
 
 /// Serialize a Zig string as a JSON string, writing to the given writer.
 /// Handles the standard escapes plus \uXXXX for other control bytes.
-pub fn writeJsonString(writer: std.io.AnyWriter, s: []const u8) !void {
+pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |b| {
         switch (b) {

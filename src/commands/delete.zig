@@ -21,22 +21,22 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     const session_ref = if (args.len > 0) args[0] else null;
 
     // First try the server — it owns any live or zombie sessions in the
     // current registry and will cleanly kill + unlink them.
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
+    var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
-    try payload_buf.appendSlice("{\"op\":\"delete\"");
+    try payload_buf.writer.writeAll("{\"op\":\"delete\"");
     if (session_ref) |s| {
-        try payload_buf.appendSlice(",\"session\":");
-        try common.writeJsonString(payload_buf.writer().any(), s);
+        try payload_buf.writer.writeAll(",\"session\":");
+        try common.writeJsonString(&payload_buf.writer, s);
     }
-    try payload_buf.appendSlice("}");
+    try payload_buf.writer.writeAll("}");
 
     var server_ok = false;
-    if (common.sendRawRequest(alloc, payload_buf.items)) |response_line| {
+    if (common.sendRawRequest(alloc, io, payload_buf.writer.buffered())) |response_line| {
         defer alloc.free(response_line);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_line, .{}) catch null;
         defer if (parsed) |*p| p.deinit();
@@ -64,7 +64,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         std.process.exit(common.ExitCode.not_found);
     };
 
-    const path = logs.resolveLogPath(alloc, ref) catch |err| {
+    const path = logs.resolveLogPath(alloc, io, ref) catch |err| {
         switch (err) {
             error.SessionNotFound => try common.printErr("hty delete: session not found"),
             error.AmbiguousPrefix => try common.printErr("hty delete: ambiguous session prefix"),
@@ -78,16 +78,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // `path` may be the by-name symlink or a direct UUID file. Resolve
     // it to the canonical UUID file so we can delete both it and the
     // symlink (if any) cleanly.
-    const real_path = std.fs.realpathAlloc(alloc, path) catch try alloc.dupe(u8, path);
+    const real_path = std.Io.Dir.cwd().realPathFileAlloc(io, path, alloc) catch try alloc.dupe(u8, path);
     defer alloc.free(real_path);
 
-    std.fs.deleteFileAbsolute(real_path) catch |err| {
+    std.Io.Dir.deleteFileAbsolute(io, real_path) catch |err| {
         try common.printErrFmt("hty delete: failed to unlink {s}: {s}", .{ real_path, @errorName(err) });
         std.process.exit(common.ExitCode.generic);
     };
     // Also remove the name symlink if the reference was a name.
     if (!std.mem.eql(u8, path, real_path)) {
-        std.fs.deleteFileAbsolute(path) catch {};
+        std.Io.Dir.deleteFileAbsolute(io, path) catch {};
     }
 
     const msg = try std.fmt.allocPrint(alloc, "deleted {s} (log file unlinked)", .{ref});

@@ -1,6 +1,7 @@
 //! `hty info` — print resolved paths and server status.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -91,7 +92,7 @@ pub fn renderVersionString(alloc: Allocator, info: GitInfo) ![]u8 {
     return alloc.dupe(u8, info.version);
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, _: std.Io, args: []const []const u8) !void {
     var json_output = false;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) {
@@ -130,9 +131,9 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     const running = server_stats != null;
     const server_status: []const u8 = if (running) "running" else "not running";
 
-    var buf: std.ArrayListUnmanaged(u8) = .{};
-    defer buf.deinit(alloc);
-    const w = buf.writer(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const w = &buf.writer;
 
     const version_line = try renderVersionLine(alloc, currentGitInfo());
     defer alloc.free(version_line);
@@ -142,17 +143,17 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     try w.print("server:  {s}\n", .{server_status});
 
     // Show relevant env vars if set.
-    if (std.posix.getenv("HTY_SOCKET")) |v| {
+    if (sys.getenv("HTY_SOCKET")) |v| {
         if (v.len > 0) try w.print("\n$HTY_SOCKET={s}\n", .{v});
     }
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |v| {
+    if (sys.getenv("XDG_RUNTIME_DIR")) |v| {
         if (v.len > 0) try w.print("$XDG_RUNTIME_DIR={s}\n", .{v});
     }
-    if (std.posix.getenv("XDG_STATE_HOME")) |v| {
+    if (sys.getenv("XDG_STATE_HOME")) |v| {
         if (v.len > 0) try w.print("$XDG_STATE_HOME={s}\n", .{v});
     }
 
-    try common.printRaw(buf.items);
+    try common.printRaw(buf.writer.buffered());
 }
 
 /// Fast path for the top-level `hty --version` / `hty -v` flags. Prints

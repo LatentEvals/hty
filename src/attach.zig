@@ -75,7 +75,7 @@ pub fn flushPendingToAttach(sess: *Session) void {
 /// skipped: the loop reaps those itself when it tears the connection
 /// down, emitting the same disconnect event.
 pub fn reapClosedAttachClients(sess: *Session) void {
-    var reaped: std.ArrayListUnmanaged(*AttachClient) = .{};
+    var reaped: std.ArrayListUnmanaged(*AttachClient) = .empty;
     defer reaped.deinit(sess.alloc);
 
     var i: usize = 0;

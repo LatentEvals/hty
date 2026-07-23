@@ -8,6 +8,24 @@
 //! here as a dedicated integration-test aggregate.
 
 const std = @import("std");
+const io = std.testing.io;
+
+/// 0.15 std.fs.File.readToEndAlloc equivalent (removed in 0.16).
+fn readFileToEnd(file: std.Io.File, alloc: std.mem.Allocator, max: usize) ![]u8 {
+    var list = std.array_list.Managed(u8).init(alloc);
+    errdefer list.deinit();
+    var chunk: [65536]u8 = undefined;
+    while (list.items.len <= max) {
+        const n = file.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try list.appendSlice(chunk[0..n]);
+    }
+    return list.toOwnedSlice();
+}
+const sys = @import("hty").sys;
 const hty = @import("hty");
 
 const list_cmd = @import("commands/list.zig");
@@ -58,14 +76,13 @@ pub fn expectTestOk(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap
 
 /// Search PATH for a command and return its absolute path, or null.
 fn findCommand(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    const path_env = std.process.getEnvVarOwned(alloc, "PATH") catch return null;
-    defer alloc.free(path_env);
+    const path_env = sys.getenv("PATH") orelse return null;
 
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
         const full = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name }) catch continue;
-        std.fs.accessAbsolute(full, .{}) catch {
+        std.Io.Dir.accessAbsolute(io, full, .{}) catch {
             alloc.free(full);
             continue;
         };
@@ -75,7 +92,7 @@ fn findCommand(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
 }
 
 test "unknown operation returns actionable error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{ .op = "bogus" });
@@ -93,7 +110,7 @@ test "unknown operation returns actionable error" {
 }
 
 test "list op returns empty array on a fresh registry" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{ .op = "list" });
@@ -106,7 +123,7 @@ test "list op returns empty array on a fresh registry" {
 }
 
 test "name collision is rejected" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -149,7 +166,7 @@ test "name collision is rejected" {
 }
 
 test "headless protocol can drive cat and snapshot echoed text" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -226,7 +243,7 @@ test "headless protocol can drive cat and snapshot echoed text" {
 }
 
 test "snapshot cells field exposes wide-char spacer tails over the RPC" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -288,7 +305,7 @@ test "snapshot cells field exposes wide-char spacer tails over the RPC" {
 }
 
 test "wait_for_text with regex matches a pattern" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -366,15 +383,15 @@ test "session event log records spawn, input, output, killed" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-log-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -418,9 +435,9 @@ test "session event log records spawn, input, output, killed" {
     const link_path = try std.fmt.allocPrint(alloc, "{s}/logcat.jsonl", .{by_name});
     defer alloc.free(link_path);
 
-    const file = try std.fs.openFileAbsolute(link_path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 1024 * 1024);
     defer alloc.free(contents);
 
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"kind\":\"spawn\"") != null);
@@ -448,13 +465,13 @@ test "headless protocol can use nano to write a file" {
     const nano_path = findCommand(std.testing.allocator, "nano") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(nano_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-nano-{d}.txt", .{std.time.nanoTimestamp()});
+    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-nano-{d}.txt", .{sys.nanoTimestamp()});
     defer std.testing.allocator.free(path);
-    std.fs.deleteFileAbsolute(path) catch {};
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
     {
         var parsed = try testRequest(&registry, .{
@@ -548,9 +565,9 @@ test "headless protocol can use nano to write a file" {
         _ = try expectTestOk(parsed);
     }
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(std.testing.allocator, 4096);
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    const contents = try readFileToEnd(file, std.testing.allocator, 4096);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "written through nano") != null);
@@ -560,7 +577,7 @@ test "headless protocol can launch top and quit" {
     const top_path = findCommand(std.testing.allocator, "top") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(top_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -613,13 +630,13 @@ test "headless protocol can use emacs to write an org file" {
     const emacs_path = findCommand(std.testing.allocator, "emacs") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(emacs_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
-    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-emacs-{d}.org", .{std.time.nanoTimestamp()});
+    const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-emacs-{d}.org", .{sys.nanoTimestamp()});
     defer std.testing.allocator.free(path);
-    std.fs.deleteFileAbsolute(path) catch {};
-    defer std.fs.deleteFileAbsolute(path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
 
     // Spawn emacs in terminal mode with no init file.
     {
@@ -741,9 +758,9 @@ test "headless protocol can use emacs to write an org file" {
     }
 
     // Verify file contents.
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(std.testing.allocator, 4096);
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    const contents = try readFileToEnd(file, std.testing.allocator, 4096);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "* Hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "** TODO Write tests") != null);
@@ -770,11 +787,11 @@ fn setupReplayLogDir(
     const log_dir = try std.fmt.bufPrint(
         log_dir_buf,
         "/tmp/hty-replay-{s}-{d}",
-        .{ tag, std.time.nanoTimestamp() },
+        .{ tag, sys.nanoTimestamp() },
     );
-    try std.fs.cwd().makePath(log_dir);
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
     return .{ .log_dir = log_dir, .by_name = by_name };
 }
 
@@ -782,9 +799,9 @@ fn setupReplayLogDir(
 fn readSessionLog(alloc: std.mem.Allocator, by_name: []const u8, name: []const u8) ![]u8 {
     const link_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ by_name, name });
     defer alloc.free(link_path);
-    const file = try std.fs.openFileAbsolute(link_path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
+    defer file.close(io);
+    return try readFileToEnd(file, alloc, 4 * 1024 * 1024);
 }
 
 test "replay reproduces the live grid for a colored cat session" {
@@ -792,10 +809,10 @@ test "replay reproduces the live grid for a colored cat session" {
 
     var log_dir_buf: [256]u8 = undefined;
     const dirs = try setupReplayLogDir(alloc, "cat", &log_dir_buf);
-    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = dirs.log_dir;
 
@@ -879,7 +896,7 @@ test "replay reproduces the live grid for a colored cat session" {
     defer alloc.free(log_bytes);
 
     // 6. Replay into a fresh VT.
-    var result = try replayToTerminal(alloc, log_bytes, rows, cols);
+    var result = try replayToTerminal(io, alloc, log_bytes, rows, cols);
     defer result.deinit(alloc);
 
     // 7. Render with the same dims and compare byte-for-byte.
@@ -894,10 +911,10 @@ test "replay reproduces the live grid across a mid-session resize" {
 
     var log_dir_buf: [256]u8 = undefined;
     const dirs = try setupReplayLogDir(alloc, "resize", &log_dir_buf);
-    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = dirs.log_dir;
 
@@ -1014,7 +1031,7 @@ test "replay reproduces the live grid across a mid-session resize" {
 
     // 6. Replay and compare. `result.rows`/`.cols` should reflect the new
     //    (post-resize) dimensions, proving the resize applied.
-    var result = try replayToTerminal(alloc, log_bytes, start_rows, start_cols);
+    var result = try replayToTerminal(io, alloc, log_bytes, start_rows, start_cols);
     defer result.deinit(alloc);
     try std.testing.expectEqual(new_rows, result.rows);
     try std.testing.expectEqual(new_cols, result.cols);
@@ -1068,7 +1085,7 @@ pub fn expectTestError(parsed: std.json.Parsed(std.json.Value), needle: []const 
 }
 
 test "invalid JSON returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "not valid json {{{");
@@ -1077,7 +1094,7 @@ test "invalid JSON returns a structured error" {
 }
 
 test "non-object JSON root returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "[1,2,3]");
@@ -1086,7 +1103,7 @@ test "non-object JSON root returns a structured error" {
 }
 
 test "request missing the op field returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "{}");
@@ -1097,7 +1114,7 @@ test "request missing the op field returns a structured error" {
 }
 
 test "op with missing required subfield returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // spawn without `program` — handleSpawn calls readRequiredString("program").
@@ -1107,7 +1124,7 @@ test "op with missing required subfield returns a structured error" {
 }
 
 test "op with wrong-type field returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // `program` should be a string; send an integer.
@@ -1162,7 +1179,7 @@ pub fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
 
 test "resolve session by full UUID" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, null);
@@ -1179,7 +1196,7 @@ test "resolve session by full UUID" {
 
 test "resolve session by short UUID prefix" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, null);
@@ -1198,7 +1215,7 @@ test "resolve session by short UUID prefix" {
 
 test "ambiguous prefix is rejected" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_a = try spawnCatSession(&registry, "a");
@@ -1227,7 +1244,7 @@ test "ambiguous prefix is rejected" {
 
 test "sole-session implicit resolution" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "solo");
@@ -1245,7 +1262,7 @@ test "sole-session implicit resolution" {
 
 test "sole-session implicit errors when multiple sessions exist" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_a = try spawnCatSession(&registry, "aa");
@@ -1267,7 +1284,7 @@ test "sole-session implicit errors when multiple sessions exist" {
 
 test "session-not-found returns a structured error" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // Spawn one session so the "no sessions at all" branch doesn't shadow
@@ -1293,7 +1310,7 @@ test "session-not-found returns a structured error" {
 // code between files.
 
 test "send_bytes_hex op sends decoded bytes to the pty" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "hexcat");
@@ -1326,7 +1343,7 @@ test "send_bytes_hex op sends decoded bytes to the pty" {
 }
 
 test "send_bytes_hex op rejects malformed hex" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "badhex");
@@ -1352,7 +1369,7 @@ test "send_bytes_hex op rejects malformed hex" {
 // `--raw-text 'hello\n'`. We assert the echo contains those two literal
 // bytes and no real newline snuck in.
 test "send_text with literal backslash-n preserves bytes verbatim (--raw-text round trip)" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "rawcat");
@@ -1404,7 +1421,7 @@ test "send_text with literal backslash-n preserves bytes verbatim (--raw-text ro
 }
 
 test "send_key op accepts a symbolic key name" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "keycat");
@@ -1426,7 +1443,7 @@ test "send_key op accepts a symbolic key name" {
 }
 
 test "send_key op rejects an unknown key name" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "badkey");
@@ -1446,7 +1463,7 @@ test "send_key op rejects an unknown key name" {
 }
 
 test "resize op changes dimensions visible in the next snapshot" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "rcat");
@@ -1485,7 +1502,7 @@ test "resize op changes dimensions visible in the next snapshot" {
 }
 
 test "wait_for_exit returns after the child terminates" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // /usr/bin/true exits immediately — perfect for wait_for_exit.
@@ -1513,7 +1530,7 @@ test "wait_for_exit returns after the child terminates" {
 
 test "list op returns one entry per session" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_one = try spawnCatSession(&registry, "one");
@@ -1551,7 +1568,7 @@ test "list op returns one entry per session" {
 
 test "list json stays structured with no live server and no sessions" {
     const alloc = std.testing.allocator;
-    var merged = try list_cmd.collectMergedSessions(alloc, null, null);
+    var merged = try list_cmd.collectMergedSessions(io, alloc, null, null);
     defer merged.deinit();
 
     const response = try list_cmd.buildJsonResponse(merged.arena(), merged.entries.items);
@@ -1565,11 +1582,11 @@ test "list json includes disk-backed sessions with no live server" {
 
     var log_dir_buf: [256]u8 = undefined;
     const dirs = try setupReplayLogDir(alloc, "list-json", &log_dir_buf);
-    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = dirs.log_dir;
 
@@ -1577,7 +1594,7 @@ test "list json includes disk-backed sessions with no live server" {
         defer alloc.free(uuid);
     }
 
-    var merged = try list_cmd.collectMergedSessions(alloc, dirs.log_dir, null);
+    var merged = try list_cmd.collectMergedSessions(io, alloc, dirs.log_dir, null);
     defer merged.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), merged.entries.items.len);
@@ -1596,11 +1613,11 @@ test "list json preserves null names for unnamed disk-backed sessions" {
 
     var log_dir_buf: [256]u8 = undefined;
     const dirs = try setupReplayLogDir(alloc, "list-json-null-name", &log_dir_buf);
-    defer std.fs.cwd().deleteTree(dirs.log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = dirs.log_dir;
 
@@ -1614,7 +1631,7 @@ test "list json preserves null names for unnamed disk-backed sessions" {
         _ = try expectTestOk(parsed);
     }
 
-    var merged = try list_cmd.collectMergedSessions(alloc, dirs.log_dir, null);
+    var merged = try list_cmd.collectMergedSessions(io, alloc, dirs.log_dir, null);
     defer merged.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), merged.entries.items.len);
@@ -1634,15 +1651,15 @@ test "delete op removes the session record and its log files" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-delete-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -1666,8 +1683,8 @@ test "delete op removes the session record and its log files" {
     defer alloc.free(name_path);
 
     // Files must exist before delete.
-    try std.fs.accessAbsolute(uuid_path, .{});
-    try std.fs.accessAbsolute(name_path, .{});
+    try std.Io.Dir.accessAbsolute(io, uuid_path, .{});
+    try std.Io.Dir.accessAbsolute(io, name_path, .{});
 
     {
         var parsed = try testRequest(&registry, .{ .op = "delete", .session = "todelete" });
@@ -1676,8 +1693,8 @@ test "delete op removes the session record and its log files" {
     }
 
     // Log files are gone.
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(uuid_path, .{}));
-    try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(name_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, uuid_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, name_path, .{}));
 
     // Session is gone from the registry — list returns empty.
     {
@@ -1716,16 +1733,16 @@ test "named sessions stay reserved across registry restarts until delete" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-name-reservation-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = log_dir;
 
@@ -1742,7 +1759,7 @@ test "named sessions stay reserved across registry restarts until delete" {
     }
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = log_dir;
 
@@ -1859,7 +1876,7 @@ const ServerHarness = struct {
     fn deinit(self: *ServerHarness, alloc: std.mem.Allocator) void {
         self.stop.store(true, .release);
         self.thread.join();
-        std.fs.cwd().deleteTree(self.log_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(io, self.log_dir) catch {};
         alloc.destroy(self.ctx);
         alloc.free(self.socket_path);
         alloc.free(self.log_dir);
@@ -1876,7 +1893,7 @@ const ServerEntryCtx = struct {
     err_flag: *std.atomic.Value(bool),
 
     fn run(self: *ServerEntryCtx) void {
-        runServerWithOpts(self.alloc, self.socket_path, .{
+        runServerWithOpts(self.alloc, std.testing.io, self.socket_path, .{
             .empty_grace_ms = 30_000, // let stop_signal control exit
             .stop_signal = self.stop,
             .log_dir = self.log_dir,
@@ -1887,13 +1904,13 @@ const ServerEntryCtx = struct {
 };
 
 fn startServerHarness(alloc: std.mem.Allocator, tag: []const u8) !*ServerHarness {
-    const stamp = std.time.nanoTimestamp();
+    const stamp = sys.nanoTimestamp();
     const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-{s}-log-{d}", .{ tag, stamp });
     errdefer alloc.free(log_dir);
-    try std.fs.cwd().makePath(log_dir);
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
     return startServerHarnessImpl(alloc, tag, log_dir);
 }
 
@@ -1920,7 +1937,7 @@ fn startServerHarnessImpl(
     const harness = try alloc.create(ServerHarness);
     errdefer alloc.destroy(harness);
 
-    const stamp = std.time.nanoTimestamp();
+    const stamp = sys.nanoTimestamp();
 
     // Unix-socket paths are capped at ~104 bytes on macOS / ~108 on
     // Linux. Keep the path short and predictable; uniqueness comes from
@@ -1929,7 +1946,7 @@ fn startServerHarnessImpl(
     errdefer alloc.free(socket_path);
     // Clear any stale path from a previous run — the server unlinks on
     // its own, but this keeps the test hermetic if a prior run crashed.
-    std.fs.cwd().deleteFile(socket_path) catch {};
+    std.Io.Dir.cwd().deleteFile(io, socket_path) catch {};
 
     const ctx = try alloc.create(ServerEntryCtx);
     errdefer alloc.destroy(ctx);
@@ -1956,8 +1973,8 @@ fn startServerHarnessImpl(
     // Give the server a moment to create the socket file.
     var tries: usize = 0;
     while (tries < 50) : (tries += 1) {
-        std.fs.accessAbsolute(harness.socket_path, .{}) catch {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+        std.Io.Dir.accessAbsolute(io, harness.socket_path, .{}) catch {
+            sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
         return harness;
@@ -1973,7 +1990,7 @@ fn socketRequest(
     const request_line = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(request_line);
 
-    const stream = try std.net.connectUnixSocket(socket_path);
+    const stream = try sys.connectUnixSocket(socket_path);
     defer stream.close();
 
     try stream.writeAll(request_line);
@@ -1998,22 +2015,23 @@ test "startup reconciliation: legacy log without by-name symlink still reserves 
     // Prepare a log dir holding a legacy session log: the spawn header
     // names the session, but no by-name symlink exists (as written by hty
     // versions that predate the symlink).
-    const stamp = std.time.nanoTimestamp();
+    const stamp = sys.nanoTimestamp();
     const log_dir = try std.fmt.allocPrint(alloc, "/tmp/hty-reconcile-log-{d}", .{stamp});
     defer alloc.free(log_dir);
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
     const legacy_id = "00000000-0000-7000-8000-00000000abcd";
     {
         const legacy_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ log_dir, legacy_id });
         defer alloc.free(legacy_path);
-        const file = try std.fs.createFileAbsolute(legacy_path, .{ .mode = 0o600 });
-        defer file.close();
-        try file.writeAll(
+        const file = try std.Io.Dir.createFileAbsolute(io, legacy_path, .{ .permissions = @enumFromInt(0o600) });
+        defer file.close(io);
+        try file.writeStreamingAll(
+            io,
             "{\"t\":1,\"kind\":\"spawn\",\"program\":\"/bin/cat\",\"args\":[],\"name\":\"legacy-reserved\",\"rows\":8,\"cols\":24}\n",
         );
     }
@@ -2044,7 +2062,8 @@ test "startup reconciliation: legacy log without by-name symlink still reserves 
         const link_path = try std.fmt.allocPrint(alloc, "{s}/legacy-reserved.jsonl", .{by_name});
         defer alloc.free(link_path);
         var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = try std.fs.readLinkAbsolute(link_path, &target_buf);
+        const target_len = try std.Io.Dir.readLinkAbsolute(io, link_path, &target_buf);
+        const target = target_buf[0..target_len];
         const expected_target = try std.fmt.allocPrint(alloc, "../{s}.jsonl", .{legacy_id});
         defer alloc.free(expected_target);
         try std.testing.expectEqualStrings(expected_target, target);
@@ -2123,19 +2142,19 @@ test "concurrency: long wait_for_text does not block concurrent list (LatentEval
 
     // Small delay so the wait is definitely parked in the loop's waiter
     // table when we issue the competing list call.
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    sys.sleep(100 * std.time.ns_per_ms);
 
     // 3. Issue a `list` request and time it. In the pre-fix server this
     //    would queue behind the wait and return after ~1.5 seconds.
     //    After the fix it should return within a drain tick plus a bit
     //    of socket round-trip — well under 500ms on any CI runner.
-    const start = std.time.milliTimestamp();
+    const start = sys.milliTimestamp();
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = sys.milliTimestamp() - start;
 
     // Generous budget: the pre-fix behavior would be ~1500ms (the wait's
     // full timeout). 500ms gives plenty of slack for slow CI runners
@@ -2204,18 +2223,18 @@ test "concurrency: eight parked waits do not stall a fresh list (event loop)" {
     }
 
     // Let all eight waits reach the server and park.
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    sys.sleep(200 * std.time.ns_per_ms);
 
     // A fresh connection's `list` must complete within its usual budget —
     // with thread-per-connection this held because threads are cheap;
     // with the loop it holds because parked waits don't run at all.
-    const start = std.time.milliTimestamp();
+    const start = sys.milliTimestamp();
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
         _ = try expectTestOk(parsed);
     }
-    const elapsed = std.time.milliTimestamp() - start;
+    const elapsed = sys.milliTimestamp() - start;
     try std.testing.expect(elapsed < 500);
 
     // Every wait must still resolve with its own timeout response.
@@ -2244,7 +2263,7 @@ test "oversized request line gets a structured error and the server keeps servin
     //    newline. The server must reply with a structured error instead
     //    of buffering the flood until it OOMs.
     {
-        const stream = try std.net.connectUnixSocket(harness.socket_path);
+        const stream = try sys.connectUnixSocket(harness.socket_path);
         defer stream.close();
 
         const filler = try alloc.alloc(u8, 64 * 1024);
@@ -2330,7 +2349,7 @@ test "concurrency: server shuts down cleanly while a wait handler is in flight" 
     var wait_ctx = WaitCtx{ .alloc = alloc, .socket_path = harness.socket_path };
     const wait_thread = try std.Thread.spawn(.{}, WaitCtx.run, .{&wait_ctx});
 
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    sys.sleep(50 * std.time.ns_per_ms);
 
     // Kill the session — handleKill transitions status to .killed, which
     // handleWaitForExit observes on its next poll (25ms).
@@ -2447,11 +2466,11 @@ test "info json top-level version agrees with build.describe" {
 
 test "info json with a live server reports pid and uptime" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // Make the uptime non-zero so the assertion has something to check.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    sys.sleep(5 * std.time.ns_per_ms);
 
     var parsed = try testRequest(&registry, .{ .op = "info" });
     defer parsed.deinit();
@@ -2476,7 +2495,7 @@ test "info json with a live server reports pid and uptime" {
 
 test "run json returns a session with id, name, program, and args (issue #22)" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{
@@ -2525,7 +2544,7 @@ test "run json returns a session with id, name, program, and args (issue #22)" {
 
 test "wait --json text match reports matched, elapsed_ms, and text.needle+offset" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2591,7 +2610,7 @@ test "wait --json text match reports matched, elapsed_ms, and text.needle+offset
 
 test "wait --json regex match reports a real byte offset in text.offset" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2661,7 +2680,7 @@ test "wait --json regex match reports a real byte offset in text.offset" {
 
 test "wait --json idle match reports matched=idle and elapsed_ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2705,7 +2724,7 @@ test "wait --json idle match reports matched=idle and elapsed_ms" {
 
 test "wait --json exit match reports matched=exit and exit.code" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // `true` exits immediately with code 0. Resolve via PATH so this works
@@ -2755,7 +2774,7 @@ test "wait --json exit match reports matched=exit and exit.code" {
 
 test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2816,7 +2835,7 @@ test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
 
 test "wait_and_snapshot kind=idle returns matched=idle, elapsed_ms, and snapshot" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2865,7 +2884,7 @@ test "wait_and_snapshot kind=idle returns matched=idle, elapsed_ms, and snapshot
 
 test "wait_and_snapshot kind=text matches a string and includes the buffer" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2916,7 +2935,7 @@ test "wait_and_snapshot kind=text matches a string and includes the buffer" {
 
 test "wait_and_snapshot kind=duration sleeps at least the requested ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2957,7 +2976,7 @@ test "wait_and_snapshot kind=duration sleeps at least the requested ms" {
 
 test "wait_and_snapshot snapshot=false omits the snapshot field" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2999,7 +3018,7 @@ test "wait_and_snapshot snapshot=false omits the snapshot field" {
 
 test "wait_and_snapshot kind=none with snapshot=true returns the snapshot immediately" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3039,7 +3058,7 @@ test "wait_and_snapshot kind=none with snapshot=true returns the snapshot immedi
 
 test "wait_and_snapshot kind=text reports timed_out=true on timeout" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3087,7 +3106,7 @@ test "wait_and_snapshot --wait-until-idle has op-start floor (no instant fire af
     // sit through at least the requested idle window even when no fresh
     // screen change is observed during the op.
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3105,7 +3124,7 @@ test "wait_and_snapshot --wait-until-idle has op-start floor (no instant fire af
     // Drain the initial spawn screen change, then sit idle long enough
     // that any naive `now - last_screen_change` would already exceed our
     // target idle_ms.
-    std.Thread.sleep(250 * std.time.ns_per_ms);
+    sys.sleep(250 * std.time.ns_per_ms);
     {
         var parsed = try testRequest(&registry, .{
             .op = "wait_and_snapshot",
@@ -3136,7 +3155,7 @@ test "wait_and_snapshot timeout_ms=0 disables the timeout" {
     // when the wait condition is satisfied. Pair with a quick-firing
     // condition (a 30ms idle window) so the test isn't slow.
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3177,7 +3196,7 @@ test "wait_and_snapshot timeout_ms=0 disables the timeout" {
 
 test "wait_and_snapshot kind=regex matches a pattern and reports matched=regex" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3231,7 +3250,7 @@ test "wait_and_snapshot kind=regex matches a pattern and reports matched=regex" 
 
 test "wait_and_snapshot kind=exit returns matched=exit and the exit code" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
@@ -3300,13 +3319,13 @@ fn setupAttachLogDir(alloc: std.mem.Allocator, tag: []const u8) ![]u8 {
     const log_dir = try std.fmt.allocPrint(
         alloc,
         "/tmp/hty-attach-{s}-{d}",
-        .{ tag, std.time.nanoTimestamp() },
+        .{ tag, sys.nanoTimestamp() },
     );
     errdefer alloc.free(log_dir);
-    try std.fs.cwd().makePath(log_dir);
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
     return log_dir;
 }
 
@@ -3314,9 +3333,9 @@ fn setupAttachLogDir(alloc: std.mem.Allocator, tag: []const u8) ![]u8 {
 fn readAttachLog(alloc: std.mem.Allocator, log_dir: []const u8, name: []const u8) ![]u8 {
     const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/{s}.jsonl", .{ log_dir, name });
     defer alloc.free(link_path);
-    const file = try std.fs.openFileAbsolute(link_path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(alloc, 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
+    defer file.close(io);
+    return try readFileToEnd(file, alloc, 1024 * 1024);
 }
 
 /// Parse a JSONL log into owned objects. Caller frees the returned slice
@@ -3354,9 +3373,9 @@ test "issue #33: send ops tag log events with origin=send" {
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "send-origin");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3406,12 +3425,12 @@ test "issue #33: send ops tag log events with origin=send" {
     try std.testing.expect(saw_input);
 }
 
-/// Make a connected socketpair and return (local, peer) as `std.net.Stream`s.
+/// Make a connected socketpair and return (local, peer) as `sys.Stream`s.
 /// Caller closes both. `local` is the end we hand to `AttachClient`; `peer`
 /// is the end the test uses to pretend to be an attach client.
 const SocketPair = struct {
-    local: std.net.Stream,
-    peer: std.net.Stream,
+    local: sys.Stream,
+    peer: sys.Stream,
 };
 
 fn makeSocketPair() !SocketPair {
@@ -3431,7 +3450,7 @@ fn makeSocketPair() !SocketPair {
 fn registerAttachClient(
     alloc: std.mem.Allocator,
     sess: *session_mod_tests.Session,
-    local: std.net.Stream,
+    local: sys.Stream,
 ) !*AttachClientTest {
     var uuid_buf: [36]u8 = undefined;
     uuid_mod_tests.generateUuidV7(&uuid_buf);
@@ -3472,9 +3491,9 @@ test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "attach-lifecycle");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3558,9 +3577,9 @@ test "issue #33: interleaved send/attach produces ordered origin labels" {
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "interleaved");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3668,9 +3687,9 @@ test "issue #33: abrupt attach drop still logs attach_disconnect" {
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "abrupt");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3738,7 +3757,7 @@ test "issue #33: pre-feature log parses through replayToTerminal (backward compa
         \\{"t":1700000000120,"kind":"exited","code":0}
     ;
 
-    var result = try replay_mod.replayToTerminal(alloc, legacy_log, 24, 80);
+    var result = try replay_mod.replayToTerminal(io, alloc, legacy_log, 24, 80);
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 24), result.rows);
     try std.testing.expectEqual(@as(u16, 80), result.cols);
@@ -3798,10 +3817,10 @@ test "issue #33: hty logs renders [send] and [attach] prefixes" {
 /// `readLine` as many times as needed, then call `deinit`.
 const LineReader = struct {
     alloc: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: sys.Stream,
     buf: std.array_list.Managed(u8),
 
-    fn init(alloc: std.mem.Allocator, stream: std.net.Stream) LineReader {
+    fn init(alloc: std.mem.Allocator, stream: sys.Stream) LineReader {
         return .{
             .alloc = alloc,
             .stream = stream,
@@ -3816,7 +3835,7 @@ const LineReader = struct {
     /// Read until the next '\n' and return the bytes before it (newline
     /// consumed but not returned). Caller owns the returned slice.
     fn readLine(self: *LineReader, timeout_ms: u64) ![]u8 {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = sys.nanoTimestamp();
         const deadline_ns = start_ns + @as(i128, @intCast(timeout_ms * std.time.ns_per_ms));
 
         // Serve from the existing buffer if a full line is already there.
@@ -3831,7 +3850,7 @@ const LineReader = struct {
                 .events = std.posix.POLL.IN,
                 .revents = 0,
             }};
-            const now_ns = std.time.nanoTimestamp();
+            const now_ns = sys.nanoTimestamp();
             if (now_ns >= deadline_ns) return error.ReadTimeout;
             const remaining_ms: i32 = @intCast(@divTrunc(deadline_ns - now_ns, std.time.ns_per_ms));
             const rc = try std.posix.poll(&pfd, @max(1, remaining_ms));
@@ -3860,9 +3879,9 @@ test "issue #29: watch against existing session receives started + initial snaps
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "watch-existing");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3949,9 +3968,9 @@ test "issue #84: watch client sending repaint receives a full-screen output snap
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "watch-repaint");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4058,8 +4077,8 @@ test "issue #84: watch client sending repaint receives a full-screen output snap
 /// Open a raw attach-style connection against a harness server: connect
 /// to the Unix socket and write the request line. The caller reads
 /// frames off the returned stream (and owns/closes it).
-fn openStreamingConn(socket_path: []const u8, request_line: []const u8) !std.net.Stream {
-    const stream = try std.net.connectUnixSocket(socket_path);
+fn openStreamingConn(socket_path: []const u8, request_line: []const u8) !sys.Stream {
+    const stream = try sys.connectUnixSocket(socket_path);
     errdefer stream.close();
     try stream.writeAll(request_line);
     try stream.writeAll("\n");
@@ -4075,9 +4094,9 @@ fn expectFrameKind(
     expected_kind: []const u8,
     timeout_ms: u64,
 ) ![]const u8 {
-    const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    const deadline_ns = sys.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
     while (true) {
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = sys.nanoTimestamp();
         if (now_ns >= deadline_ns) return error.FrameTimeout;
         const remaining_ms: u64 = @intCast(@divTrunc(deadline_ns - now_ns, std.time.ns_per_ms));
         const line = try reader.readLine(@max(1, remaining_ms));
@@ -4202,9 +4221,9 @@ test "issue #29: promoted watcher streams live output (regression: post-promotio
     var saw_l1 = false;
     var saw_l2 = false;
     var saw_l3 = false;
-    const total_deadline_ns = std.time.nanoTimestamp() + @as(i128, 10_000) * std.time.ns_per_ms;
+    const total_deadline_ns = sys.nanoTimestamp() + @as(i128, 10_000) * std.time.ns_per_ms;
     while (!(saw_l1 and saw_l2 and saw_l3)) {
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = sys.nanoTimestamp();
         if (now_ns >= total_deadline_ns) break;
         const remaining_ms: u64 = @intCast(@divTrunc(total_deadline_ns - now_ns, std.time.ns_per_ms));
         const bytes = expectFrameKind(alloc, &reader, "output", @max(50, remaining_ms)) catch break;
@@ -4229,9 +4248,9 @@ test "issue #29: read-only input frames are dropped by the server" {
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "watch-readonly-drop");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4354,7 +4373,7 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
     // then a few more. Every write must report success (client under its
     // buffer bound) and must not block.
     var frame: [8192]u8 = undefined;
-    var expected = std.ArrayListUnmanaged(u8){};
+    var expected = std.ArrayListUnmanaged(u8).empty;
     defer expected.deinit(alloc);
     var seq: u8 = 0;
     while (true) {
@@ -4373,13 +4392,13 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
     // pump does). Every byte must arrive, in write order.
     var received: usize = 0;
     var chunk: [8192]u8 = undefined;
-    var drain_timer = try std.time.Timer.start();
+    var drain_timer = try sys.Timer.start();
     while (received < expected.items.len) {
         try std.testing.expect(drain_timer.read() < 10 * std.time.ns_per_s);
         client.flushPending();
-        const n = std.posix.recv(pair.peer.handle, &chunk, std.posix.MSG.DONTWAIT) catch |err| switch (err) {
+        const n = sys.recv(pair.peer.handle, &chunk, std.posix.MSG.DONTWAIT) catch |err| switch (err) {
             error.WouldBlock => {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                sys.sleep(1 * std.time.ns_per_ms);
                 continue;
             },
             else => return err,
@@ -4411,9 +4430,9 @@ test "hardening: stalled attach reader does not block the pump; list completes a
     const alloc = std.testing.allocator;
     const log_dir = try setupAttachLogDir(alloc, "stalled-reader");
     defer alloc.free(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4448,7 +4467,7 @@ test "hardening: stalled attach reader does not block the pump; list completes a
     // is dropped + reaped instead, and `list` keeps completing between
     // pumps.
     var reaped = false;
-    var overall_timer = try std.time.Timer.start();
+    var overall_timer = try sys.Timer.start();
     while (overall_timer.read() < 60 * std.time.ns_per_s) {
         registry.pump();
         {
@@ -4460,7 +4479,7 @@ test "hardening: stalled attach reader does not block the pump; list completes a
             reaped = true;
             break;
         }
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        sys.sleep(5 * std.time.ns_per_ms);
     }
     try std.testing.expect(reaped);
 
@@ -4476,7 +4495,7 @@ test "hardening: stalled attach reader does not block the pump; list completes a
         defer idle.deinit();
         _ = try expectTestOk(idle);
     }
-    var list_timer = try std.time.Timer.start();
+    var list_timer = try sys.Timer.start();
     {
         var parsed = try testRequest(&registry, .{ .op = "list" });
         defer parsed.deinit();
@@ -4490,9 +4509,9 @@ test "hardening: stalled attach reader does not block the pump; list completes a
     {
         const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/stalled.jsonl", .{log_dir});
         defer alloc.free(link_path);
-        const file = try std.fs.openFileAbsolute(link_path, .{});
-        defer file.close();
-        const contents = try file.readToEndAlloc(alloc, 64 * 1024 * 1024);
+        const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
+        defer file.close(io);
+        const contents = try readFileToEnd(file, alloc, 64 * 1024 * 1024);
         defer alloc.free(contents);
         try std.testing.expect(std.mem.indexOf(u8, contents, "\"kind\":\"attach_disconnect\"") != null);
     }
@@ -4544,7 +4563,7 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
     // completing, and the overflowed watcher must get dropped with an
     // `attach_disconnect` in the session log (the loop's reap path).
     var dropped = false;
-    var overall_timer = try std.time.Timer.start();
+    var overall_timer = try sys.Timer.start();
     const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/connstall.jsonl", .{harness.log_dir});
     defer alloc.free(link_path);
     while (overall_timer.read() < 60 * std.time.ns_per_s) {
@@ -4553,13 +4572,13 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
             defer parsed.deinit();
             _ = try expectTestOk(parsed);
         }
-        const file = std.fs.openFileAbsolute(link_path, .{}) catch {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+        const file = std.Io.Dir.openFileAbsolute(io, link_path, .{}) catch {
+            sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
-        defer file.close();
-        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+        defer file.close(io);
+        const contents = readFileToEnd(file, alloc, 64 * 1024 * 1024) catch {
+            sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
         defer alloc.free(contents);
@@ -4567,7 +4586,7 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
             dropped = true;
             break;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        sys.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expect(dropped);
 
@@ -4583,7 +4602,7 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
         defer idle.deinit();
         _ = try expectTestOk(idle);
     }
-    var list_timer = try std.time.Timer.start();
+    var list_timer = try sys.Timer.start();
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
@@ -4599,7 +4618,7 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
 }
 
 /// Send one attach `input` frame carrying `text` on an attach socket.
-fn sendInputFrame(alloc: std.mem.Allocator, stream: std.net.Stream, text: []const u8) !void {
+fn sendInputFrame(alloc: std.mem.Allocator, stream: sys.Stream, text: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -4745,7 +4764,7 @@ test "event loop: pending-input overflow drops without stalling the server" {
         payload_hex[i * 2] = hex_chars[b >> 4];
         payload_hex[i * 2 + 1] = hex_chars[b & 0xf];
     }
-    var flood_timer = try std.time.Timer.start();
+    var flood_timer = try sys.Timer.start();
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         var parsed = try socketRequest(alloc, harness.socket_path, .{
@@ -4760,7 +4779,7 @@ test "event loop: pending-input overflow drops without stalling the server" {
 
     // The server is still fully responsive: `list` answers within its
     // usual budget.
-    var list_timer = try std.time.Timer.start();
+    var list_timer = try sys.Timer.start();
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
@@ -4859,7 +4878,7 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
         payload_hex[i * 2] = hex_chars[b >> 4];
         payload_hex[i * 2 + 1] = hex_chars[b & 0xf];
     }
-    var flood_timer = try std.time.Timer.start();
+    var flood_timer = try sys.Timer.start();
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         {
@@ -4881,7 +4900,7 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
     // `attach_disconnect` shows up in the burst session's log while
     // `list` keeps answering.
     var dropped = false;
-    var overall_timer = try std.time.Timer.start();
+    var overall_timer = try sys.Timer.start();
     const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/deg-burst.jsonl", .{harness.log_dir});
     defer alloc.free(link_path);
     while (overall_timer.read() < 60 * std.time.ns_per_s) {
@@ -4890,13 +4909,13 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
             defer parsed.deinit();
             _ = try expectTestOk(parsed);
         }
-        const file = std.fs.openFileAbsolute(link_path, .{}) catch {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+        const file = std.Io.Dir.openFileAbsolute(io, link_path, .{}) catch {
+            sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
-        defer file.close();
-        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+        defer file.close(io);
+        const contents = readFileToEnd(file, alloc, 64 * 1024 * 1024) catch {
+            sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
         defer alloc.free(contents);
@@ -4904,7 +4923,7 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
             dropped = true;
             break;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        sys.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expect(dropped);
 
@@ -4922,7 +4941,7 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
     try expectTextFound(alloc, harness.socket_path, "deg-healthy", "HEALTHY-OK");
 
     // And `list` still meets its usual budget.
-    var list_timer = try std.time.Timer.start();
+    var list_timer = try sys.Timer.start();
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
@@ -4993,7 +5012,7 @@ test "event loop: wait_for_text resolves on the iteration output arrives (median
 
         // ...give the loop a beat to park it, so the measurement below
         // exercises the parked-waiter wakeup, not first-evaluation luck.
-        std.Thread.sleep(30 * std.time.ns_per_ms);
+        sys.sleep(30 * std.time.ns_per_ms);
 
         // Produce the needle and clock how long the parked wait takes to
         // answer after the send RPC has fully completed. The tty's echo
@@ -5008,7 +5027,7 @@ test "event loop: wait_for_text resolves on the iteration output arrives (median
             defer parsed.deinit();
             _ = try expectTestOk(parsed);
         }
-        var timer = try std.time.Timer.start();
+        var timer = try sys.Timer.start();
         const line = try reader.readLine(5000);
         defer alloc.free(line);
         sample.* = @intCast(timer.read() / std.time.ns_per_ms);
@@ -5061,8 +5080,8 @@ test "event loop: --remove session is auto-removed once its exit is observed" {
     // Child exits almost immediately; poll `list` until the sweep has
     // reaped the session. Ample headroom for CI.
     var removed = false;
-    const deadline = std.time.milliTimestamp() + 5_000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sys.milliTimestamp() + 5_000;
+    while (sys.milliTimestamp() < deadline) {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "list" });
         defer parsed.deinit();
         const object = try expectTestOk(parsed);
@@ -5071,7 +5090,7 @@ test "event loop: --remove session is auto-removed once its exit is observed" {
             removed = true;
             break;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        sys.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expect(removed);
 }
@@ -5095,12 +5114,12 @@ fn spawnMouseFixture(
     defer alloc.free(py);
 
     // Build args: scripts/fixtures/mouse-echo.py <modes...>
-    var args_list = std.ArrayListUnmanaged([]const u8){};
+    var args_list = std.ArrayListUnmanaged([]const u8).empty;
     defer args_list.deinit(alloc);
     try args_list.append(alloc, "scripts/fixtures/mouse-echo.py");
     for (modes) |m| try args_list.append(alloc, m);
 
-    var env_list = std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }){};
+    var env_list = std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }).empty;
     defer env_list.deinit(alloc);
     try env_list.append(alloc, .{ .key = "HTY_MOUSE_RECORD", .value = record_path });
 
@@ -5156,13 +5175,13 @@ fn killMouseFixture(registry: *SessionRegistry, name: []const u8) !void {
 
 test "mouse: snapshot exposes mouse state after app enables 1002+1006" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
-    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
     defer alloc.free(rec);
-    std.fs.deleteFileAbsolute(rec) catch {};
-    defer std.fs.deleteFileAbsolute(rec) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
 
     spawnMouseFixture(&registry, "mouse_snap", &.{ "1002", "1006" }, rec) catch |err| {
         if (err == error.SkipZigTest) return err;
@@ -5188,7 +5207,7 @@ test "mouse: snapshot exposes mouse state after app enables 1002+1006" {
 
 test "mouse: send_mouse refuses when mouse is disabled" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "no_mouse");
@@ -5222,13 +5241,13 @@ test "mouse: send_mouse refuses when mouse is disabled" {
 
 test "mouse: click emits SGR press+release when 1006 is enabled" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
-    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
     defer alloc.free(rec);
-    std.fs.deleteFileAbsolute(rec) catch {};
-    defer std.fs.deleteFileAbsolute(rec) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
 
     spawnMouseFixture(&registry, "mouse_click", &.{ "1002", "1006" }, rec) catch |err| {
         if (err == error.SkipZigTest) return err;
@@ -5272,12 +5291,12 @@ test "mouse: click emits SGR press+release when 1006 is enabled" {
     defer idle.deinit();
     _ = try expectTestOk(idle);
 
-    const file = std.fs.openFileAbsolute(rec, .{}) catch |err| {
+    const file = std.Io.Dir.openFileAbsolute(io, rec, .{}) catch |err| {
         std.debug.print("record file missing: {s}\n", .{@errorName(err)});
         return err;
     };
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 4096);
     defer alloc.free(contents);
 
     // Expected SGR wire: ESC [ < 0 ; 10 ; 5 M (press) then ESC [ < 0 ; 10 ; 5 m (release).
@@ -5287,13 +5306,13 @@ test "mouse: click emits SGR press+release when 1006 is enabled" {
 
 test "mouse: X10 coords out of range errors when SGR not negotiated" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
-    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
     defer alloc.free(rec);
-    std.fs.deleteFileAbsolute(rec) catch {};
-    defer std.fs.deleteFileAbsolute(rec) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
 
     // Only ?1000 (X10-only), no ?1006 — SGR must not be used.
     spawnMouseFixture(&registry, "mouse_oor", &.{"1000"}, rec) catch |err| {
@@ -5326,13 +5345,13 @@ test "mouse: X10 coords out of range errors when SGR not negotiated" {
 
 test "mouse: X10 encoding when only 1000 is on (no SGR)" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
-    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{std.time.nanoTimestamp()});
+    const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
     defer alloc.free(rec);
-    std.fs.deleteFileAbsolute(rec) catch {};
-    defer std.fs.deleteFileAbsolute(rec) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, rec) catch {};
 
     spawnMouseFixture(&registry, "mouse_x10", &.{"1000"}, rec) catch |err| {
         if (err == error.SkipZigTest) return err;
@@ -5362,9 +5381,9 @@ test "mouse: X10 encoding when only 1000 is on (no SGR)" {
     defer idle.deinit();
     _ = try expectTestOk(idle);
 
-    const file = try std.fs.openFileAbsolute(rec, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 4096);
+    const file = try std.Io.Dir.openFileAbsolute(io, rec, .{});
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 4096);
     defer alloc.free(contents);
 
     // X10 press: ESC [ M <0+32=' '> <col+32=35='#'> <row+32=34='"'>.
@@ -5386,11 +5405,11 @@ fn waitForDrainCondition(
     ctx: anytype,
     predicate: *const fn (@TypeOf(ctx)) bool,
 ) bool {
-    const start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - start < deadline_ms) {
+    const start = sys.milliTimestamp();
+    while (sys.milliTimestamp() - start < deadline_ms) {
         registry.pump();
         if (predicate(ctx)) return true;
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        sys.sleep(20 * std.time.ns_per_ms);
     }
     return false;
 }
@@ -5408,15 +5427,15 @@ test "run --remove: session is auto-removed after child exits" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-remove-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5453,15 +5472,15 @@ test "run --remove: session persists while child is alive" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-remove-live-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5484,7 +5503,7 @@ test "run --remove: session persists while child is alive" {
     // Pump a few passes to let the auto-remove sweep run; session should
     // stay because cat is still running.
     registry.pump();
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    sys.sleep(150 * std.time.ns_per_ms);
     registry.pump();
     try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
 
@@ -5514,15 +5533,15 @@ test "run --remove: manual hty kill races cleanly with auto-remove (no crash)" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-remove-race-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5576,15 +5595,15 @@ test "spawn without --remove keeps the session after exit" {
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-noremove-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5605,7 +5624,7 @@ test "spawn without --remove keeps the session after exit" {
     var i: usize = 0;
     while (i < 15) : (i += 1) {
         registry.pump();
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        sys.sleep(20 * std.time.ns_per_ms);
     }
     try std.testing.expectEqual(@as(usize, 1), sessionCount(&registry));
 }
@@ -5673,7 +5692,7 @@ test "delete during wait_for_text: wait returns structured error, no UAF" {
     // Give the wait time to park, then delete the session out from under
     // it. The loop resolves the parked waiter with the structured error
     // in the same iteration the delete dispatches.
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    sys.sleep(150 * std.time.ns_per_ms);
     {
         var parsed = try socketRequest(alloc, harness.socket_path, .{ .op = "delete", .session = "del-mid-wait" });
         defer parsed.deinit();
@@ -5699,7 +5718,7 @@ test "delete during wait_for_text: wait returns structured error, no UAF" {
 
 test "handler error mid-op releases the session borrow" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -5742,7 +5761,7 @@ test "handler error mid-op releases the session borrow" {
 
 test "deferred free: remove unpublishes immediately; storage survives until freeDoomed" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -5794,7 +5813,7 @@ test "deferred free: remove unpublishes immediately; storage survives until free
 // change stamp gating skips every subsequent poll — and the gate must not
 // stop a genuine screen change from being scanned and matched.
 test "wait polls skip snapshots while the screen is unchanged" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {

@@ -25,6 +25,7 @@
 //!   touching dispatch code — but none ships.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -71,10 +72,10 @@ pub const ReadyIter = struct {
 /// exactly one thread ever touches it.
 pub const Loop = struct {
     alloc: Allocator,
-    entries: std.ArrayListUnmanaged(Entry) = .{},
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
     /// Scratch pollfd array rebuilt by `buildPollSet`; retained between
     /// iterations so steady-state waits allocate nothing.
-    pollfds: std.ArrayListUnmanaged(posix.pollfd) = .{},
+    pollfds: std.ArrayListUnmanaged(posix.pollfd) = .empty,
 
     const Entry = struct {
         fd: posix.fd_t,
@@ -193,10 +194,10 @@ pub const Deadline = struct {
 /// stable: entries with equal deadlines pop in insertion order.
 ///
 /// Timestamps are absolute milliseconds on the caller's clock
-/// (`std.time.milliTimestamp` convention elsewhere in the server).
+/// (`sys.milliTimestamp` convention elsewhere in the server).
 pub const DeadlineTable = struct {
     alloc: Allocator,
-    entries: std.ArrayListUnmanaged(Deadline) = .{},
+    entries: std.ArrayListUnmanaged(Deadline) = .empty,
 
     pub fn init(alloc: Allocator) DeadlineTable {
         return .{ .alloc = alloc };
@@ -412,12 +413,12 @@ test "loop: waitReady yields the readable fd and skips quiet ones" {
     defer loop.deinit();
 
     // Two pipes: one gets a byte written (readable), one stays quiet.
-    const ready_pipe = try posix.pipe();
-    defer posix.close(ready_pipe[0]);
-    defer posix.close(ready_pipe[1]);
-    const quiet_pipe = try posix.pipe();
-    defer posix.close(quiet_pipe[0]);
-    defer posix.close(quiet_pipe[1]);
+    const ready_pipe = try sys.pipe();
+    defer sys.close(ready_pipe[0]);
+    defer sys.close(ready_pipe[1]);
+    const quiet_pipe = try sys.pipe();
+    defer sys.close(quiet_pipe[0]);
+    defer sys.close(quiet_pipe[1]);
 
     try loop.registerFd(quiet_pipe[0], .{});
     try loop.registerFd(ready_pipe[0], .{});
@@ -426,7 +427,7 @@ test "loop: waitReady yields the readable fd and skips quiet ones" {
     var it = try loop.waitReady(0);
     try std.testing.expect(it.next() == null);
 
-    _ = try posix.write(ready_pipe[1], "x");
+    _ = try sys.write(ready_pipe[1], "x");
 
     it = try loop.waitReady(0);
     const ready = it.next().?;

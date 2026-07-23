@@ -2,6 +2,7 @@
 //! This is the client half; the server broadcast lives in `../attach.zig`.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -41,7 +42,7 @@ pub fn helpText() []const u8 {
 /// a resize frame when set. Atomic so the signal handler stays trivial.
 var attach_resized = std.atomic.Value(bool).init(false);
 
-fn attachSigwinchHandler(_: i32) callconv(.c) void {
+fn attachSigwinchHandler(_: std.posix.SIG) callconv(.c) void {
     attach_resized.store(true, .release);
 }
 
@@ -55,7 +56,7 @@ fn attachSigwinchHandler(_: i32) callconv(.c) void {
 /// `{"kind":"started"}` frame. Once that happens, the main thread
 /// installs raw mode / SIGWINCH and falls into the regular input loop.
 const AttachClientState = struct {
-    stream: std.net.Stream,
+    stream: sys.Stream,
     done: std.atomic.Value(bool) = .init(false),
     waiting: std.atomic.Value(bool) = .init(false),
     started: std.atomic.Value(bool) = .init(false),
@@ -82,7 +83,7 @@ const AttachClientState = struct {
     }
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -96,7 +97,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 
     const stdin_fd = std.posix.STDIN_FILENO;
     const stdout_fd = std.posix.STDOUT_FILENO;
-    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    const stdin_is_tty = sys.isatty(stdin_fd);
 
     // Read observer terminal dimensions so we can resize the PTY to match.
     var winsize = std.mem.zeroes(c.winsize);
@@ -111,20 +112,20 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {
+    var stream = ensure.ensureServer(alloc, io, socket_path, .{}) catch {
         try common.printErr("hty attach: cannot connect to server");
         std.process.exit(common.ExitCode.generic);
     };
 
-    var request_buf = std.array_list.Managed(u8).init(alloc);
+    var request_buf: std.Io.Writer.Allocating = .init(alloc);
     defer request_buf.deinit();
-    try request_buf.appendSlice("{\"op\":\"attach\"");
+    try request_buf.writer.writeAll("{\"op\":\"attach\"");
     if (session_ref) |s| {
-        try request_buf.appendSlice(",\"session\":");
-        try common.writeJsonString(request_buf.writer().any(), s);
+        try request_buf.writer.writeAll(",\"session\":");
+        try common.writeJsonString(&request_buf.writer, s);
     }
-    try request_buf.writer().any().print(",\"rows\":{d},\"cols\":{d}}}\n", .{ init_rows, init_cols });
-    stream.writeAll(request_buf.items) catch {
+    try request_buf.writer.print(",\"rows\":{d},\"cols\":{d}}}\n", .{ init_rows, init_cols });
+    stream.writeAll(request_buf.writer.buffered()) catch {
         stream.close();
         try common.printErr("hty attach: failed to send attach request");
         std.process.exit(common.ExitCode.generic);
@@ -232,14 +233,14 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
                     if (cancel) {
                         shared.done.store(true, .release);
                         _ = stream.writeAll("{\"op\":\"detach\"}\n") catch {};
-                        std.posix.shutdown(stream.handle, .both) catch {};
+                        sys.shutdown(stream.handle, .both) catch {};
                         reader_thread.join();
                         stream.close();
                         return;
                     }
                 }
             } else {
-                std.Thread.sleep(25 * std.time.ns_per_ms);
+                sys.sleep(25 * std.time.ns_per_ms);
             }
         }
 
@@ -402,7 +403,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // Signal the reader thread to wind down and join it.
     shared.done.store(true, .release);
     _ = stream.writeAll("{\"op\":\"detach\"}\n") catch {};
-    std.posix.shutdown(stream.handle, .both) catch {};
+    sys.shutdown(stream.handle, .both) catch {};
     reader_thread.join();
     stream.close();
 }
@@ -463,7 +464,7 @@ fn handleAttachServerFrame(
         shared.started.store(true, .release);
         if (shared.waiting.load(.acquire)) {
             shared.waiting.store(false, .release);
-            _ = std.posix.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
+            _ = sys.write(stdout_fd, "\x1b[2J\x1b[H") catch {};
         }
         return;
     }
@@ -480,7 +481,7 @@ fn handleAttachServerFrame(
         }
         const bytes = hex.decodeHex(alloc, hex_val.string) catch return;
         defer alloc.free(bytes);
-        _ = std.posix.write(stdout_fd, bytes) catch {};
+        _ = sys.write(stdout_fd, bytes) catch {};
         return;
     }
 
@@ -543,8 +544,8 @@ pub fn runInteractive(
 ) !void {
     const stdin_fd = std.posix.STDIN_FILENO;
     const stdout_fd = std.posix.STDOUT_FILENO;
-    const stdin_is_tty = std.posix.isatty(stdin_fd);
-    const stdout_is_tty = std.posix.isatty(stdout_fd);
+    const stdin_is_tty = sys.isatty(stdin_fd);
+    const stdout_is_tty = sys.isatty(stdout_fd);
     const use_alt = opts.use_alt_screen and stdout_is_tty;
 
     if (opts.suppress_initial_snapshot) {
@@ -642,7 +643,7 @@ pub fn runInteractive(
 
         if (!stdin_is_tty) {
             // No stdin to forward — just wait for the reader thread.
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+            sys.sleep(25 * std.time.ns_per_ms);
             continue;
         }
 
@@ -696,7 +697,7 @@ pub fn runInteractive(
 
     shared.done.store(true, .release);
     _ = shared.stream.writeAll("{\"op\":\"detach\"}\n") catch {};
-    std.posix.shutdown(shared.stream.handle, .both) catch {};
+    sys.shutdown(shared.stream.handle, .both) catch {};
     reader_thread.join();
 }
 
@@ -705,6 +706,7 @@ pub fn runInteractive(
 /// and run the interactive phase. Returns the child's exit code if the
 /// session exited while attached, null if the user detached.
 pub fn attachToExistingSession(
+    io: std.Io,
     alloc: Allocator,
     session_id: []const u8,
     init_rows: u16,
@@ -713,17 +715,17 @@ pub fn attachToExistingSession(
     const socket_path = common.resolveSocketPathOrExit(alloc);
     defer alloc.free(socket_path);
 
-    var stream = ensure.ensureServer(alloc, socket_path, .{}) catch {
+    var stream = ensure.ensureServer(alloc, io, socket_path, .{}) catch {
         try common.printErr("hty run --attach: cannot connect to server");
         std.process.exit(common.ExitCode.generic);
     };
 
-    var request_buf = std.array_list.Managed(u8).init(alloc);
+    var request_buf: std.Io.Writer.Allocating = .init(alloc);
     defer request_buf.deinit();
-    try request_buf.appendSlice("{\"op\":\"attach\",\"session\":");
-    try common.writeJsonString(request_buf.writer().any(), session_id);
-    try request_buf.writer().any().print(",\"rows\":{d},\"cols\":{d}}}\n", .{ init_rows, init_cols });
-    stream.writeAll(request_buf.items) catch {
+    try request_buf.writer.writeAll("{\"op\":\"attach\",\"session\":");
+    try common.writeJsonString(&request_buf.writer, session_id);
+    try request_buf.writer.print(",\"rows\":{d},\"cols\":{d}}}\n", .{ init_rows, init_cols });
+    stream.writeAll(request_buf.writer.buffered()) catch {
         stream.close();
         try common.printErr("hty run --attach: failed to send attach request");
         std.process.exit(common.ExitCode.generic);
@@ -787,7 +789,7 @@ pub fn attachToExistingSession(
     defer if (preload.len > 0) alloc.free(preload);
 
     var shared = AttachClientState{ .stream = stream };
-    const stdout_is_tty = std.posix.isatty(std.posix.STDOUT_FILENO);
+    const stdout_is_tty = sys.isatty(std.posix.STDOUT_FILENO);
     try runInteractive(alloc, &shared, .{
         .preload = preload,
         .send_initial_resize = false,

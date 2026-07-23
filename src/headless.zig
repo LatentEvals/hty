@@ -56,18 +56,17 @@ pub const std_options: std.Options = .{
     .log_level = .err,
 };
 
-fn writeUsageError(arg: []const u8) !void {
+fn writeUsageError(io: std.Io, arg: []const u8) !void {
     const alloc = std.heap.c_allocator;
     const message = try std.fmt.allocPrint(alloc, "unknown subcommand: {s}\n\n{s}", .{ arg, commands.help_mod.generalHelpText() });
     defer alloc.free(message);
-    var stderr = std.fs.File.stderr();
-    _ = try stderr.writeAll(message);
+    try std.Io.File.stderr().writeStreamingAll(io, message);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const alloc = std.heap.c_allocator;
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const io = init.io;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         try commands.common_mod.printRaw(commands.help_mod.generalHelpText());
@@ -92,30 +91,30 @@ pub fn main() !void {
             try commands.common_mod.printErr("__server__ requires a socket path");
             std.process.exit(ExitCode.generic);
         }
-        try runServer(alloc, args[2]);
+        try runServer(alloc, io, args[2]);
         return;
     }
 
     const subargs = args[2..];
     if (std.mem.eql(u8, verb, "--help") or std.mem.eql(u8, verb, "-h") or std.mem.eql(u8, verb, "help")) {
-        try commands.help_mod.run(alloc, subargs);
+        try commands.help_mod.run(alloc, io, subargs);
         return;
     }
-    if (std.mem.eql(u8, verb, "keys")) return commands.keys_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "info")) return commands.info_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "run")) return commands.run_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "list")) return commands.list_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "watch")) return commands.watch_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "send")) return commands.send_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "snapshot")) return commands.snapshot_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "wait")) return commands.wait_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "kill")) return commands.kill_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "delete")) return commands.delete_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "logs")) return commands.logs_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "export")) return commands.export_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "replay")) return commands.replay_mod.run(alloc, subargs);
-    if (std.mem.eql(u8, verb, "attach")) return commands.attach_mod.run(alloc, subargs);
+    if (std.mem.eql(u8, verb, "keys")) return commands.keys_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "info")) return commands.info_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "run")) return commands.run_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "list")) return commands.list_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "watch")) return commands.watch_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "send")) return commands.send_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "snapshot")) return commands.snapshot_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "wait")) return commands.wait_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "kill")) return commands.kill_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "delete")) return commands.delete_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "logs")) return commands.logs_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "export")) return commands.export_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "replay")) return commands.replay_mod.run(alloc, io, subargs);
+    if (std.mem.eql(u8, verb, "attach")) return commands.attach_mod.run(alloc, io, subargs);
 
-    try writeUsageError(verb);
+    try writeUsageError(io, verb);
     std.process.exit(ExitCode.generic);
 }

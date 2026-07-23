@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const sys = @import("sys.zig");
 const builtin = @import("builtin");
 pub const ghostty_vt = @import("ghostty-vt");
 pub const Normalize = @import("Normalize");
@@ -125,9 +126,9 @@ pub const InteractiveTerminal = struct {
     master_fd: std.posix.fd_t,
     child_pid: std.posix.pid_t,
     reader_thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
-    write_mutex: std.Thread.Mutex = .{},
-    events: std.ArrayListUnmanaged(OutputEvent) = .{},
+    mutex: sys.Mutex = .{},
+    write_mutex: sys.Mutex = .{},
+    events: std.ArrayListUnmanaged(OutputEvent) = .empty,
     /// Index of the next event `pollEvent` returns. Consuming from the
     /// front by bumping this index (instead of `orderedRemove(0)`) keeps
     /// polling O(1); the buffer is recycled whenever the queue drains.
@@ -148,6 +149,7 @@ pub const InteractiveTerminal = struct {
 
     pub fn spawn(
         alloc: std.mem.Allocator,
+        io: std.Io,
         command: CommandSpec,
         config: TerminalConfig,
     ) !*InteractiveTerminal {
@@ -195,10 +197,10 @@ pub const InteractiveTerminal = struct {
         // errdefers run in reverse order: kill+reap fires before close so
         // the child is gone before we drop the master end of its pty.
         const child_pid: std.posix.pid_t = @intCast(pid);
-        errdefer std.posix.close(master);
+        errdefer sys.close(master);
         errdefer {
             _ = c.kill(child_pid, c.SIGKILL);
-            _ = std.posix.waitpid(child_pid, 0);
+            _ = sys.waitpid(child_pid, 0);
         }
 
         var self = try alloc.create(InteractiveTerminal);
@@ -206,7 +208,7 @@ pub const InteractiveTerminal = struct {
 
         self.* = .{
             .alloc = alloc,
-            .terminal = try ghostty_vt.Terminal.init(alloc, .{
+            .terminal = try ghostty_vt.Terminal.init(io, alloc, .{
                 .cols = config.cols,
                 .rows = config.rows,
                 .max_scrollback = config.scrollback,
@@ -245,7 +247,7 @@ pub const InteractiveTerminal = struct {
             // Threadless (server-path) terminal whose child was never
             // reaped: kill() above sent SIGKILL, so this blocking reap
             // returns promptly and no zombie outlives the terminal.
-            _ = std.posix.waitpid(self.child_pid, 0);
+            _ = sys.waitpid(self.child_pid, 0);
             self.reaped = true;
         }
 
@@ -281,7 +283,7 @@ pub const InteractiveTerminal = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.terminal.resize(self.alloc, cols, rows);
+        try self.terminal.resize(self.alloc, .{ .cols = cols, .rows = rows });
         self.config.rows = rows;
         self.config.cols = cols;
         if (self.config.emit_screen_updates) {
@@ -387,7 +389,7 @@ pub const InteractiveTerminal = struct {
 
         if (!already_closed) {
             _ = c.kill(self.child_pid, c.SIGKILL);
-            std.posix.close(self.master_fd);
+            sys.close(self.master_fd);
         }
     }
 
@@ -423,7 +425,7 @@ pub const InteractiveTerminal = struct {
         self.reaped = true;
         if (!self.closed) {
             self.closed = true;
-            std.posix.close(self.master_fd);
+            sys.close(self.master_fd);
         }
     }
 
@@ -477,7 +479,7 @@ pub const InteractiveTerminal = struct {
             self.mutex.unlock();
         }
 
-        const wait_result = std.posix.waitpid(self.child_pid, 0);
+        const wait_result = sys.waitpid(self.child_pid, 0);
         const status = @as(c_int, @intCast(wait_result.status));
         const exit_code: ?i32 = if (c.WIFEXITED(status))
             c.WEXITSTATUS(status)
@@ -500,7 +502,7 @@ pub const InteractiveTerminal = struct {
 
         var index: usize = 0;
         while (index < bytes.len) {
-            const written = try std.posix.write(self.master_fd, bytes[index..]);
+            const written = try sys.write(self.master_fd, bytes[index..]);
             if (written == 0) return error.ShortWrite;
             index += written;
         }
@@ -625,7 +627,7 @@ fn buildEnvp(
 ) ![]?[*:0]u8 {
     const has_term = hasEnvKey(env, "TERM");
 
-    var list: std.ArrayListUnmanaged(?[*:0]u8) = .{};
+    var list: std.ArrayListUnmanaged(?[*:0]u8) = .empty;
     errdefer {
         for (list.items) |maybe_ptr| {
             if (maybe_ptr) |ptr| alloc.free(std.mem.span(ptr));
@@ -710,7 +712,7 @@ fn resolveProgram(
         // POSIX: an empty PATH component means the current directory.
         const base = if (dir.len == 0) "." else dir;
         const candidate = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ base, program }, 0);
-        std.posix.accessZ(candidate, std.posix.X_OK) catch {
+        sys.accessZ(candidate, std.posix.X_OK) catch {
             alloc.free(candidate);
             continue;
         };
@@ -748,11 +750,6 @@ pub fn buildCells(
     defer render_state.deinit(alloc);
     try render_state.update(alloc, terminal);
 
-    // Init the Unicode NFC normalizer once per snapshot. Per-cell init
-    // would allocate the full Normalize tables on every grapheme, which
-    // is orders of magnitude more expensive than the normalization itself.
-    const normalize = try Normalize.init(alloc);
-    defer normalize.deinit(alloc);
 
     const row_slice = render_state.row_data.slice();
     const render_rows = row_slice.items(.cells);
@@ -781,7 +778,7 @@ pub fn buildCells(
             const graphemes = cell_slice.items(.grapheme);
 
             for (0..cols) |x_usize| {
-                row[cells_built] = try renderCellString(alloc, &normalize, raw_cells, graphemes, x_usize);
+                row[cells_built] = try renderCellString(alloc, raw_cells, graphemes, x_usize);
                 cells_built += 1;
             }
         } else {
@@ -799,7 +796,6 @@ pub fn buildCells(
 
 fn renderCellString(
     alloc: std.mem.Allocator,
-    normalize: *const Normalize,
     raw_cells: anytype,
     graphemes: anytype,
     x: usize,
@@ -830,7 +826,7 @@ fn renderCellString(
             const len = try std.unicode.utf8Encode(cp, &tmp);
             try buf.appendSlice(tmp[0..len]);
         }
-        var result = try normalize.nfc(alloc, buf.items);
+        var result = try Normalize.nfc(alloc, buf.items);
         defer result.deinit(alloc);
         return alloc.dupe(u8, result.slice);
     }
@@ -1004,7 +1000,7 @@ fn maybeAppendAnsiStyle(
 }
 
 fn appendAnsiStyle(out: *std.array_list.Managed(u8), style: AnsiStyleState) !void {
-    try out.writer().print(
+    try out.print(
         "\x1b[0{s}{s}{s}{s}{s};38;2;{};{};{};48;2;{};{};{}m",
         .{
             if (style.bold) ";1" else "",
@@ -1033,7 +1029,7 @@ fn appendSpacesAnsi(out: *std.array_list.Managed(u8), count: u16) !void {
 }
 
 test "spawn captures snapshot and exit" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf 'hello from zig'" },
     }, .{
@@ -1053,7 +1049,7 @@ test "spawn captures snapshot and exit" {
 }
 
 test "plainSnapshot returns the text buffer and both snapshot kinds bump the counter" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf 'plain text only'" },
     }, .{
@@ -1080,7 +1076,7 @@ test "plainSnapshot returns the text buffer and both snapshot kinds bump the cou
 }
 
 test "send forwards bytes through the pty" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/cat",
     }, .{
         .rows = 10,
@@ -1094,7 +1090,7 @@ test "send forwards bytes through the pty" {
 }
 
 test "title changes are emitted as events" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf '\\033]2;zig-title\\033\\\\'; sleep 0.1" },
     }, .{
@@ -1108,7 +1104,7 @@ test "title changes are emitted as events" {
 }
 
 test "exit event survives allocation failure" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sleep",
         .args = &.{"5"},
     }, .{
@@ -1157,7 +1153,7 @@ test "exit event survives allocation failure" {
 }
 
 test "pollEvent returns events in FIFO order and recycles the buffer" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sleep",
         .args = &.{"5"},
     }, .{
@@ -1192,7 +1188,7 @@ test "pollEvent returns events in FIFO order and recycles the buffer" {
 }
 
 test "snapshot preserves ansi styling" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf '\\033[31;47mhi\\033[0m'" },
     }, .{
@@ -1278,7 +1274,7 @@ test "spawn: child inherits parent env and gets the TERM default" {
     _ = c.setenv("HTY_SPAWN_ENV_TEST", "inherited-ok", 1);
     defer _ = c.unsetenv("HTY_SPAWN_ENV_TEST");
 
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf \"var=$HTY_SPAWN_ENV_TEST term=$TERM\"" },
     }, .{
@@ -1295,7 +1291,7 @@ test "spawn: config env overrides parent env and TERM" {
     _ = c.setenv("HTY_SPAWN_ENV_TEST", "parent-value", 1);
     defer _ = c.unsetenv("HTY_SPAWN_ENV_TEST");
 
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "/bin/sh",
         .args = &.{ "-c", "printf \"var=$HTY_SPAWN_ENV_TEST term=$TERM\"" },
     }, .{
@@ -1313,7 +1309,7 @@ test "spawn: config env overrides parent env and TERM" {
 }
 
 test "spawn: bare program name resolves against PATH" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "sh",
         .args = &.{ "-c", "printf 'resolved-via-path'" },
     }, .{
@@ -1327,7 +1323,7 @@ test "spawn: bare program name resolves against PATH" {
 }
 
 test "spawn: nonexistent program still exits 127" {
-    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, .{
+    var terminal = try InteractiveTerminal.spawn(std.heap.c_allocator, std.testing.io, .{
         .program = "hty-definitely-not-a-real-program",
     }, .{
         .rows = 10,
@@ -1336,8 +1332,8 @@ test "spawn: nonexistent program still exits 127" {
     });
     defer terminal.deinit();
 
-    const deadline = std.time.milliTimestamp() + 2_000;
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sys.milliTimestamp() + 2_000;
+    while (sys.milliTimestamp() < deadline) {
         if (terminal.pollEvent()) |event| {
             defer {
                 var owned = event;
@@ -1351,7 +1347,7 @@ test "spawn: nonexistent program still exits 127" {
                 else => {},
             }
         }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        sys.sleep(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -1376,7 +1372,7 @@ test "spawn: failure on any parent-side error path leaks no memory, fd, or child
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
             .fail_index = fail_index,
         });
-        if (InteractiveTerminal.spawn(failing.allocator(), .{
+        if (InteractiveTerminal.spawn(failing.allocator(), std.testing.io, .{
             .program = "/bin/sh",
             .args = &.{ "-c", "sleep 5" },
         }, .{
@@ -1404,11 +1400,12 @@ test "spawn: failure on any parent-side error path leaks no memory, fd, or child
 }
 
 fn countOpenFds() !usize {
-    var dir = try std.fs.openDirAbsolute("/dev/fd", .{ .iterate = true });
-    defer dir.close();
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/dev/fd", .{ .iterate = true });
+    defer dir.close(io);
     var it = dir.iterate();
     var count: usize = 0;
-    while (try it.next()) |_| count += 1;
+    while (try it.next(io)) |_| count += 1;
     return count;
 }
 
@@ -1425,7 +1422,7 @@ const CellsHarness = struct {
     cells: [][]const []const u8,
 
     fn init(alloc: std.mem.Allocator, rows: u16, cols: u16, input: []const u8) !CellsHarness {
-        var terminal = try ghostty_vt.Terminal.init(alloc, .{
+        var terminal = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
             .cols = cols,
             .rows = rows,
             .max_scrollback = 10_000,
@@ -1530,12 +1527,12 @@ fn waitForText(
     needle: []const u8,
     timeout_ms: u64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sys.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (sys.milliTimestamp() < deadline) {
         var snapshot = try terminal.snapshot();
         defer snapshot.deinit(std.heap.c_allocator);
         if (std.mem.indexOf(u8, snapshot.buffer, needle) != null) return;
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        sys.sleep(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -1544,8 +1541,8 @@ fn waitForExit(
     terminal: *InteractiveTerminal,
     timeout_ms: u64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sys.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (sys.milliTimestamp() < deadline) {
         if (terminal.pollEvent()) |event| {
             defer {
                 var owned = event;
@@ -1553,7 +1550,7 @@ fn waitForExit(
             }
             if (event == .exited) return;
         }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        sys.sleep(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
@@ -1563,8 +1560,8 @@ fn waitForTitleEvent(
     title: []const u8,
     timeout_ms: u64,
 ) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    const deadline = sys.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (sys.milliTimestamp() < deadline) {
         if (terminal.pollEvent()) |event| {
             defer {
                 var owned = event;
@@ -1577,7 +1574,7 @@ fn waitForTitleEvent(
                 else => {},
             }
         }
-        std.Thread.sleep(25 * std.time.ns_per_ms);
+        sys.sleep(25 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
