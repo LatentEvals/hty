@@ -6,15 +6,16 @@
 //! `shortestUniquePrefixLen` exploits to size the ID column in `hty list`.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 
 /// Generate a UUIDv7 into `out` as a 36-char hex-with-dashes string.
 /// Layout: 48 bits unix-ms timestamp | 4 bits version=7 | 12 bits rand |
 ///         2 bits variant=10 | 62 bits rand.
 pub fn generateUuidV7(out: *[36]u8) void {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    sys.random(&bytes);
 
-    const ms: u64 = @intCast(std.time.milliTimestamp());
+    const ms: u64 = @intCast(sys.milliTimestamp());
     bytes[0] = @intCast((ms >> 40) & 0xff);
     bytes[1] = @intCast((ms >> 32) & 0xff);
     bytes[2] = @intCast((ms >> 24) & 0xff);

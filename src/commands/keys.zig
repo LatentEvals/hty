@@ -40,6 +40,6 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(_: Allocator, _: []const []const u8) !void {
+pub fn run(_: Allocator, _: std.Io, _: []const []const u8) !void {
     try common.printRaw(helpText());
 }

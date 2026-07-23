@@ -1,6 +1,7 @@
 //! `hty kill` — terminate a session's process (record kept for replay).
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -26,7 +27,7 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var delete_after = false;
     var session_ref: ?[]const u8 = null;
 
@@ -47,16 +48,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 
     // Kill phase.
     {
-        var payload_buf = std.array_list.Managed(u8).init(alloc);
+        var payload_buf: std.Io.Writer.Allocating = .init(alloc);
         defer payload_buf.deinit();
-        try payload_buf.appendSlice("{\"op\":\"kill\"");
+        try payload_buf.writer.writeAll("{\"op\":\"kill\"");
         if (session_ref) |s| {
-            try payload_buf.appendSlice(",\"session\":");
-            try common.writeJsonString(payload_buf.writer().any(), s);
+            try payload_buf.writer.writeAll(",\"session\":");
+            try common.writeJsonString(&payload_buf.writer, s);
         }
-        try payload_buf.appendSlice("}");
+        try payload_buf.writer.writeAll("}");
 
-        const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+        const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
         defer alloc.free(response_line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -77,16 +78,16 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // If delete fails here, its exit code propagates — the user can
     // retry `hty delete <ref>` manually; the process is already dead.
     {
-        var payload_buf = std.array_list.Managed(u8).init(alloc);
+        var payload_buf: std.Io.Writer.Allocating = .init(alloc);
         defer payload_buf.deinit();
-        try payload_buf.appendSlice("{\"op\":\"delete\"");
+        try payload_buf.writer.writeAll("{\"op\":\"delete\"");
         if (session_ref) |s| {
-            try payload_buf.appendSlice(",\"session\":");
-            try common.writeJsonString(payload_buf.writer().any(), s);
+            try payload_buf.writer.writeAll(",\"session\":");
+            try common.writeJsonString(&payload_buf.writer, s);
         }
-        try payload_buf.appendSlice("}");
+        try payload_buf.writer.writeAll("}");
 
-        const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+        const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
         defer alloc.free(response_line);
 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -110,17 +111,18 @@ test "kill then delete removes the session record (end-to-end via ops)" {
     const SessionRegistry = @import("../registry.zig").SessionRegistry;
     const tests_mod = @import("../tests.zig");
 
+    const io = std.testing.io;
     var log_dir_buf: [256]u8 = undefined;
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-kill-delete-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();
@@ -156,17 +158,18 @@ test "kill+delete on already-exited session still removes the record" {
     const SessionRegistry = @import("../registry.zig").SessionRegistry;
     const tests_mod = @import("../tests.zig");
 
+    const io = std.testing.io;
     var log_dir_buf: [256]u8 = undefined;
     const log_dir = try std.fmt.bufPrint(
         &log_dir_buf,
         "/tmp/hty-kill-delete-exited-test-{d}",
-        .{std.time.nanoTimestamp()},
+        .{sys.nanoTimestamp()},
     );
-    try std.fs.cwd().makePath(log_dir);
-    defer std.fs.cwd().deleteTree(log_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, log_dir);
+    defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
     const by_name = try std.fmt.allocPrint(alloc, "{s}/by-name", .{log_dir});
     defer alloc.free(by_name);
-    try std.fs.cwd().makePath(by_name);
+    try std.Io.Dir.cwd().createDirPath(io, by_name);
 
     var registry = SessionRegistry.init(alloc);
     defer registry.deinit();

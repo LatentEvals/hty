@@ -1,6 +1,7 @@
 //! `hty logs` — print the JSONL event log for a session.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -45,7 +46,7 @@ const LogsOptions = struct {
     json: bool = false,
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var opts = LogsOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -68,7 +69,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         }
     }
 
-    const path = resolveLogPath(alloc, opts.session) catch |err| {
+    const path = resolveLogPath(alloc, io, opts.session) catch |err| {
         switch (err) {
             error.SessionNotFound => try common.printErr("session log not found"),
             error.AmbiguousPrefix => try common.printErr("ambiguous session prefix"),
@@ -79,23 +80,29 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     };
     defer alloc.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| {
+    const fd = sys.open(path, .{ .ACCMODE = .RDONLY }, 0) catch |err| {
         try common.printErrFmt("cannot open {s}: {s}", .{ path, @errorName(err) });
         std.process.exit(common.ExitCode.generic);
     };
-    defer file.close();
-
-    var buffered = std.array_list.Managed(u8).init(alloc);
-    defer buffered.deinit();
+    defer sys.close(fd);
 
     // Initial pass: read the whole file into memory. This keeps the filter
     // logic simple — we can't know the "last event timestamp" without seeing
     // every line, and even multi-megabyte logs are fine to load wholesale.
-    const initial = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch |err| {
-        try common.printErrFmt("read failed: {s}", .{@errorName(err)});
-        std.process.exit(common.ExitCode.generic);
-    };
-    defer alloc.free(initial);
+    var initial_buf = std.array_list.Managed(u8).init(alloc);
+    defer initial_buf.deinit();
+    {
+        var chunk: [64 * 1024]u8 = undefined;
+        while (initial_buf.items.len < 64 * 1024 * 1024) {
+            const n = std.posix.read(fd, &chunk) catch |err| {
+                try common.printErrFmt("read failed: {s}", .{@errorName(err)});
+                std.process.exit(common.ExitCode.generic);
+            };
+            if (n == 0) break;
+            try initial_buf.appendSlice(chunk[0..n]);
+        }
+    }
+    const initial = initial_buf.items;
 
     const cutoff_ms: ?i64 = blk: {
         if (opts.since_ms) |since| {
@@ -109,7 +116,6 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         try common.printLine("TIMESTAMP               KIND     DETAIL");
     }
 
-    var file_pos: u64 = initial.len;
     try printJsonlLines(alloc, initial, cutoff_ms, opts.json);
 
     if (!opts.follow) return;
@@ -120,16 +126,12 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     defer leftover.deinit();
 
     while (true) {
-        const stat = file.stat() catch break;
-        if (stat.size > file_pos) {
-            try file.seekTo(file_pos);
-            const remaining = stat.size - file_pos;
-            const bytes = try alloc.alloc(u8, @intCast(remaining));
-            defer alloc.free(bytes);
-            const n = file.readAll(bytes) catch break;
-            file_pos += @intCast(n);
-
-            try leftover.appendSlice(bytes[0..n]);
+        // The log is append-only and the fd stays at EOF between polls, so a
+        // plain read() picks up exactly the newly appended bytes (0 = no news).
+        var chunk: [64 * 1024]u8 = undefined;
+        const n = std.posix.read(fd, &chunk) catch break;
+        if (n > 0) {
+            try leftover.appendSlice(chunk[0..n]);
             // Split on '\n' and print whole lines. Any trailing partial line
             // stays in `leftover` for the next iteration.
             var start: usize = 0;
@@ -145,7 +147,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
                 leftover.shrinkRetainingCapacity(leftover.items.len - start);
             }
         }
-        std.Thread.sleep(50 * std.time.ns_per_ms);
+        sys.sleep(50 * std.time.ns_per_ms);
     }
 }
 
@@ -351,7 +353,7 @@ fn formatLocalIsoMs(buf: []u8, ms: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{ms}) catch "?";
 }
 
-pub fn resolveLogPath(alloc: Allocator, reference: ?[]const u8) ![]u8 {
+pub fn resolveLogPath(alloc: Allocator, io: std.Io, reference: ?[]const u8) ![]u8 {
     const log_dir = try paths.resolveLogDir(alloc);
     defer alloc.free(log_dir);
 
@@ -367,12 +369,12 @@ pub fn resolveLogPath(alloc: Allocator, reference: ?[]const u8) ![]u8 {
         alloc.free(uuid_path);
 
         // 3. prefix match
-        var dir = try std.fs.openDirAbsolute(log_dir, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.openDirAbsolute(io, log_dir, .{ .iterate = true });
+        defer dir.close(io);
         var it = dir.iterate();
         var match: ?[]u8 = null;
         errdefer if (match) |m| alloc.free(m);
-        while (try it.next()) |entry| {
+        while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
             const stem = entry.name[0 .. entry.name.len - ".jsonl".len];
@@ -389,12 +391,12 @@ pub fn resolveLogPath(alloc: Allocator, reference: ?[]const u8) ![]u8 {
     }
 
     // No reference: if exactly one .jsonl file exists, use it.
-    var dir = try std.fs.openDirAbsolute(log_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, log_dir, .{ .iterate = true });
+    defer dir.close(io);
     var it = dir.iterate();
     var sole: ?[]u8 = null;
     errdefer if (sole) |s| alloc.free(s);
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         if (sole != null) {
@@ -409,7 +411,7 @@ pub fn resolveLogPath(alloc: Allocator, reference: ?[]const u8) ![]u8 {
 }
 
 pub fn fileExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    sys.access(path, sys.F_OK) catch return false;
     return true;
 }
 

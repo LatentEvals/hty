@@ -15,6 +15,7 @@
 //! Review the `testdata/vt/*.golden` diff before committing.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 
 /// Feed `input` into a fresh VT, render the final screen, and compare the
@@ -71,15 +72,15 @@ fn compareOrUpdateGolden(
     const path = try std.fmt.allocPrint(alloc, "testdata/vt/{s}", .{basename});
     defer alloc.free(path);
 
-    if (std.posix.getenv("UPDATE_GOLDENS") != null) {
-        try std.fs.cwd().makePath("testdata/vt");
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    if (sys.getenv("UPDATE_GOLDENS") != null) {
+        try std.Io.Dir.cwd().createDirPath(io, "testdata/vt");
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(actual);
         return;
     }
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print(
                 \\

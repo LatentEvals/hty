@@ -2,6 +2,7 @@
 //! log files on disk.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
@@ -39,7 +40,7 @@ const SessionEntry = struct {
 
 pub const MergedSessions = struct {
     arena_state: std.heap.ArenaAllocator,
-    entries: std.ArrayListUnmanaged(SessionEntry) = .{},
+    entries: std.ArrayListUnmanaged(SessionEntry) = .empty,
 
     pub fn deinit(self: *MergedSessions) void {
         self.entries.deinit(self.arena_state.allocator());
@@ -52,7 +53,7 @@ pub const MergedSessions = struct {
     }
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var json_output = false;
     for (args) |arg| {
         if (std.mem.eql(u8, arg, "--json")) json_output = true;
@@ -68,7 +69,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     const log_dir = resolveLogDirForClient(alloc) catch null;
     defer if (log_dir) |dir| alloc.free(dir);
 
-    var merged = try collectMergedSessions(alloc, log_dir, server_line);
+    var merged = try collectMergedSessions(io, alloc, log_dir, server_line);
     defer merged.deinit();
 
     // Sort by created_at_ms descending so newest sessions show first in both
@@ -100,7 +101,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     try common.printLine(header);
 
     for (merged.entries.items) |e| {
-        const now = std.time.milliTimestamp();
+        const now = sys.milliTimestamp();
         const age_ms = now - e.created_at_ms;
         const age_str = try formatAge(alloc, age_ms);
         defer alloc.free(age_str);
@@ -123,6 +124,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
 }
 
 pub fn collectMergedSessions(
+    io: std.Io,
     alloc: Allocator,
     log_dir: ?[]const u8,
     server_line: ?[]const u8,
@@ -131,7 +133,7 @@ pub fn collectMergedSessions(
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var entries: std.ArrayListUnmanaged(SessionEntry) = .{};
+    var entries: std.ArrayListUnmanaged(SessionEntry) = .empty;
     var seen_ids = std.StringHashMap(void).init(arena);
     defer seen_ids.deinit();
 
@@ -139,7 +141,7 @@ pub fn collectMergedSessions(
         try appendServerSessions(arena, &entries, &seen_ids, line);
     }
 
-    try scanDiskSessions(arena, log_dir, &entries, &seen_ids);
+    try scanDiskSessions(io, arena, log_dir, &entries, &seen_ids);
 
     return .{
         .arena_state = arena_state,
@@ -227,6 +229,7 @@ fn querySeverListIfLive(alloc: Allocator) !?[]u8 {
 /// and last event, and append a synthetic entry for any id not already
 /// seen. The arena owns the strings in the returned entries.
 fn scanDiskSessions(
+    io: std.Io,
     arena: Allocator,
     log_dir: ?[]const u8,
     entries: *std.ArrayListUnmanaged(SessionEntry),
@@ -234,20 +237,18 @@ fn scanDiskSessions(
 ) !void {
     const dir = log_dir orelse return;
 
-    var root = std.fs.openDirAbsolute(dir, .{ .iterate = true }) catch return;
-    defer root.close();
+    var root = std.Io.Dir.openDirAbsolute(io, dir, .{ .iterate = true }) catch return;
+    defer root.close(io);
 
     var it = root.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         const stem = entry.name[0 .. entry.name.len - ".jsonl".len];
         if (seen_ids.contains(stem)) continue;
 
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, entry.name });
-        const file = std.fs.openFileAbsolute(path, .{}) catch continue;
-        defer file.close();
-        const bytes = file.readToEndAlloc(arena, 64 * 1024 * 1024) catch continue;
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024)) catch continue;
 
         const parsed_entry = parseLogFileForListing(arena, stem, bytes) orelse continue;
         try entries.append(arena, parsed_entry);
@@ -260,12 +261,12 @@ fn scanDiskSessions(
 /// disk scan where creating a log dir as a side effect of `hty list`
 /// would be surprising.
 fn resolveLogDirForClient(alloc: Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_STATE_HOME")) |state| {
+    if (sys.getenv("XDG_STATE_HOME")) |state| {
         if (state.len > 0) {
             return std.fmt.allocPrint(alloc, "{s}/hty/logs", .{state});
         }
     }
-    const home = std.posix.getenv("HOME") orelse return error.HomeNotSet;
+    const home = sys.getenv("HOME") orelse return error.HomeNotSet;
     return std.fmt.allocPrint(alloc, "{s}/.local/state/hty/logs", .{home});
 }
 

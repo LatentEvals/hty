@@ -76,7 +76,7 @@ pub fn helpForTopic(topic: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, _: std.Io, args: []const []const u8) !void {
     if (args.len == 0) {
         try common.printRaw(generalHelpText());
         return;

@@ -18,6 +18,7 @@
 //! makes session spawn/servicing hooks silently skip log-file operations.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 const session_mod = @import("session.zig");
 const uuid_mod = @import("uuid.zig");
@@ -29,6 +30,10 @@ const Session = session_mod.Session;
 
 pub const SessionRegistry = struct {
     alloc: Allocator,
+    /// Io instance for session terminal construction (ghostty's
+    /// Terminal.init requires one as of Zig 0.16). Set once at init;
+    /// the registry itself does its file work at the syscall level.
+    io: std.Io,
     by_id: std.StringHashMapUnmanaged(*Session) = .{},
     name_index: std.StringHashMapUnmanaged(*Session) = .{},
     /// Absolute path to the session log directory. Borrowed from the caller
@@ -40,15 +45,16 @@ pub const SessionRegistry = struct {
     /// free phase, or `deinit`) tears them down. Deferral guarantees a
     /// `*Session` obtained by resolve stays valid for the remainder of
     /// the current dispatch/iteration even if that dispatch deletes it.
-    doomed: std.ArrayListUnmanaged(*Session) = .{},
+    doomed: std.ArrayListUnmanaged(*Session) = .empty,
     /// Unix-epoch milliseconds at which this registry was created. Used by
     /// `hty info --json` to report the server's uptime.
     started_at_ms: i64 = 0,
 
-    pub fn init(alloc: Allocator) SessionRegistry {
+    pub fn init(alloc: Allocator, io: std.Io) SessionRegistry {
         return .{
             .alloc = alloc,
-            .started_at_ms = std.time.milliTimestamp(),
+            .io = io,
+            .started_at_ms = sys.milliTimestamp(),
         };
     }
 
@@ -84,7 +90,7 @@ pub const SessionRegistry = struct {
         const sess = try self.alloc.create(Session);
         errdefer self.alloc.destroy(sess);
 
-        const now = std.time.milliTimestamp();
+        const now = sys.milliTimestamp();
         sess.* = .{
             .alloc = self.alloc,
             .id = undefined,
@@ -247,7 +253,7 @@ pub const SessionRegistry = struct {
     /// append, attach broadcast, VT feed (with title-change and bell
     /// logging), and the screen-change stamp that wakes idle/text waiters.
     fn dispatchOutput(self: *SessionRegistry, sess: *Session, bytes: []const u8) void {
-        const now = std.time.milliTimestamp();
+        const now = sys.milliTimestamp();
         // Sniff DEC private-mode toggles (CSI ? Pm h/l) out of the output
         // stream so `hty send --click` knows which apps have opted into
         // mouse input and which encoding they prefer. See issue #24.
@@ -274,13 +280,13 @@ pub const SessionRegistry = struct {
     pub fn reapSession(self: *SessionRegistry, sess: *Session) bool {
         const term = sess.terminal;
         if (term.reaped) return true;
-        const result = std.posix.waitpid(term.child_pid, std.posix.W.NOHANG);
+        const result = sys.waitpid(term.child_pid, std.posix.W.NOHANG);
         if (result.pid == 0) return false;
         const status = result.status;
         const code: ?i32 = if (std.posix.W.IFEXITED(status))
             @as(i32, @intCast(std.posix.W.EXITSTATUS(status)))
         else if (std.posix.W.IFSIGNALED(status))
-            -@as(i32, @intCast(std.posix.W.TERMSIG(status)))
+            -@as(i32, @intCast(@intFromEnum(std.posix.W.TERMSIG(status))))
         else
             null;
         term.noteChildExit(code);
@@ -295,7 +301,7 @@ pub const SessionRegistry = struct {
     fn applyExit(self: *SessionRegistry, sess: *Session, code: ?i32) void {
         _ = self;
         if (sess.getStatus() != .running) return;
-        const now = std.time.milliTimestamp();
+        const now = sys.milliTimestamp();
         sess.setExitCode(code);
         sess.setStatus(.exited);
         sess.markTerminal(now);
@@ -310,7 +316,7 @@ pub const SessionRegistry = struct {
     fn applyFailure(self: *SessionRegistry, sess: *Session, err: anyerror) void {
         _ = self;
         if (sess.getStatus() != .running) return;
-        const now = std.time.milliTimestamp();
+        const now = sys.milliTimestamp();
         sess.setStatus(.failed);
         sess.markTerminal(now);
         var msg_buf: [128]u8 = undefined;
@@ -385,7 +391,7 @@ pub const SessionRegistry = struct {
     /// removal. Runs on the iteration that observes the exit (the loop's
     /// end-of-iteration phase) and on every in-process pump.
     pub fn autoRemoveSweep(self: *SessionRegistry) void {
-        var to_remove: std.ArrayListUnmanaged(*Session) = .{};
+        var to_remove: std.ArrayListUnmanaged(*Session) = .empty;
         defer to_remove.deinit(self.alloc);
         var sweep_it = self.by_id.valueIterator();
         while (sweep_it.next()) |sess_ptr| {
@@ -406,7 +412,7 @@ pub const SessionRegistry = struct {
                     "{s}/{s}.jsonl",
                     .{ log_dir, &sess.id },
                 )) |p| {
-                    std.fs.deleteFileAbsolute(p) catch {};
+                    sys.unlink(p) catch {};
                 } else |_| {}
                 if (sess.name) |name| {
                     if (std.fmt.bufPrint(
@@ -414,7 +420,7 @@ pub const SessionRegistry = struct {
                         "{s}/by-name/{s}.jsonl",
                         .{ log_dir, name },
                     )) |p| {
-                        std.fs.deleteFileAbsolute(p) catch {};
+                        sys.unlink(p) catch {};
                     } else |_| {}
                 }
             }

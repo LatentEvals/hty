@@ -1,6 +1,7 @@
 //! `hty replay` — replay a recorded session log through a fresh VT engine.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 const hty = @import("hty");
 
@@ -53,7 +54,7 @@ const LoggedEvent = struct {
     cols: ?u16 = null,
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var opts = ReplayOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -87,7 +88,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         }
     }
 
-    const path = logs.resolveLogPath(alloc, opts.session) catch |err| {
+    const path = logs.resolveLogPath(alloc, io, opts.session) catch |err| {
         switch (err) {
             error.SessionNotFound => try common.printErr("session log not found"),
             error.AmbiguousPrefix => try common.printErr("ambiguous session prefix"),
@@ -98,14 +99,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     };
     defer alloc.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| {
-        try common.printErrFmt("cannot open {s}: {s}", .{ path, @errorName(err) });
-        std.process.exit(common.ExitCode.generic);
-    };
-    defer file.close();
-
-    const bytes = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch |err| {
-        try common.printErrFmt("read failed: {s}", .{@errorName(err)});
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024)) catch |err| {
+        try common.printErrFmt("cannot read {s}: {s}", .{ path, @errorName(err) });
         std.process.exit(common.ExitCode.generic);
     };
     defer alloc.free(bytes);
@@ -140,7 +135,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     // Setup alt-screen + raw mode (so Ctrl-C leaves cleanly).
     const stdin_fd = std.posix.STDIN_FILENO;
     const stdout_fd = std.posix.STDOUT_FILENO;
-    const stdin_is_tty = std.posix.isatty(stdin_fd);
+    const stdin_is_tty = sys.isatty(stdin_fd);
 
     try watch.enterAltScreen(stdout_fd);
     defer watch.leaveAltScreen(stdout_fd);
@@ -166,7 +161,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     }
     defer if (saved_termios) |st| std.posix.tcsetattr(stdin_fd, .FLUSH, st) catch {};
 
-    replayLoop(alloc, bytes, rows, cols, first_t.?, opts) catch |err| {
+    replayLoop(io, alloc, bytes, rows, cols, first_t.?, opts) catch |err| {
         try common.printErrFmt("replay failed: {s}", .{@errorName(err)});
         std.process.exit(common.ExitCode.generic);
     };
@@ -214,7 +209,7 @@ fn applyLogEvent(
         const nc = getInteger(obj, "cols") orelse return false;
         cur_rows.* = @intCast(nr);
         cur_cols.* = @intCast(nc);
-        try terminal.resize(alloc, cur_cols.*, cur_rows.*);
+        try terminal.resize(alloc, .{ .cols = cur_cols.*, .rows = cur_rows.* });
         return true;
     }
     return false;
@@ -228,12 +223,13 @@ fn applyLogEvent(
 /// Intended for tests that assert replay produces the same grid as the live
 /// session that recorded the log.
 pub fn replayToTerminal(
+    io: std.Io,
     alloc: Allocator,
     bytes: []const u8,
     initial_rows: u16,
     initial_cols: u16,
 ) !ReplayResult {
-    var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+    var terminal = try hty.ghostty_vt.Terminal.init(io, alloc, .{
         .cols = initial_cols,
         .rows = initial_rows,
         .max_scrollback = 10_000,
@@ -264,6 +260,7 @@ pub fn replayToTerminal(
 }
 
 fn replayLoop(
+    io: std.Io,
     alloc: Allocator,
     bytes: []const u8,
     initial_rows: u16,
@@ -278,7 +275,7 @@ fn replayLoop(
     const to_threshold: ?i64 = if (opts.to_ms) |v| first_t + @as(i64, @intCast(v)) else null;
 
     while (true) {
-        var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+        var terminal = try hty.ghostty_vt.Terminal.init(io, alloc, .{
             .cols = initial_cols,
             .rows = initial_rows,
             .max_scrollback = 10_000,
@@ -297,7 +294,7 @@ fn replayLoop(
         // Skip the spawn line, already parsed.
         _ = it.next();
 
-        _ = try std.posix.write(stdout_fd, "\x1b[2J\x1b[H");
+        _ = try sys.write(stdout_fd, "\x1b[2J\x1b[H");
 
         while (it.next()) |line| {
             if (line.len == 0) continue;
@@ -324,7 +321,7 @@ fn replayLoop(
                 if (dt_ms > 0) {
                     const dt_ns = @as(u64, @intCast(dt_ms)) * std.time.ns_per_ms;
                     const scaled = @as(u64, @intFromFloat(@as(f64, @floatFromInt(dt_ns)) / opts.speed));
-                    std.Thread.sleep(scaled);
+                    sys.sleep(scaled);
                 }
             }
             prev_t = t;
@@ -339,10 +336,10 @@ fn replayLoop(
         if (!opts.loop) {
             while (true) {
                 if (checkCtrlCFromStdin(stdin_fd)) return;
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                sys.sleep(50 * std.time.ns_per_ms);
             }
         }
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        sys.sleep(500 * std.time.ns_per_ms);
     }
 }
 
@@ -350,8 +347,8 @@ fn paintFrame(alloc: Allocator, terminal: *hty.ghostty_vt.Terminal, rows: u16, c
     const frame = hty.renderScreenAnsi(alloc, terminal, rows, cols) catch return;
     defer alloc.free(frame);
     const stdout_fd = std.posix.STDOUT_FILENO;
-    _ = std.posix.write(stdout_fd, "\x1b[H") catch return;
-    _ = std.posix.write(stdout_fd, frame) catch return;
+    _ = sys.write(stdout_fd, "\x1b[H") catch return;
+    _ = sys.write(stdout_fd, frame) catch return;
 }
 
 fn checkCtrlCFromStdin(stdin_fd: std.posix.fd_t) bool {

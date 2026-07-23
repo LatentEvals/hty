@@ -74,8 +74,8 @@ pub fn main() void {
 
 fn mainServer() !void {
     @disableInstrumentation();
-    var stdin_reader = std.fs.File.stdin().readerStreaming(&stdin_buffer);
-    var stdout_writer = std.fs.File.stdout().writerStreaming(&stdout_buffer);
+    var stdin_reader = std.Io.File.stdin().readerStreaming(&stdin_buffer);
+    var stdout_writer = std.Io.File.stdout().writerStreaming(&stdout_buffer);
     var server = try std.zig.Server.init(.{
         .in = &stdin_reader.interface,
         .out = &stdout_writer.interface,
@@ -194,7 +194,7 @@ fn mainTerminal() void {
         .root_name = "Test",
         .estimated_total_items = test_fn_list.len,
     });
-    const have_tty = std.fs.File.stderr().isTty();
+    const have_tty = std.Io.File.stderr().isTty();
 
     var async_frame_buffer: []align(builtin.target.stackAlignment()) u8 = undefined;
     async_frame_buffer = &[_]u8{};
@@ -293,7 +293,7 @@ pub fn mainSimple() anyerror!void {
     var skipped: u64 = 0;
     var failed: u64 = 0;
 
-    const stdout = if (enable_write) std.fs.File.stdout() else {};
+    const stdout = if (enable_write) std.Io.File.stdout() else {};
 
     for (builtin.test_functions) |test_fn| {
         if (enable_write) {

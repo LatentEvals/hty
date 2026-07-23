@@ -45,7 +45,7 @@ pub const INPUT_COALESCE_MS: i64 = 10;
 /// and skipped, matching the rest of the log-reading code.
 pub fn writeCast(
     alloc: Allocator,
-    writer: std.io.AnyWriter,
+    writer: *std.Io.Writer,
     log_bytes: []const u8,
 ) !void {
     // Parse the spawn line for initial geometry + session start timestamp.
@@ -104,7 +104,7 @@ pub fn writeCast(
 
 fn processLine(
     alloc: Allocator,
-    writer: std.io.AnyWriter,
+    writer: *std.Io.Writer,
     line: []const u8,
     start_ms: i64,
     pending: *std.array_list.Managed(u8),
@@ -174,7 +174,7 @@ fn processLine(
     // has no cast-v2 equivalent we want to emit.
 }
 
-fn emitInput(writer: std.io.AnyWriter, bytes: []const u8, delta_ms: i64) !void {
+fn emitInput(writer: *std.Io.Writer, bytes: []const u8, delta_ms: i64) !void {
     const clamped: i64 = if (delta_ms > 0) delta_ms else 0;
     const elapsed: f64 = @as(f64, @floatFromInt(clamped)) / 1000.0;
     try writer.print("[{d:.6}, \"i\", ", .{elapsed});
@@ -185,7 +185,7 @@ fn emitInput(writer: std.io.AnyWriter, bytes: []const u8, delta_ms: i64) !void {
 /// Write `bytes` as a JSON string, replacing invalid UTF-8 sequences with
 /// U+FFFD so the downstream parser never sees bare high bytes that aren't
 /// part of a valid UTF-8 codepoint. Control characters get `\uXXXX` escapes.
-fn writeSanitizedJsonString(writer: std.io.AnyWriter, bytes: []const u8) !void {
+fn writeSanitizedJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
     try writer.writeByte('"');
     var i: usize = 0;
     while (i < bytes.len) {
@@ -606,11 +606,10 @@ test "malformed event lines are skipped, not fatal" {
 }
 
 test "real fixture round-trips: concatenated output matches decoded hex" {
+    const io = std.testing.io;
     const alloc = testing.allocator;
     const path = "testdata/sessions/vim-edit.jsonl";
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch return;
-    defer file.close();
-    const bytes = try file.readToEndAlloc(alloc, 16 * 1024 * 1024);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024)) catch return;
     defer alloc.free(bytes);
 
     const cast = try runWriteCast(alloc, bytes);

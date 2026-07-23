@@ -25,6 +25,7 @@
 //! Review the diff in `testdata/sessions/` before committing.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 const replayToTerminal = @import("commands/replay.zig").replayToTerminal;
 
@@ -35,7 +36,7 @@ test "fixture suite: real-program replay goldens" {
 
     // Open the fixtures dir. If it doesn't exist, the suite is a no-op — a
     // fresh clone should pass before any fixtures have been added.
-    var dir = std.fs.cwd().openDir(fixtures_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(fixtures_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -60,7 +61,7 @@ fn runFixture(alloc: std.mem.Allocator, filename: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixtures_dir, filename });
     defer alloc.free(path);
 
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close();
     const bytes = try file.readToEndAlloc(alloc, 64 * 1024 * 1024);
     defer alloc.free(bytes);
@@ -79,7 +80,7 @@ fn runFixture(alloc: std.mem.Allocator, filename: []const u8) !void {
     const rows: u16 = @intCast(rows_v.integer);
     const cols: u16 = @intCast(cols_v.integer);
 
-    var result = try replayToTerminal(alloc, bytes, rows, cols);
+    var result = try replayToTerminal(io, alloc, bytes, rows, cols);
     defer result.deinit(alloc);
 
     const ansi = try hty.renderScreenAnsi(alloc, &result.terminal, result.rows, result.cols);
@@ -107,15 +108,15 @@ fn compareOrUpdateGolden(
     const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixtures_dir, basename });
     defer alloc.free(path);
 
-    if (std.posix.getenv("UPDATE_GOLDENS") != null) {
-        try std.fs.cwd().makePath(fixtures_dir);
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    if (sys.getenv("UPDATE_GOLDENS") != null) {
+        try std.Io.Dir.cwd().createDirPath(io, fixtures_dir);
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(actual);
         return;
     }
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
             std.debug.print(
                 \\

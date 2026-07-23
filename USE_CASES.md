@@ -1,0 +1,21 @@
+Read through the README to make sure I'm riffing on what it actually does today (persistent sessions, wait primitives, watch/attach split, JSONL logs + replay/export). Here's where my head goes, roughly ordered by how excited I'd be to see them exist:
+
+1. Golden-screen testing for TUIs — "Playwright for the terminal." This feels like the biggest untapped market. Ratatui, Bubble Tea, and Textual apps all have miserable test stories: everyone hand-rolls a fake backend or just doesn't test rendering. A thin wrapper (hty-test?) that runs the app, sends a scripted key sequence, snapshots, and diffs against a checked-in golden screen would give TUI authors real CI. You already have deterministic replay through a fresh VT engine, which is exactly the property snapshot testing needs. Bonus: resize fuzzing — send SIGWINCH storms mid-session and assert nothing panics, since resize handling is where basically every TUI app is broken.
+
+2. Interactive-CLI fuzzing with free crash repros. Throw structured-random key sequences at any curses app and watch for hangs/crashes. The killer detail is that the JSONL log is the reproducer — a crash comes with a byte-exact replay attached. That's the rr pitch but for terminal programs, and nobody has it.
+
+3. Terminal-use evals. Given the LatentEvals umbrella, this one seems almost obligatory: a benchmark where agents must complete tasks in vim, git rebase -i, nethack, psql, k9s — driven through hty, graded by replaying the log. "Can your model exit vim" as an actual measured capability. The recorded sessions double as training data for terminal-use, which is scarce and valuable right now.
+
+4. Modern expect(1). expect matches on the raw byte stream, which is why every expect script is a pile of regexes over escape codes. hty asserts on the rendered screen, which is what the human actually meant. There's a long tail of enterprises screen-scraping ancient curses admin tools, TN3270/5250 mainframe sessions, and vendor installers who would switch for that alone.
+
+5. Never-stale README GIFs. A "screenplay" file (run, send, wait, pause beats) that CI performs on every release and exports via hty export → agg → GIF. Demo GIFs are universally out of date because re-recording by hand is tedious and humans make typos. Scripted performances are retake-free and regenerate themselves. You could dogfood this for hty's own README.
+
+6. Overnight babysitting of interactive processes. An agent supervises a long interactive thing — a db migration that asks questions, a flaky terraform apply, an installer — answering prompts per a policy, while the human can hty watch from their phone over an SSH tunnel anytime, and attach to take over if the agent gets confused. The read-only watch / bidirectional attach split is the exact primitive this needs and almost nothing else has it.
+
+7. Inverted control: agent watches, human drives. Everything markets hty as "agent types, human watches" — flip it. Human works in a session, an agent polls snapshots read-only and coaches: "you're in ex mode", "that rebase is about to drop a commit". A terminal tutor / pair reviewer with zero ability to interfere. Same machinery, opposite direction, and it sidesteps all the trust issues of letting an agent type.
+
+8. Honeypot / audit recorder. Wrap a shell (or a fake one) in hty and you get a full-fidelity, append-only recording of everything an intruder — or a contractor, or a compliance-scoped operator — saw and typed, replayable after the fact. Session recording products exist, but they're heavyweight enterprise things; this is one binary.
+
+Wildcard: NetHack-as-RL-environment via the screen, not via NLE's internal hooks — forces agents to play from actual pixels-equivalent observations, which is the honest version of the task.
+
+If I had to bet on one, it's #1 — golden-screen testing has a clear audience (every TUI framework community), an obvious adoption path (a GitHub Action), and it makes hty a dependency of other people's CI, which is the stickiest place a tool can live. #3 is the most strategically on-brand for you. Want me to sketch what a hty-test harness or a terminal-use eval spec would look like?

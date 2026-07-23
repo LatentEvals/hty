@@ -60,7 +60,7 @@ pub fn helpText() []const u8 {
     ;
 }
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var name: ?[]const u8 = null;
     var rows: u16 = 24;
     var cols: u16 = 80;
@@ -231,31 +231,31 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     const program_args = args[start + 1 ..];
 
     // Build spawn request as a JSON object manually so we can include name + args cleanly.
-    var payload_buf = std.array_list.Managed(u8).init(alloc);
+    var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
-    var writer = payload_buf.writer();
+    const writer = &payload_buf.writer;
 
     try writer.writeAll("{\"op\":\"spawn\",\"program\":");
-    try common.writeJsonString(writer.any(), program);
+    try common.writeJsonString(writer, program);
     try writer.writeAll(",\"args\":[");
     for (program_args, 0..) |a, idx| {
         if (idx > 0) try writer.writeAll(",");
-        try common.writeJsonString(writer.any(), a);
+        try common.writeJsonString(writer, a);
     }
     try writer.writeAll("]");
     if (name) |n| {
         try writer.writeAll(",\"name\":");
-        try common.writeJsonString(writer.any(), n);
+        try common.writeJsonString(writer, n);
     }
     try writer.print(",\"rows\":{d},\"cols\":{d},\"scrollback\":{d}", .{ rows, cols, scrollback });
     if (remove_on_exit) try writer.writeAll(",\"remove\":true");
     if (cwd) |c_val| {
         try writer.writeAll(",\"cwd\":");
-        try common.writeJsonString(writer.any(), c_val);
+        try common.writeJsonString(writer, c_val);
     }
     try writer.writeAll("}");
 
-    const response_line = try common.sendRawRequest(alloc, payload_buf.items);
+    const response_line = try common.sendRawRequest(alloc, io, payload_buf.writer.buffered());
     defer alloc.free(response_line);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
@@ -327,7 +327,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         // Pin the wait_and_snapshot to the freshly-spawned session by id —
         // safer than relying on sole-session resolution if other tests /
         // commands are racing in the background.
-        var wait_parsed = try send_cmd.sendFusedWait(alloc, .{
+        var wait_parsed = try send_cmd.sendFusedWait(alloc, io, .{
             .session_ref = id_str,
             .wait_kind = wait_kind,
             .needle = needle,
@@ -378,7 +378,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         // and the child exited within the 100ms auto-remove grace
         // window, attach may come back as SessionNotFound; that path
         // is handled inside `attachToExistingSession` by exiting 0.
-        const maybe_code = attach_cmd.attachToExistingSession(alloc, sid, rows, cols) catch |err| {
+        const maybe_code = attach_cmd.attachToExistingSession(io, alloc, sid, rows, cols) catch |err| {
             try common.printErrFmt("hty run --attach: {s}", .{@errorName(err)});
             std.process.exit(common.ExitCode.generic);
         };
@@ -427,10 +427,10 @@ fn emitRunJson(alloc: Allocator, sess_obj: std.json.ObjectMap) !void {
     );
     defer alloc.free(inner);
 
-    var buf = std.array_list.Managed(u8).init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
-    try buf.appendSlice("{\"session\":");
-    try buf.appendSlice(inner);
-    try buf.appendSlice("}");
-    try common.printLine(buf.items);
+    try buf.writer.writeAll("{\"session\":");
+    try buf.writer.writeAll(inner);
+    try buf.writer.writeAll("}");
+    try common.printLine(buf.writer.buffered());
 }

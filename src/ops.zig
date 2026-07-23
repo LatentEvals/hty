@@ -1,4 +1,5 @@
 const std = @import("std");
+const sys = @import("hty").sys;
 const hty = @import("hty");
 
 const Allocator = std.mem.Allocator;
@@ -79,6 +80,7 @@ pub fn handleSpawn(
 
     const terminal = try hty.InteractiveTerminal.spawn(
         registry.alloc,
+        registry.io,
         .{
             .program = program,
             .args = args,
@@ -129,7 +131,7 @@ pub fn handleSpawn(
 /// can know (pid, uptime).
 pub fn handleInfo(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Response {
     _ = arena;
-    const now = std.time.milliTimestamp();
+    const now = sys.milliTimestamp();
     const uptime_ms = now - registry.started_at_ms;
     const server_pid: i64 = @intCast(posix_getpid());
     return .{
@@ -334,14 +336,14 @@ pub fn handleSendMouse(arena: Allocator, sess: *Session, object: std.json.Object
         // `ESC [ < <btn> ; <col> ; <row> M/m` — M for press/motion,
         // m for release. Wheels use M.
         const terminator: u8 = if (is_release and !is_wheel) 'm' else 'M';
-        try buf.writer().print("\x1b[<{d};{d};{d}{c}", .{ button_code, col, row, terminator });
+        try buf.print("\x1b[<{d};{d};{d}{c}", .{ button_code, col, row, terminator });
     } else {
         // X10: `ESC [ M <btn+32> <col+32> <row+32>`. Release maps to
         // button 3 (same for all buttons) in legacy encoding; motion
         // adds 32 in the button field (already applied above for
         // motion). Wheel events use the raw 64/65 code untouched.
         const x10_btn: u32 = if (is_release and !is_wheel) 3 else button_code;
-        try buf.writer().print("\x1b[M", .{});
+        try buf.print("\x1b[M", .{});
         try buf.append(@intCast(@min(x10_btn + 32, 0xFF)));
         try buf.append(@intCast(@min(col + 32, 0xFF)));
         try buf.append(@intCast(@min(row + 32, 0xFF)));
@@ -636,7 +638,7 @@ pub fn evaluateWaitCondition(
 ) !?WaitResult {
     switch (condition) {
         .duration => |duration_ms| {
-            const now = std.time.milliTimestamp();
+            const now = sys.milliTimestamp();
             if (now - state.start_ms >= @as(i64, @intCast(duration_ms))) {
                 return .{
                     .matched = "duration",
@@ -649,11 +651,11 @@ pub fn evaluateWaitCondition(
                 @max(sess.getLastScreenChange(), floor)
             else
                 sess.getLastScreenChange();
-            const since = std.time.milliTimestamp() - reference;
+            const since = sys.milliTimestamp() - reference;
             if (since >= cfg.idle_ms) {
                 return .{
                     .matched = "idle",
-                    .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                    .elapsed_ms = sys.milliTimestamp() - state.start_ms,
                 };
             }
         },
@@ -690,7 +692,7 @@ pub fn evaluateWaitCondition(
                 if (offset) |off| {
                     return .{
                         .matched = cfg.matched_label,
-                        .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                        .elapsed_ms = sys.milliTimestamp() - state.start_ms,
                         .text = .{ .needle = try arena.dupe(u8, cfg.needle), .offset = off },
                     };
                 }
@@ -700,7 +702,7 @@ pub fn evaluateWaitCondition(
             if (sess.getStatus() != .running) {
                 return .{
                     .matched = "exit",
-                    .elapsed_ms = std.time.milliTimestamp() - state.start_ms,
+                    .elapsed_ms = sys.milliTimestamp() - state.start_ms,
                     .exit = .{ .code = sess.getExitCode() orelse 0 },
                 };
             }
@@ -741,10 +743,10 @@ fn runWait(
     const is_duration = condition == .duration;
 
     while (true) {
-        if (!is_duration and std.time.milliTimestamp() > deadline) {
+        if (!is_duration and sys.milliTimestamp() > deadline) {
             return .{
                 .timed_out = true,
-                .elapsed_ms = std.time.milliTimestamp() - start_ms,
+                .elapsed_ms = sys.milliTimestamp() - start_ms,
             };
         }
 
@@ -851,7 +853,7 @@ fn runStandaloneWait(
     id: ?i64,
     kind: WaitOpKind,
 ) !Response {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = sys.milliTimestamp();
     const plan = try planWait(arena, kind, object, start_ms);
     const condition = plan.condition.?; // standalone kinds always wait
     defer freeWaitConditionRegex(condition);
@@ -948,7 +950,7 @@ pub fn handleWaitAndSnapshot(
     object: std.json.ObjectMap,
     id: ?i64,
 ) !Response {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = sys.milliTimestamp();
     const plan = try planWait(arena, .fused, object, start_ms);
     const include_snapshot = plan.format == .fused_snapshot;
 
@@ -1021,7 +1023,7 @@ pub fn handleKill(arena: Allocator, registry: *SessionRegistry, sess: *Session, 
         // Stamp the terminal timestamp so the drain-loop auto-remove
         // sweep can reap this session if it was spawned with `--remove`.
         // A no-op for sessions without `remove_on_exit`.
-        sess.markTerminal(std.time.milliTimestamp());
+        sess.markTerminal(sys.milliTimestamp());
         // Name stays reserved — the session record is still browsable and
         // replayable until explicitly removed with `hty delete`.
     }
@@ -1048,7 +1050,7 @@ pub fn handleDelete(arena: Allocator, registry: *SessionRegistry, sess: *Session
             "{s}/{s}.jsonl",
             .{ log_dir, &sess.id },
         ) catch null;
-        if (uuid_path) |p| std.fs.deleteFileAbsolute(p) catch {};
+        if (uuid_path) |p| sys.unlink(p) catch {};
 
         if (sess.name) |name| {
             const link_path = std.fmt.allocPrint(
@@ -1056,7 +1058,7 @@ pub fn handleDelete(arena: Allocator, registry: *SessionRegistry, sess: *Session
                 "{s}/by-name/{s}.jsonl",
                 .{ log_dir, name },
             ) catch null;
-            if (link_path) |p| std.fs.deleteFileAbsolute(p) catch {};
+            if (link_path) |p| sys.unlink(p) catch {};
         }
     }
 

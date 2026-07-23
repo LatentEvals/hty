@@ -5,6 +5,7 @@
 //! (`AttachClient.tryWriteFrame`).
 
 const std = @import("std");
+const sys = @import("hty").sys;
 
 const Allocator = std.mem.Allocator;
 
@@ -86,7 +87,7 @@ pub const AttachSetup = union(enum) {
 pub fn handleAttachConnection(
     alloc: Allocator,
     registry: *SessionRegistry,
-    stream: std.net.Stream,
+    stream: sys.Stream,
     line: []const u8,
     read_only: bool,
 ) !AttachSetup {
@@ -180,7 +181,7 @@ pub fn handleAttachConnection(
 pub fn registerSubscriber(
     alloc: Allocator,
     sess: *Session,
-    stream: std.net.Stream,
+    stream: sys.Stream,
     read_only: bool,
 ) !*AttachClient {
     // Mint a stable client id so connect/input/disconnect log events for
@@ -217,7 +218,7 @@ pub fn registerSubscriber(
 pub fn promoteWatchSubscriber(
     alloc: Allocator,
     sess: *Session,
-    stream: std.net.Stream,
+    stream: sys.Stream,
 ) !*AttachClient {
     const client = try registerSubscriber(alloc, sess, stream, true);
     _ = client.tryWriteFrame("{\"kind\":\"started\"}\n");
@@ -247,7 +248,7 @@ pub fn sendSnapshotFrame(client: *AttachClient) void {
     } else |_| {}
 }
 
-pub fn writeAttachAck(stream: std.net.Stream) !void {
+pub fn writeAttachAck(stream: sys.Stream) !void {
     try stream.writeAll("{\"ok\":true}\n");
 }
 
@@ -255,11 +256,11 @@ pub fn writeAttachAck(stream: std.net.Stream) !void {
 /// the client knows to paint a "Waiting…" frame and delay any per-client
 /// setup (for attach: raw mode, SIGWINCH) until the `started` frame
 /// arrives. Older clients that don't recognize the field safely ignore it.
-pub fn writeAttachAckWaiting(stream: std.net.Stream) !void {
+pub fn writeAttachAckWaiting(stream: sys.Stream) !void {
     try stream.writeAll("{\"ok\":true,\"waiting\":true}\n");
 }
 
-pub fn writeAttachError(stream: std.net.Stream, message: []const u8) !void {
+pub fn writeAttachError(stream: sys.Stream, message: []const u8) !void {
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(
         &buf,

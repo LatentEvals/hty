@@ -15,7 +15,7 @@ const errno = posix.errno;
 const unexpectedErrno = posix.unexpectedErrno;
 const UnexpectedError = posix.UnexpectedError;
 const toPosixPath = posix.toPosixPath;
-const fd_t = posix.fd_t;
+pub const fd_t = posix.fd_t;
 const pid_t = posix.pid_t;
 const mode_t = posix.mode_t;
 const socket_t = posix.socket_t;
@@ -1751,7 +1751,7 @@ fn setSockFlags(sock: socket_t, flags: u32) !void {
 /// Precision of timing depends on the hardware and operating system.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 pub fn timestamp() i64 {
     return @divFloor(milliTimestamp(), ms_per_s);
 }
@@ -1760,13 +1760,13 @@ pub fn timestamp() i64 {
 /// Precision of timing depends on the hardware and operating system.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 
 /// Get a calendar timestamp, in milliseconds, relative to UTC 1970-01-01.
 /// Precision of timing depends on the hardware and operating system.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 pub fn milliTimestamp() i64 {
     return @as(i64, @intCast(@divFloor(nanoTimestamp(), ns_per_ms)));
 }
@@ -1775,13 +1775,13 @@ pub fn milliTimestamp() i64 {
 /// Precision of timing depends on the hardware and operating system.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 
 /// Get a calendar timestamp, in microseconds, relative to UTC 1970-01-01.
 /// Precision of timing depends on the hardware and operating system.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 pub fn microTimestamp() i64 {
     return @as(i64, @intCast(@divFloor(nanoTimestamp(), ns_per_us)));
 }
@@ -1791,14 +1791,14 @@ pub fn microTimestamp() i64 {
 /// On Windows this has a maximum granularity of 100 nanoseconds.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 
 /// Get a calendar timestamp, in nanoseconds, relative to UTC 1970-01-01.
 /// Precision of timing depends on the hardware and operating system.
 /// On Windows this has a maximum granularity of 100 nanoseconds.
 /// The return value is signed because it is possible to have a date that is
 /// before the epoch.
-/// See `posix.clock_gettime` for a POSIX timestamp.
+/// See `clock_gettime` for a POSIX timestamp.
 pub fn nanoTimestamp() i128 {
     switch (builtin.os.tag) {
         .windows => {
@@ -1818,7 +1818,7 @@ pub fn nanoTimestamp() i128 {
             return value.toEpoch();
         },
         else => {
-            const ts = posix.clock_gettime(.REALTIME) catch |err| switch (err) {
+            const ts = clock_gettime(.REALTIME) catch |err| switch (err) {
                 error.UnsupportedClock, error.Unexpected => return 0, // "Precision of timing depends on hardware and OS".
             };
             return (@as(i128, ts.sec) * ns_per_s) + ts.nsec;
@@ -1886,7 +1886,7 @@ pub const Instant = struct {
             else => posix.CLOCK.MONOTONIC,
         };
 
-        const ts = posix.clock_gettime(clock_id) catch return error.Unsupported;
+        const ts = clock_gettime(clock_id) catch return error.Unsupported;
         return .{ .timestamp = ts };
     }
 
@@ -2870,3 +2870,236 @@ pub fn sleep(nanoseconds: u64) void {
     const ns = nanoseconds % ns_per_s;
     nanosleep(s, ns);
 }
+
+/// Write all of `bytes` to `fd` (0.15 std.fs.File.writeAll equivalent at fd level).
+pub fn writeAll(fd: fd_t, bytes: []const u8) WriteError!void {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        index += try write(fd, bytes[index..]);
+    }
+}
+
+pub const MakeDirError = error{
+    /// In WASI, this error may occur when the file descriptor does
+    /// not hold the required rights to create a new directory relative to it.
+    AccessDenied,
+    PermissionDenied,
+    DiskQuota,
+    PathAlreadyExists,
+    SymLinkLoop,
+    LinkQuotaExceeded,
+    NameTooLong,
+    FileNotFound,
+    SystemResources,
+    NoSpaceLeft,
+    NotDir,
+    ReadOnlyFileSystem,
+    /// WASI-only; file paths must be valid UTF-8.
+    InvalidUtf8,
+    /// Windows-only; file paths provided by the user must be valid WTF-8.
+    /// https://simonsapin.github.io/wtf-8/
+    InvalidWtf8,
+    BadPathName,
+    NoDevice,
+    /// On Windows, `\\server` or `\\server\share` was not found.
+    NetworkNotFound,
+} || UnexpectedError;
+
+/// Create a directory.
+/// `mode` is ignored on Windows and WASI.
+/// On Windows, `dir_path` should be encoded as [WTF-8](https://simonsapin.github.io/wtf-8/).
+/// On WASI, `dir_path` should be encoded as valid UTF-8.
+/// On other platforms, `dir_path` is an opaque sequence of bytes with no particular encoding.
+
+pub fn mkdir(dir_path: []const u8, mode: mode_t) MakeDirError!void {
+    if (native_os == .wasi and !builtin.link_libc) {
+        return mkdirat(AT.FDCWD, dir_path, mode);
+    } else if (native_os == .windows) {
+        const dir_path_w = try windows.sliceToPrefixedFileW(null, dir_path);
+        return mkdirW(dir_path_w.span(), mode);
+    } else {
+        const dir_path_c = try toPosixPath(dir_path);
+        return mkdirZ(&dir_path_c, mode);
+    }
+}
+
+/// Same as `mkdir` but the parameter is null-terminated.
+/// On Windows, `dir_path` should be encoded as [WTF-8](https://simonsapin.github.io/wtf-8/).
+/// On WASI, `dir_path` should be encoded as valid UTF-8.
+/// On other platforms, `dir_path` is an opaque sequence of bytes with no particular encoding.
+
+pub fn mkdirZ(dir_path: [*:0]const u8, mode: mode_t) MakeDirError!void {
+    if (native_os == .windows) {
+        const dir_path_w = try windows.cStrToPrefixedFileW(null, dir_path);
+        return mkdirW(dir_path_w.span(), mode);
+    } else if (native_os == .wasi and !builtin.link_libc) {
+        return mkdir(mem.sliceTo(dir_path, 0), mode);
+    }
+    switch (errno(system.mkdir(dir_path, mode))) {
+        .SUCCESS => return,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .DQUOT => return error.DiskQuota,
+        .EXIST => return error.PathAlreadyExists,
+        .FAULT => unreachable,
+        .LOOP => return error.SymLinkLoop,
+        .MLINK => return error.LinkQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTDIR => return error.NotDir,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .ILSEQ => |err| if (native_os == .wasi)
+            return error.InvalidUtf8
+        else
+            return unexpectedErrno(err),
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+/// Windows-only. Same as `mkdir` but the parameters is WTF16LE encoded.
+
+pub fn mkdirat(dir_fd: fd_t, sub_dir_path: []const u8, mode: mode_t) MakeDirError!void {
+    if (native_os == .windows) {
+        const sub_dir_path_w = try windows.sliceToPrefixedFileW(dir_fd, sub_dir_path);
+        return mkdiratW(dir_fd, sub_dir_path_w.span(), mode);
+    } else if (native_os == .wasi and !builtin.link_libc) {
+        return mkdiratWasi(dir_fd, sub_dir_path, mode);
+    } else {
+        const sub_dir_path_c = try toPosixPath(sub_dir_path);
+        return mkdiratZ(dir_fd, &sub_dir_path_c, mode);
+    }
+}
+
+pub fn mkdiratZ(dir_fd: fd_t, sub_dir_path: [*:0]const u8, mode: mode_t) MakeDirError!void {
+    if (native_os == .windows) {
+        const sub_dir_path_w = try windows.cStrToPrefixedFileW(dir_fd, sub_dir_path);
+        return mkdiratW(dir_fd, sub_dir_path_w.span(), mode);
+    } else if (native_os == .wasi and !builtin.link_libc) {
+        return mkdirat(dir_fd, mem.sliceTo(sub_dir_path, 0), mode);
+    }
+    switch (errno(system.mkdirat(dir_fd, sub_dir_path, mode))) {
+        .SUCCESS => return,
+        .ACCES => return error.AccessDenied,
+        .BADF => unreachable,
+        .PERM => return error.PermissionDenied,
+        .DQUOT => return error.DiskQuota,
+        .EXIST => return error.PathAlreadyExists,
+        .FAULT => unreachable,
+        .LOOP => return error.SymLinkLoop,
+        .MLINK => return error.LinkQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTDIR => return error.NotDir,
+        .ROFS => return error.ReadOnlyFileSystem,
+        // dragonfly: when dir_fd is unlinked from filesystem
+        .NOTCONN => return error.FileNotFound,
+        .ILSEQ => |err| if (native_os == .wasi)
+            return error.InvalidUtf8
+        else
+            return unexpectedErrno(err),
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+/// Windows-only. Same as `mkdirat` except the parameter WTF16 LE encoded.
+
+pub fn mkdiratW(dir_fd: fd_t, sub_path_w: []const u16, mode: mode_t) MakeDirError!void {
+    _ = mode;
+    const sub_dir_handle = windows.OpenFile(sub_path_w, .{
+        .dir = dir_fd,
+        .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
+        .creation = windows.FILE_CREATE,
+        .filter = .dir_only,
+    }) catch |err| switch (err) {
+        error.IsDir => return error.Unexpected,
+        error.PipeBusy => return error.Unexpected,
+        error.NoDevice => return error.Unexpected,
+        error.WouldBlock => return error.Unexpected,
+        error.AntivirusInterference => return error.Unexpected,
+        else => |e| return e,
+    };
+    windows.CloseHandle(sub_dir_handle);
+}
+
+pub fn mkdirW(dir_path_w: []const u16, mode: mode_t) MakeDirError!void {
+    _ = mode;
+    const sub_dir_handle = windows.OpenFile(dir_path_w, .{
+        .dir = fs.cwd().fd,
+        .access_mask = windows.GENERIC_READ | windows.SYNCHRONIZE,
+        .creation = windows.FILE_CREATE,
+        .filter = .dir_only,
+    }) catch |err| switch (err) {
+        error.IsDir => return error.Unexpected,
+        error.PipeBusy => return error.Unexpected,
+        error.NoDevice => return error.Unexpected,
+        error.WouldBlock => return error.Unexpected,
+        error.AntivirusInterference => return error.Unexpected,
+        else => |e| return e,
+    };
+    windows.CloseHandle(sub_dir_handle);
+}
+
+pub fn mkdiratWasi(dir_fd: fd_t, sub_dir_path: []const u8, mode: mode_t) MakeDirError!void {
+    _ = mode;
+    switch (wasi.path_create_directory(dir_fd, sub_dir_path.ptr, sub_dir_path.len)) {
+        .SUCCESS => return,
+        .ACCES => return error.AccessDenied,
+        .BADF => unreachable,
+        .PERM => return error.PermissionDenied,
+        .DQUOT => return error.DiskQuota,
+        .EXIST => return error.PathAlreadyExists,
+        .FAULT => unreachable,
+        .LOOP => return error.SymLinkLoop,
+        .MLINK => return error.LinkQuotaExceeded,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.NoSpaceLeft,
+        .NOTDIR => return error.NotDir,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .NOTCAPABLE => return error.AccessDenied,
+        .ILSEQ => return error.InvalidUtf8,
+        else => |err| return unexpectedErrno(err),
+    }
+}
+
+
+/// Fill `buf` with cryptographically secure random bytes. Replacement for
+/// 0.15 std.crypto.random.bytes at io-less call sites (0.16 moved entropy
+/// onto the Io interface).
+pub fn random(buf: []u8) void {
+    switch (native_os) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => std.c.arc4random_buf(buf.ptr, buf.len),
+        .linux => {
+            var i: usize = 0;
+            while (i < buf.len) {
+                const rc = std.os.linux.getrandom(buf[i..].ptr, buf.len - i, 0);
+                switch (std.os.linux.E.init(rc)) {
+                    .SUCCESS => i += rc,
+                    .INTR => continue,
+                    else => unreachable, // getrandom with flags=0 cannot fail otherwise
+                }
+            }
+        },
+        else => @compileError("unsupported OS"),
+    }
+}
+
+/// Plain thread mutex with 0.15 std.Thread.Mutex semantics (0.16 moved
+/// Thread.Mutex to Io.Mutex, which requires an Io at every lock site).
+/// hty always links libc, so pthread is the natural implementation.
+pub const Mutex = struct {
+    m: std.c.pthread_mutex_t = .{},
+
+    pub fn lock(self: *Mutex) void {
+        assert(std.c.pthread_mutex_lock(&self.m) == .SUCCESS);
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        assert(std.c.pthread_mutex_unlock(&self.m) == .SUCCESS);
+    }
+};

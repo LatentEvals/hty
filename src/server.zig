@@ -28,6 +28,7 @@
 //! structurally, not by grace timing or refcounts.
 
 const std = @import("std");
+const sys = @import("hty").sys;
 
 const Allocator = std.mem.Allocator;
 
@@ -119,28 +120,27 @@ pub const RunOpts = struct {
     log_dir: ?[]const u8 = null,
 };
 
-pub fn runServer(alloc: Allocator, socket_path: []const u8) !void {
-    return runServerWithOpts(alloc, socket_path, .{});
+pub fn runServer(alloc: Allocator, io: std.Io, socket_path: []const u8) !void {
+    return runServerWithOpts(alloc, io, socket_path, .{});
 }
 
-pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpts) !void {
+pub fn runServerWithOpts(alloc: Allocator, io: std.Io, socket_path: []const u8, opts: RunOpts) !void {
     // Unlink stale socket file if present.
-    std.posix.unlink(socket_path) catch |err| switch (err) {
+    sys.unlink(socket_path) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 
-    const address = try std.net.Address.initUnix(socket_path);
-    var server = try address.listen(.{ .reuse_address = true });
+    var server = try sys.listenUnix(socket_path, 128);
     defer server.deinit();
-    defer std.posix.unlink(socket_path) catch {};
+    defer sys.unlink(socket_path) catch {};
 
     // The loop accepts until WouldBlock on every listen-readiness, so the
     // listen socket must be non-blocking (it also dodges the classic
     // "client resets between poll and accept" stall).
     try setStreamNonBlocking(server.stream.handle);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, io);
     defer registry.deinit();
 
     // Resolve the session log directory best-effort (or take the test
@@ -163,7 +163,7 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
         // One-time reconciliation: logs written by older hty versions may
         // predate the by-name symlink that `nameInUse` now treats as
         // authoritative; create any missing links before serving requests.
-        log_mod.reconcileByNameLinks(alloc, d);
+        log_mod.reconcileByNameLinks(io, alloc, d);
     }
 
     var srv = LoopServer{
@@ -183,7 +183,7 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
     // Auto-shutdown: the server starts empty, so arm the shutdown deadline
     // right away (the old code's `empty_since_ms = now` initialization). A
     // new session or connection cancels it at the next iteration's sync.
-    if (srv.deadlines.insert(empty_shutdown_deadline_id, std.time.milliTimestamp() + opts.empty_grace_ms)) {
+    if (srv.deadlines.insert(empty_shutdown_deadline_id, sys.milliTimestamp() + opts.empty_grace_ms)) {
         srv.empty_armed = true;
     } else |_| {}
 
@@ -192,11 +192,11 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
     // still notices. Production (null) keeps a deadline-free steady
     // state: poll blocks until real work arrives.
     if (opts.stop_signal != null) {
-        srv.deadlines.insert(stop_poll_deadline_id, std.time.milliTimestamp() + stop_poll_ms) catch {};
+        srv.deadlines.insert(stop_poll_deadline_id, sys.milliTimestamp() + stop_poll_ms) catch {};
     }
 
     while (true) {
-        const timeout = srv.deadlines.nextTimeoutMs(std.time.milliTimestamp());
+        const timeout = srv.deadlines.nextTimeoutMs(sys.milliTimestamp());
         var ready = srv.loop.waitReady(timeout) catch |err| {
             std.debug.print("poll failed: {s}\n", .{@errorName(err)});
             continue;
@@ -220,7 +220,7 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
         // event that satisfies it arrived.
         srv.evaluateWaiters();
 
-        var now = std.time.milliTimestamp();
+        var now = sys.milliTimestamp();
         while (srv.deadlines.popExpired(now)) |expired| {
             switch (expired.id) {
                 empty_shutdown_deadline_id => {
@@ -237,7 +237,7 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
                 },
                 else => srv.waiterDeadlineExpired(expired.id, now),
             }
-            now = std.time.milliTimestamp();
+            now = sys.milliTimestamp();
         }
 
         // Deadline expiries can also resolve waiter-visible state (a reap
@@ -273,18 +273,18 @@ pub fn runServerWithOpts(alloc: Allocator, socket_path: []const u8, opts: RunOpt
 /// One client connection owned by the event loop: RPC, attach/watch, or
 /// pre-creation pending watch.
 const Conn = struct {
-    stream: std.net.Stream,
+    stream: sys.Stream,
     state: State = .reading_request,
     /// Inbound bytes. While `reading_request`: the request line being
     /// accumulated (cleared once dispatched; RPC conns discard anything
     /// after their request line — one request, one response, close).
     /// While `attached`: the JSONL frame stream from the client.
-    inbuf: std.ArrayListUnmanaged(u8) = .{},
+    inbuf: std.ArrayListUnmanaged(u8) = .empty,
     /// Outbound bytes not yet accepted by the socket, flushed on POLLOUT.
     /// Bounded by `max_outbound_bytes` (see its doc for the exact rule).
     /// Attached conns use their subscriber's buffer instead
     /// (`AttachClient.pending`, same bound and overflow policy).
-    outbuf: std.ArrayListUnmanaged(u8) = .{},
+    outbuf: std.ArrayListUnmanaged(u8) = .empty,
     /// Bytes of `outbuf` already written to the socket.
     out_pos: usize = 0,
     /// Set when this connection is parked in the waiter table.
@@ -361,7 +361,7 @@ const LoopServer = struct {
     loop: Loop,
     deadlines: DeadlineTable,
     conns: std.AutoHashMapUnmanaged(std.posix.socket_t, *Conn) = .{},
-    waiters: std.ArrayListUnmanaged(*Waiter) = .{},
+    waiters: std.ArrayListUnmanaged(*Waiter) = .empty,
     /// PTY master fds currently in the poll set, mapped to their session.
     /// Read interest is constant while registered; write interest tracks
     /// whether the session has queued input. Reconciled against the
@@ -450,7 +450,7 @@ const LoopServer = struct {
 
     fn acceptReady(self: *LoopServer) void {
         while (true) {
-            const fd = std.posix.accept(
+            const fd = sys.accept(
                 self.listen_fd,
                 null,
                 null,
@@ -468,7 +468,7 @@ const LoopServer = struct {
                     self.listen_paused = true;
                     self.deadlines.insert(
                         listen_resume_deadline_id,
-                        std.time.milliTimestamp() + listen_resume_ms,
+                        sys.milliTimestamp() + listen_resume_ms,
                     ) catch {};
                     return;
                 },
@@ -481,8 +481,8 @@ const LoopServer = struct {
             self.adoptConn(fd) catch {
                 // A connection slot couldn't be made: reject with the
                 // structured error and keep serving (PRD §6).
-                _ = std.posix.write(fd, "{\"ok\":false,\"error\":\"too many open connections\"}\n") catch {};
-                std.posix.close(fd);
+                _ = sys.write(fd, "{\"ok\":false,\"error\":\"too many open connections\"}\n") catch {};
+                sys.close(fd);
             };
         }
     }
@@ -514,7 +514,7 @@ const LoopServer = struct {
             .open, .reaped, .broken => {},
             // EOF observed but the child isn't reapable yet — retry on a
             // short deadline instead of polling a drained fd.
-            .reap_pending => self.armReapRetry(std.time.milliTimestamp()),
+            .reap_pending => self.armReapRetry(sys.milliTimestamp()),
         }
     }
 
@@ -740,7 +740,7 @@ const LoopServer = struct {
         id: ?i64,
     ) !?DispatchOutcome {
         const arena = arena_state.allocator();
-        const start_ms = std.time.milliTimestamp();
+        const start_ms = sys.milliTimestamp();
         const plan = ops.planWait(arena, kind, object, start_ms) catch |err| {
             return .{ .response = try encodeErrorLine(self.alloc, id, err) };
         };
@@ -972,7 +972,7 @@ const LoopServer = struct {
     fn flushConn(self: *LoopServer, conn: *Conn) void {
         const fd = conn.stream.handle;
         while (conn.out_pos < conn.outbuf.items.len) {
-            const n = std.posix.write(fd, conn.outbuf.items[conn.out_pos..]) catch |err| switch (err) {
+            const n = sys.write(fd, conn.outbuf.items[conn.out_pos..]) catch |err| switch (err) {
                 error.WouldBlock => {
                     self.loop.armWrite(fd);
                     return;
@@ -1099,9 +1099,9 @@ const LoopServer = struct {
     /// exists (spawn turned into a state flip — formerly a dedicated
     /// watcher thread woken through a self-pipe).
     fn syncSubscribers(self: *LoopServer) void {
-        var to_reap: std.ArrayListUnmanaged(*Conn) = .{};
+        var to_reap: std.ArrayListUnmanaged(*Conn) = .empty;
         defer to_reap.deinit(self.alloc);
-        var to_promote: std.ArrayListUnmanaged(*Conn) = .{};
+        var to_promote: std.ArrayListUnmanaged(*Conn) = .empty;
         defer to_promote.deinit(self.alloc);
 
         var it = self.conns.valueIterator();
@@ -1157,12 +1157,12 @@ const LoopServer = struct {
     /// holds a pointer across a free. Also keeps the waitpid-retry
     /// deadline armed while any dead child remains unreaped.
     fn syncSessionPtys(self: *LoopServer, now: i64) void {
-        var desired: std.ArrayListUnmanaged(SessionRegistry.PtyInterest) = .{};
+        var desired: std.ArrayListUnmanaged(SessionRegistry.PtyInterest) = .empty;
         defer desired.deinit(self.alloc);
         self.registry.collectPtyInterest(self.alloc, &desired);
 
         // Deregister fds no longer wanted.
-        var stale: std.ArrayListUnmanaged(std.posix.fd_t) = .{};
+        var stale: std.ArrayListUnmanaged(std.posix.fd_t) = .empty;
         defer stale.deinit(self.alloc);
         var it = self.session_fds.keyIterator();
         while (it.next()) |fd_ptr| {

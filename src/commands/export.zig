@@ -41,7 +41,7 @@ const ExportOptions = struct {
     format: ?Format = null,
 };
 
-pub fn run(alloc: Allocator, args: []const []const u8) !void {
+pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var opts = ExportOptions{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -66,7 +66,7 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
         common.printUsageAndExit("`hty export` requires --format (e.g. --format asciicast)");
     };
 
-    const path = logs.resolveLogPath(alloc, opts.session) catch |err| {
+    const path = logs.resolveLogPath(alloc, io, opts.session) catch |err| {
         switch (err) {
             error.SessionNotFound => try common.printErr("session log not found"),
             error.AmbiguousPrefix => try common.printErr("ambiguous session prefix"),
@@ -77,14 +77,8 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
     };
     defer alloc.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only }) catch |err| {
-        try common.printErrFmt("cannot open {s}: {s}", .{ path, @errorName(err) });
-        std.process.exit(common.ExitCode.generic);
-    };
-    defer file.close();
-
-    const bytes = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch |err| {
-        try common.printErrFmt("read failed: {s}", .{@errorName(err)});
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024)) catch |err| {
+        try common.printErrFmt("cannot read {s}: {s}", .{ path, @errorName(err) });
         std.process.exit(common.ExitCode.generic);
     };
     defer alloc.free(bytes);
@@ -94,13 +88,13 @@ pub fn run(alloc: Allocator, args: []const []const u8) !void {
             // Build the whole cast in memory, then write it to stdout in a
             // single call. Session logs are capped at 64 MB by the reader
             // above, so this is bounded.
-            var buf = std.array_list.Managed(u8).init(alloc);
+            var buf: std.Io.Writer.Allocating = .init(alloc);
             defer buf.deinit();
-            asciicast.writeCast(alloc, buf.writer().any(), bytes) catch |err| {
+            asciicast.writeCast(alloc, &buf.writer, bytes) catch |err| {
                 try common.printErrFmt("asciicast conversion failed: {s}", .{@errorName(err)});
                 std.process.exit(common.ExitCode.generic);
             };
-            try common.printRaw(buf.items);
+            try common.printRaw(buf.writer.buffered());
         },
     }
 }
