@@ -59,7 +59,7 @@ Or point your agent at `https://hty.sh/skill.md` directly.
 brew install LatentEvals/tap/hty
 ```
 
-**From source** — requires [Zig](https://ziglang.org) 0.15+.
+**From source** — requires [Zig](https://ziglang.org) 0.16+.
 
 ```sh
 git clone https://github.com/LatentEvals/hty.git
