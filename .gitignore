@@ -4,3 +4,4 @@ zig-out/
 .claude/
 .uncompact/
 internal-docs/
+zig-pkg/
