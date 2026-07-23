@@ -161,7 +161,7 @@ test "preflightSocketDir passes on a writable dir and leaves no probe behind" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(io, "state");
+    try tmp.dir.createDir(io, "state", .default_dir);
     const alloc = std.testing.allocator;
     const state_path = try tmp.dir.realPathFileAlloc(io, "state", alloc);
     defer alloc.free(state_path);
@@ -177,7 +177,7 @@ test "preflightSocketDir rejects an unwritable dir" {
     if (c.getuid() == 0) return error.SkipZigTest; // root ignores permission bits
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(io, "state");
+    try tmp.dir.createDir(io, "state", .default_dir);
     const alloc = std.testing.allocator;
     const state_path = try tmp.dir.realPathFileAlloc(io, "state", alloc);
     defer alloc.free(state_path);

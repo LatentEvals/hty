@@ -1372,7 +1372,7 @@ test "spawn: failure on any parent-side error path leaks no memory, fd, or child
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
             .fail_index = fail_index,
         });
-        if (InteractiveTerminal.spawn(failing.allocator(), .{
+        if (InteractiveTerminal.spawn(failing.allocator(), std.testing.io, .{
             .program = "/bin/sh",
             .args = &.{ "-c", "sleep 5" },
         }, .{
@@ -1400,11 +1400,12 @@ test "spawn: failure on any parent-side error path leaks no memory, fd, or child
 }
 
 fn countOpenFds() !usize {
-    var dir = try std.fs.openDirAbsolute("/dev/fd", .{ .iterate = true });
-    defer dir.close();
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.openDirAbsolute(io, "/dev/fd", .{ .iterate = true });
+    defer dir.close(io);
     var it = dir.iterate();
     var count: usize = 0;
-    while (try it.next()) |_| count += 1;
+    while (try it.next(io)) |_| count += 1;
     return count;
 }
 
@@ -1421,7 +1422,7 @@ const CellsHarness = struct {
     cells: [][]const []const u8,
 
     fn init(alloc: std.mem.Allocator, rows: u16, cols: u16, input: []const u8) !CellsHarness {
-        var terminal = try ghostty_vt.Terminal.init(alloc, .{
+        var terminal = try ghostty_vt.Terminal.init(std.testing.io, alloc, .{
             .cols = cols,
             .rows = rows,
             .max_scrollback = 10_000,

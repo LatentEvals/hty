@@ -25,6 +25,7 @@
 //! Review the diff in `testdata/sessions/` before committing.
 
 const std = @import("std");
+const io = std.testing.io;
 const sys = @import("hty").sys;
 const hty = @import("hty");
 const replayToTerminal = @import("commands/replay.zig").replayToTerminal;
@@ -36,15 +37,15 @@ test "fixture suite: real-program replay goldens" {
 
     // Open the fixtures dir. If it doesn't exist, the suite is a no-op — a
     // fresh clone should pass before any fixtures have been added.
-    var dir = std.Io.Dir.cwd().openDir(fixtures_dir, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(io, fixtures_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var it = dir.iterate();
     var any_failed = false;
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
 
@@ -61,9 +62,7 @@ fn runFixture(alloc: std.mem.Allocator, filename: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ fixtures_dir, filename });
     defer alloc.free(path);
 
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
-    defer file.close();
-    const bytes = try file.readToEndAlloc(alloc, 64 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(64 * 1024 * 1024));
     defer alloc.free(bytes);
 
     // The spawn line (line 1) carries the initial rows/cols. Parse just that
@@ -111,8 +110,8 @@ fn compareOrUpdateGolden(
     if (sys.getenv("UPDATE_GOLDENS") != null) {
         try std.Io.Dir.cwd().createDirPath(io, fixtures_dir);
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(actual);
+        defer file.close(io);
+        try file.writeStreamingAll(io, actual);
         return;
     }
 
@@ -129,8 +128,9 @@ fn compareOrUpdateGolden(
         },
         else => return err,
     };
-    defer file.close();
-    const expected = try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const expected = try reader.interface.allocRemaining(alloc, .limited(4 * 1024 * 1024));
     defer alloc.free(expected);
 
     if (!std.mem.eql(u8, expected, actual)) {

@@ -238,10 +238,9 @@ fn writeSanitizedJsonString(writer: *std.Io.Writer, bytes: []const u8) !void {
 const testing = std.testing;
 
 fn runWriteCast(alloc: Allocator, log: []const u8) ![]u8 {
-    var out = std.array_list.Managed(u8).init(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
-    const w = out.writer().any();
-    try writeCast(alloc, w, log);
+    try writeCast(alloc, &out.writer, log);
     return out.toOwnedSlice();
 }
 

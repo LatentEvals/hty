@@ -9,6 +9,22 @@
 
 const std = @import("std");
 const io = std.testing.io;
+
+/// 0.15 std.fs.File.readToEndAlloc equivalent (removed in 0.16).
+fn readFileToEnd(file: std.Io.File, alloc: std.mem.Allocator, max: usize) ![]u8 {
+    var list = std.array_list.Managed(u8).init(alloc);
+    errdefer list.deinit();
+    var chunk: [65536]u8 = undefined;
+    while (list.items.len <= max) {
+        const n = file.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        try list.appendSlice(chunk[0..n]);
+    }
+    return list.toOwnedSlice();
+}
 const sys = @import("hty").sys;
 const hty = @import("hty");
 
@@ -60,8 +76,7 @@ pub fn expectTestOk(parsed: std.json.Parsed(std.json.Value)) !std.json.ObjectMap
 
 /// Search PATH for a command and return its absolute path, or null.
 fn findCommand(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    const path_env = std.process.getEnvVarOwned(alloc, "PATH") catch return null;
-    defer alloc.free(path_env);
+    const path_env = sys.getenv("PATH") orelse return null;
 
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
@@ -77,7 +92,7 @@ fn findCommand(alloc: std.mem.Allocator, name: []const u8) ?[]const u8 {
 }
 
 test "unknown operation returns actionable error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{ .op = "bogus" });
@@ -95,7 +110,7 @@ test "unknown operation returns actionable error" {
 }
 
 test "list op returns empty array on a fresh registry" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{ .op = "list" });
@@ -108,7 +123,7 @@ test "list op returns empty array on a fresh registry" {
 }
 
 test "name collision is rejected" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -151,7 +166,7 @@ test "name collision is rejected" {
 }
 
 test "headless protocol can drive cat and snapshot echoed text" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -228,7 +243,7 @@ test "headless protocol can drive cat and snapshot echoed text" {
 }
 
 test "snapshot cells field exposes wide-char spacer tails over the RPC" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -290,7 +305,7 @@ test "snapshot cells field exposes wide-char spacer tails over the RPC" {
 }
 
 test "wait_for_text with regex matches a pattern" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -376,7 +391,7 @@ test "session event log records spawn, input, output, killed" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -421,8 +436,8 @@ test "session event log records spawn, input, output, killed" {
     defer alloc.free(link_path);
 
     const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 1024 * 1024);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 1024 * 1024);
     defer alloc.free(contents);
 
     try std.testing.expect(std.mem.indexOf(u8, contents, "\"kind\":\"spawn\"") != null);
@@ -450,7 +465,7 @@ test "headless protocol can use nano to write a file" {
     const nano_path = findCommand(std.testing.allocator, "nano") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(nano_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-nano-{d}.txt", .{sys.nanoTimestamp()});
@@ -551,8 +566,8 @@ test "headless protocol can use nano to write a file" {
     }
 
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, std.testing.allocator, 4096);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "written through nano") != null);
@@ -562,7 +577,7 @@ test "headless protocol can launch top and quit" {
     const top_path = findCommand(std.testing.allocator, "top") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(top_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {
@@ -615,7 +630,7 @@ test "headless protocol can use emacs to write an org file" {
     const emacs_path = findCommand(std.testing.allocator, "emacs") orelse return error.SkipZigTest;
     defer std.testing.allocator.free(emacs_path);
 
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/hty-emacs-{d}.org", .{sys.nanoTimestamp()});
@@ -744,8 +759,8 @@ test "headless protocol can use emacs to write an org file" {
 
     // Verify file contents.
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, std.testing.allocator, 4096);
     defer std.testing.allocator.free(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "* Hello from hty") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "** TODO Write tests") != null);
@@ -785,8 +800,8 @@ fn readSessionLog(alloc: std.mem.Allocator, by_name: []const u8, name: []const u
     const link_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ by_name, name });
     defer alloc.free(link_path);
     const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+    defer file.close(io);
+    return try readFileToEnd(file, alloc, 4 * 1024 * 1024);
 }
 
 test "replay reproduces the live grid for a colored cat session" {
@@ -797,7 +812,7 @@ test "replay reproduces the live grid for a colored cat session" {
     defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = dirs.log_dir;
 
@@ -899,7 +914,7 @@ test "replay reproduces the live grid across a mid-session resize" {
     defer std.Io.Dir.cwd().deleteTree(io, dirs.log_dir) catch {};
     defer alloc.free(dirs.by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = dirs.log_dir;
 
@@ -1070,7 +1085,7 @@ pub fn expectTestError(parsed: std.json.Parsed(std.json.Value), needle: []const 
 }
 
 test "invalid JSON returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "not valid json {{{");
@@ -1079,7 +1094,7 @@ test "invalid JSON returns a structured error" {
 }
 
 test "non-object JSON root returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "[1,2,3]");
@@ -1088,7 +1103,7 @@ test "non-object JSON root returns a structured error" {
 }
 
 test "request missing the op field returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequestRaw(&registry, "{}");
@@ -1099,7 +1114,7 @@ test "request missing the op field returns a structured error" {
 }
 
 test "op with missing required subfield returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // spawn without `program` — handleSpawn calls readRequiredString("program").
@@ -1109,7 +1124,7 @@ test "op with missing required subfield returns a structured error" {
 }
 
 test "op with wrong-type field returns a structured error" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // `program` should be a string; send an integer.
@@ -1164,7 +1179,7 @@ pub fn spawnCatSession(registry: *SessionRegistry, name: ?[]const u8) ![]u8 {
 
 test "resolve session by full UUID" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, null);
@@ -1181,7 +1196,7 @@ test "resolve session by full UUID" {
 
 test "resolve session by short UUID prefix" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, null);
@@ -1200,7 +1215,7 @@ test "resolve session by short UUID prefix" {
 
 test "ambiguous prefix is rejected" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_a = try spawnCatSession(&registry, "a");
@@ -1229,7 +1244,7 @@ test "ambiguous prefix is rejected" {
 
 test "sole-session implicit resolution" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "solo");
@@ -1247,7 +1262,7 @@ test "sole-session implicit resolution" {
 
 test "sole-session implicit errors when multiple sessions exist" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_a = try spawnCatSession(&registry, "aa");
@@ -1269,7 +1284,7 @@ test "sole-session implicit errors when multiple sessions exist" {
 
 test "session-not-found returns a structured error" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // Spawn one session so the "no sessions at all" branch doesn't shadow
@@ -1295,7 +1310,7 @@ test "session-not-found returns a structured error" {
 // code between files.
 
 test "send_bytes_hex op sends decoded bytes to the pty" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "hexcat");
@@ -1328,7 +1343,7 @@ test "send_bytes_hex op sends decoded bytes to the pty" {
 }
 
 test "send_bytes_hex op rejects malformed hex" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "badhex");
@@ -1354,7 +1369,7 @@ test "send_bytes_hex op rejects malformed hex" {
 // `--raw-text 'hello\n'`. We assert the echo contains those two literal
 // bytes and no real newline snuck in.
 test "send_text with literal backslash-n preserves bytes verbatim (--raw-text round trip)" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "rawcat");
@@ -1406,7 +1421,7 @@ test "send_text with literal backslash-n preserves bytes verbatim (--raw-text ro
 }
 
 test "send_key op accepts a symbolic key name" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "keycat");
@@ -1428,7 +1443,7 @@ test "send_key op accepts a symbolic key name" {
 }
 
 test "send_key op rejects an unknown key name" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "badkey");
@@ -1448,7 +1463,7 @@ test "send_key op rejects an unknown key name" {
 }
 
 test "resize op changes dimensions visible in the next snapshot" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "rcat");
@@ -1487,7 +1502,7 @@ test "resize op changes dimensions visible in the next snapshot" {
 }
 
 test "wait_for_exit returns after the child terminates" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     // /usr/bin/true exits immediately — perfect for wait_for_exit.
@@ -1515,7 +1530,7 @@ test "wait_for_exit returns after the child terminates" {
 
 test "list op returns one entry per session" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid_one = try spawnCatSession(&registry, "one");
@@ -1571,7 +1586,7 @@ test "list json includes disk-backed sessions with no live server" {
     defer alloc.free(dirs.by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = dirs.log_dir;
 
@@ -1602,7 +1617,7 @@ test "list json preserves null names for unnamed disk-backed sessions" {
     defer alloc.free(dirs.by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = dirs.log_dir;
 
@@ -1644,7 +1659,7 @@ test "delete op removes the session record and its log files" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -1727,7 +1742,7 @@ test "named sessions stay reserved across registry restarts until delete" {
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = log_dir;
 
@@ -1744,7 +1759,7 @@ test "named sessions stay reserved across registry restarts until delete" {
     }
 
     {
-        var registry = SessionRegistry.init(alloc);
+        var registry = SessionRegistry.init(alloc, std.testing.io);
         defer registry.deinit();
         registry.log_dir = log_dir;
 
@@ -1878,7 +1893,7 @@ const ServerEntryCtx = struct {
     err_flag: *std.atomic.Value(bool),
 
     fn run(self: *ServerEntryCtx) void {
-        runServerWithOpts(self.alloc, self.socket_path, .{
+        runServerWithOpts(self.alloc, std.testing.io, self.socket_path, .{
             .empty_grace_ms = 30_000, // let stop_signal control exit
             .stop_signal = self.stop,
             .log_dir = self.log_dir,
@@ -2013,9 +2028,10 @@ test "startup reconciliation: legacy log without by-name symlink still reserves 
     {
         const legacy_path = try std.fmt.allocPrint(alloc, "{s}/{s}.jsonl", .{ log_dir, legacy_id });
         defer alloc.free(legacy_path);
-        const file = try std.Io.Dir.createFileAbsolute(io, legacy_path, .{ .mode = 0o600 });
-        defer file.close();
-        try file.writeAll(
+        const file = try std.Io.Dir.createFileAbsolute(io, legacy_path, .{ .permissions = @enumFromInt(0o600) });
+        defer file.close(io);
+        try file.writeStreamingAll(
+            io,
             "{\"t\":1,\"kind\":\"spawn\",\"program\":\"/bin/cat\",\"args\":[],\"name\":\"legacy-reserved\",\"rows\":8,\"cols\":24}\n",
         );
     }
@@ -2046,7 +2062,8 @@ test "startup reconciliation: legacy log without by-name symlink still reserves 
         const link_path = try std.fmt.allocPrint(alloc, "{s}/legacy-reserved.jsonl", .{by_name});
         defer alloc.free(link_path);
         var target_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const target = try std.fs.readLinkAbsolute(link_path, &target_buf);
+        const target_len = try std.Io.Dir.readLinkAbsolute(io, link_path, &target_buf);
+        const target = target_buf[0..target_len];
         const expected_target = try std.fmt.allocPrint(alloc, "../{s}.jsonl", .{legacy_id});
         defer alloc.free(expected_target);
         try std.testing.expectEqualStrings(expected_target, target);
@@ -2449,7 +2466,7 @@ test "info json top-level version agrees with build.describe" {
 
 test "info json with a live server reports pid and uptime" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // Make the uptime non-zero so the assertion has something to check.
@@ -2478,7 +2495,7 @@ test "info json with a live server reports pid and uptime" {
 
 test "run json returns a session with id, name, program, and args (issue #22)" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     var parsed = try testRequest(&registry, .{
@@ -2527,7 +2544,7 @@ test "run json returns a session with id, name, program, and args (issue #22)" {
 
 test "wait --json text match reports matched, elapsed_ms, and text.needle+offset" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2593,7 +2610,7 @@ test "wait --json text match reports matched, elapsed_ms, and text.needle+offset
 
 test "wait --json regex match reports a real byte offset in text.offset" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2663,7 +2680,7 @@ test "wait --json regex match reports a real byte offset in text.offset" {
 
 test "wait --json idle match reports matched=idle and elapsed_ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2707,7 +2724,7 @@ test "wait --json idle match reports matched=idle and elapsed_ms" {
 
 test "wait --json exit match reports matched=exit and exit.code" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // `true` exits immediately with code 0. Resolve via PATH so this works
@@ -2757,7 +2774,7 @@ test "wait --json exit match reports matched=exit and exit.code" {
 
 test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2818,7 +2835,7 @@ test "wait --json timeout reports matched=null, timeout=true, and elapsed_ms" {
 
 test "wait_and_snapshot kind=idle returns matched=idle, elapsed_ms, and snapshot" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2867,7 +2884,7 @@ test "wait_and_snapshot kind=idle returns matched=idle, elapsed_ms, and snapshot
 
 test "wait_and_snapshot kind=text matches a string and includes the buffer" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2918,7 +2935,7 @@ test "wait_and_snapshot kind=text matches a string and includes the buffer" {
 
 test "wait_and_snapshot kind=duration sleeps at least the requested ms" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -2959,7 +2976,7 @@ test "wait_and_snapshot kind=duration sleeps at least the requested ms" {
 
 test "wait_and_snapshot snapshot=false omits the snapshot field" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3001,7 +3018,7 @@ test "wait_and_snapshot snapshot=false omits the snapshot field" {
 
 test "wait_and_snapshot kind=none with snapshot=true returns the snapshot immediately" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3041,7 +3058,7 @@ test "wait_and_snapshot kind=none with snapshot=true returns the snapshot immedi
 
 test "wait_and_snapshot kind=text reports timed_out=true on timeout" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3089,7 +3106,7 @@ test "wait_and_snapshot --wait-until-idle has op-start floor (no instant fire af
     // sit through at least the requested idle window even when no fresh
     // screen change is observed during the op.
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3138,7 +3155,7 @@ test "wait_and_snapshot timeout_ms=0 disables the timeout" {
     // when the wait condition is satisfied. Pair with a quick-firing
     // condition (a 30ms idle window) so the test isn't slow.
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3179,7 +3196,7 @@ test "wait_and_snapshot timeout_ms=0 disables the timeout" {
 
 test "wait_and_snapshot kind=regex matches a pattern and reports matched=regex" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -3233,7 +3250,7 @@ test "wait_and_snapshot kind=regex matches a pattern and reports matched=regex" 
 
 test "wait_and_snapshot kind=exit returns matched=exit and the exit code" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const true_path = findCommand(alloc, "true") orelse return error.SkipZigTest;
@@ -3317,8 +3334,8 @@ fn readAttachLog(alloc: std.mem.Allocator, log_dir: []const u8, name: []const u8
     const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/{s}.jsonl", .{ log_dir, name });
     defer alloc.free(link_path);
     const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(alloc, 1024 * 1024);
+    defer file.close(io);
+    return try readFileToEnd(file, alloc, 1024 * 1024);
 }
 
 /// Parse a JSONL log into owned objects. Caller frees the returned slice
@@ -3358,7 +3375,7 @@ test "issue #33: send ops tag log events with origin=send" {
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3476,7 +3493,7 @@ test "issue #33: attach lifecycle logs connect, input{origin=attach}, disconnect
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3562,7 +3579,7 @@ test "issue #33: interleaved send/attach produces ordered origin labels" {
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3672,7 +3689,7 @@ test "issue #33: abrupt attach drop still logs attach_disconnect" {
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3864,7 +3881,7 @@ test "issue #29: watch against existing session receives started + initial snaps
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -3953,7 +3970,7 @@ test "issue #84: watch client sending repaint receives a full-screen output snap
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4233,7 +4250,7 @@ test "issue #29: read-only input frames are dropped by the server" {
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4356,7 +4373,7 @@ test "hardening: tryWriteFrame buffers on a full socket, preserves order, drops 
     // then a few more. Every write must report success (client under its
     // buffer bound) and must not block.
     var frame: [8192]u8 = undefined;
-    var expected = std.ArrayListUnmanaged(u8){};
+    var expected = std.ArrayListUnmanaged(u8).empty;
     defer expected.deinit(alloc);
     var seq: u8 = 0;
     while (true) {
@@ -4415,7 +4432,7 @@ test "hardening: stalled attach reader does not block the pump; list completes a
     defer alloc.free(log_dir);
     defer std.Io.Dir.cwd().deleteTree(io, log_dir) catch {};
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -4493,8 +4510,8 @@ test "hardening: stalled attach reader does not block the pump; list completes a
         const link_path = try std.fmt.allocPrint(alloc, "{s}/by-name/stalled.jsonl", .{log_dir});
         defer alloc.free(link_path);
         const file = try std.Io.Dir.openFileAbsolute(io, link_path, .{});
-        defer file.close();
-        const contents = try file.readToEndAlloc(alloc, 64 * 1024 * 1024);
+        defer file.close(io);
+        const contents = try readFileToEnd(file, alloc, 64 * 1024 * 1024);
         defer alloc.free(contents);
         try std.testing.expect(std.mem.indexOf(u8, contents, "\"kind\":\"attach_disconnect\"") != null);
     }
@@ -4559,8 +4576,8 @@ test "event loop: stalled watch socket is dropped via the conn outbound buffer; 
             sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
-        defer file.close();
-        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
+        defer file.close(io);
+        const contents = readFileToEnd(file, alloc, 64 * 1024 * 1024) catch {
             sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
@@ -4896,8 +4913,8 @@ test "event loop: stalled reader + wedged child degrade only themselves; list ke
             sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
-        defer file.close();
-        const contents = file.readToEndAlloc(alloc, 64 * 1024 * 1024) catch {
+        defer file.close(io);
+        const contents = readFileToEnd(file, alloc, 64 * 1024 * 1024) catch {
             sys.sleep(20 * std.time.ns_per_ms);
             continue;
         };
@@ -5097,12 +5114,12 @@ fn spawnMouseFixture(
     defer alloc.free(py);
 
     // Build args: scripts/fixtures/mouse-echo.py <modes...>
-    var args_list = std.ArrayListUnmanaged([]const u8){};
+    var args_list = std.ArrayListUnmanaged([]const u8).empty;
     defer args_list.deinit(alloc);
     try args_list.append(alloc, "scripts/fixtures/mouse-echo.py");
     for (modes) |m| try args_list.append(alloc, m);
 
-    var env_list = std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }){};
+    var env_list = std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }).empty;
     defer env_list.deinit(alloc);
     try env_list.append(alloc, .{ .key = "HTY_MOUSE_RECORD", .value = record_path });
 
@@ -5158,7 +5175,7 @@ fn killMouseFixture(registry: *SessionRegistry, name: []const u8) !void {
 
 test "mouse: snapshot exposes mouse state after app enables 1002+1006" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
@@ -5190,7 +5207,7 @@ test "mouse: snapshot exposes mouse state after app enables 1002+1006" {
 
 test "mouse: send_mouse refuses when mouse is disabled" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const uuid = try spawnCatSession(&registry, "no_mouse");
@@ -5224,7 +5241,7 @@ test "mouse: send_mouse refuses when mouse is disabled" {
 
 test "mouse: click emits SGR press+release when 1006 is enabled" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
@@ -5278,8 +5295,8 @@ test "mouse: click emits SGR press+release when 1006 is enabled" {
         std.debug.print("record file missing: {s}\n", .{@errorName(err)});
         return err;
     };
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 4096);
     defer alloc.free(contents);
 
     // Expected SGR wire: ESC [ < 0 ; 10 ; 5 M (press) then ESC [ < 0 ; 10 ; 5 m (release).
@@ -5289,7 +5306,7 @@ test "mouse: click emits SGR press+release when 1006 is enabled" {
 
 test "mouse: X10 coords out of range errors when SGR not negotiated" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
@@ -5328,7 +5345,7 @@ test "mouse: X10 coords out of range errors when SGR not negotiated" {
 
 test "mouse: X10 encoding when only 1000 is on (no SGR)" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     const rec = try std.fmt.allocPrint(alloc, "/tmp/hty-mouse-rec-{d}.bin", .{sys.nanoTimestamp()});
@@ -5365,8 +5382,8 @@ test "mouse: X10 encoding when only 1000 is on (no SGR)" {
     _ = try expectTestOk(idle);
 
     const file = try std.Io.Dir.openFileAbsolute(io, rec, .{});
-    defer file.close();
-    const contents = try file.readToEndAlloc(alloc, 4096);
+    defer file.close(io);
+    const contents = try readFileToEnd(file, alloc, 4096);
     defer alloc.free(contents);
 
     // X10 press: ESC [ M <0+32=' '> <col+32=35='#'> <row+32=34='"'>.
@@ -5418,7 +5435,7 @@ test "run --remove: session is auto-removed after child exits" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5463,7 +5480,7 @@ test "run --remove: session persists while child is alive" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5524,7 +5541,7 @@ test "run --remove: manual hty kill races cleanly with auto-remove (no crash)" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5586,7 +5603,7 @@ test "spawn without --remove keeps the session after exit" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -5701,7 +5718,7 @@ test "delete during wait_for_text: wait returns structured error, no UAF" {
 
 test "handler error mid-op releases the session borrow" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -5744,7 +5761,7 @@ test "handler error mid-op releases the session borrow" {
 
 test "deferred free: remove unpublishes immediately; storage survives until freeDoomed" {
     const alloc = std.testing.allocator;
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     {
@@ -5796,7 +5813,7 @@ test "deferred free: remove unpublishes immediately; storage survives until free
 // change stamp gating skips every subsequent poll — and the gate must not
 // stop a genuine screen change from being scanned and matched.
 test "wait polls skip snapshots while the screen is unchanged" {
-    var registry = SessionRegistry.init(std.testing.allocator);
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
     defer registry.deinit();
 
     {

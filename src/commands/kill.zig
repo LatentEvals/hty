@@ -124,7 +124,7 @@ test "kill then delete removes the session record (end-to-end via ops)" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -171,7 +171,7 @@ test "kill+delete on already-exited session still removes the record" {
     defer alloc.free(by_name);
     try std.Io.Dir.cwd().createDirPath(io, by_name);
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
     registry.log_dir = log_dir;
 
@@ -209,7 +209,7 @@ test "kill on nonexistent session fails before any delete happens" {
     const SessionRegistry = @import("../registry.zig").SessionRegistry;
     const tests_mod = @import("../tests.zig");
 
-    var registry = SessionRegistry.init(alloc);
+    var registry = SessionRegistry.init(alloc, std.testing.io);
     defer registry.deinit();
 
     // This is what `hty kill --delete nope` would send first.

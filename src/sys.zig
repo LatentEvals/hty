@@ -1828,7 +1828,7 @@ pub fn nanoTimestamp() i128 {
 
 test milliTimestamp {
     const time_0 = milliTimestamp();
-    std.Thread.sleep(ns_per_ms);
+    sleep(ns_per_ms);
     const time_1 = milliTimestamp();
     const interval = time_1 - time_0;
     try testing.expect(interval > 0);
@@ -2011,7 +2011,7 @@ pub const Timer = struct {
 test Timer {
     var timer = try Timer.start();
 
-    std.Thread.sleep(10 * ns_per_ms);
+    sleep(10 * ns_per_ms);
     const time_0 = timer.read();
     try testing.expect(time_0 > 0);
 

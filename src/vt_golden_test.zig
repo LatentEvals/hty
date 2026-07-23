@@ -15,6 +15,7 @@
 //! Review the `testdata/vt/*.golden` diff before committing.
 
 const std = @import("std");
+const io = std.testing.io;
 const sys = @import("hty").sys;
 const hty = @import("hty");
 
@@ -41,7 +42,7 @@ fn runGoldenChunks(
 ) !void {
     const alloc = std.testing.allocator;
 
-    var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+    var terminal = try hty.ghostty_vt.Terminal.init(io, alloc, .{
         .cols = target_cols,
         .rows = target_rows,
         .max_scrollback = 10_000,
@@ -75,8 +76,8 @@ fn compareOrUpdateGolden(
     if (sys.getenv("UPDATE_GOLDENS") != null) {
         try std.Io.Dir.cwd().createDirPath(io, "testdata/vt");
         const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(actual);
+        defer file.close(io);
+        try file.writeStreamingAll(io, actual);
         return;
     }
 
@@ -93,8 +94,9 @@ fn compareOrUpdateGolden(
         },
         else => return err,
     };
-    defer file.close();
-    const expected = try file.readToEndAlloc(alloc, 4 * 1024 * 1024);
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const expected = try reader.interface.allocRemaining(alloc, .limited(4 * 1024 * 1024));
     defer alloc.free(expected);
 
     if (!std.mem.eql(u8, expected, actual)) {
@@ -301,7 +303,7 @@ test "OSC 0 sets the terminal title" {
     // committing a one-field golden file.
     const alloc = std.testing.allocator;
 
-    var terminal = try hty.ghostty_vt.Terminal.init(alloc, .{
+    var terminal = try hty.ghostty_vt.Terminal.init(io, alloc, .{
         .cols = 80,
         .rows = 24,
         .max_scrollback = 10_000,
