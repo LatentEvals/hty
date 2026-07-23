@@ -3077,9 +3077,9 @@ pub fn random(buf: []u8) void {
         .linux => {
             var i: usize = 0;
             while (i < buf.len) {
-                const rc = std.os.linux.getrandom(buf[i..].ptr, buf.len - i, 0);
-                switch (std.os.linux.E.init(rc)) {
-                    .SUCCESS => i += rc,
+                const rc = std.c.getrandom(buf[i..].ptr, buf.len - i, 0);
+                switch (errno(rc)) {
+                    .SUCCESS => i += @intCast(rc),
                     .INTR => continue,
                     else => unreachable, // getrandom with flags=0 cannot fail otherwise
                 }
