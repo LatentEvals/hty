@@ -38,7 +38,10 @@ jobs:
           version: 0.16.0
 
       - name: build release binary
-        run: zig build -Doptimize=ReleaseFast
+        # -Dcpu=baseline: without it Zig targets the CI runner's native CPU,
+        # so binaries can use extensions (e.g. SVE on GitHub's Neoverse arm
+        # runners) that end-user machines and VMs lack, crashing with SIGILL.
+        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
       - name: package
         run: |
