@@ -121,6 +121,34 @@ pub fn printRaw(text: []const u8) !void {
     try sys.writeAll(std.posix.STDOUT_FILENO, text);
 }
 
+/// Strip trailing spaces from every line of a rendered plain-text frame.
+/// The screen buffer pads each row to the full terminal width; a terminal
+/// pads short lines itself, so the padding carries no information and only
+/// bloats agent transcripts (LatentEvals/hty#97). Caller owns the slice.
+pub fn stripTrailingSpaces(alloc: Allocator, text: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try out.append('\n');
+        first = false;
+        try out.appendSlice(std.mem.trimEnd(u8, line, " "));
+    }
+    return out.toOwnedSlice();
+}
+
+/// Print a plain snapshot `buffer`, trailing spaces stripped, plus a final
+/// newline. Only for the plain rendering — `--ansi` output keeps trailing
+/// cells because they can carry styling (e.g. a painted background).
+pub fn printPlainSnapshot(text: []const u8) !void {
+    const alloc = std.heap.c_allocator;
+    const stripped = try stripTrailingSpaces(alloc, text);
+    defer alloc.free(stripped);
+    try printRaw(stripped);
+    try printRaw("\n");
+}
+
 pub fn printErr(text: []const u8) !void {
     try sys.writeAll(std.posix.STDERR_FILENO, text);
     try sys.writeAll(std.posix.STDERR_FILENO, "\n");
@@ -216,4 +244,18 @@ pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
         }
     }
     try writer.writeByte('"');
+}
+
+test "stripTrailingSpaces drops per-line padding, keeps inner spaces" {
+    const alloc = std.testing.allocator;
+    const stripped = try stripTrailingSpaces(alloc, "hello   \n  a b   \n\nend");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("hello\n  a b\n\nend", stripped);
+}
+
+test "stripTrailingSpaces leaves unpadded text untouched" {
+    const alloc = std.testing.allocator;
+    const stripped = try stripTrailingSpaces(alloc, "no padding here");
+    defer alloc.free(stripped);
+    try std.testing.expectEqualStrings("no padding here", stripped);
 }
