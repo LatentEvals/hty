@@ -11,8 +11,10 @@ pub fn helpText() []const u8 {
     \\hty snapshot [SESSION] [--ansi] [--json]
     \\
     \\Read the session's current rendered screen. Default output is plain
-    \\text. Use --ansi to get the styled ANSI rendering, --json for the full
-    \\structured response.
+    \\text, with a trailing run of identical fill rows (vim's `~` rows, or
+    \\blank rows) collapsed into a single `~ ×14`-style marker line. Use
+    \\--ansi to get the styled ANSI rendering, --json for the full
+    \\structured response (both uncollapsed).
     \\
     ;
 }
@@ -64,6 +66,11 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     };
     const field = if (ansi_output) "screen_ansi" else "buffer";
     const text = getString(snap_obj, field) orelse "";
-    try common.printRaw(text);
+    const collapsed: ?[]u8 = if (ansi_output)
+        null
+    else
+        try common.collapseTrailingFillRows(alloc, text);
+    defer if (collapsed) |owned| alloc.free(owned);
+    try common.printRaw(collapsed orelse text);
     try common.printRaw("\n");
 }

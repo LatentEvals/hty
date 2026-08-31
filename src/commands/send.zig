@@ -703,14 +703,22 @@ pub fn readTimedOut(object: std.json.ObjectMap) bool {
 }
 
 /// Print either the plain `buffer` field or the styled `screen_ansi` field
-/// from the response's `snapshot` sub-object, with a trailing newline.
+/// from the response's `snapshot` sub-object, with a trailing newline. The
+/// plain form gets its trailing fill-row runs collapsed, same as
+/// `hty snapshot`.
 pub fn printSnapshotBody(object: std.json.ObjectMap, ansi_output: bool) !void {
     const snap_val = object.get("snapshot") orelse return;
     if (snap_val != .object) return;
     const field = if (ansi_output) "screen_ansi" else "buffer";
     const body = snap_val.object.get(field) orelse return;
     if (body != .string) return;
-    try common.printRaw(body.string);
+    const alloc = std.heap.c_allocator;
+    const collapsed: ?[]u8 = if (ansi_output)
+        null
+    else
+        try common.collapseTrailingFillRows(alloc, body.string);
+    defer if (collapsed) |owned| alloc.free(owned);
+    try common.printRaw(collapsed orelse body.string);
     try common.printRaw("\n");
 }
 
