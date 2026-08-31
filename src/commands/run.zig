@@ -38,7 +38,12 @@ pub fn helpText() []const u8 {
     \\Wait + snapshot flags (let `run` block until the program is ready and
     \\return the initial render in one round-trip):
     \\  --snapshot                Include the post-spawn snapshot in the response.
-    \\                            Requires one of --wait-until-* or --wait-duration.
+    \\                            Without an explicit --wait-* flag this implies
+    \\                            --wait-until-idle 100 so the program has a
+    \\                            chance to paint; pass --no-wait for the
+    \\                            immediate frame.
+    \\  --no-wait                 With --snapshot, capture the frame immediately
+    \\                            instead of the implied --wait-until-idle 100.
     \\  --wait-duration DUR       Sleep DUR after spawn, then snapshot.
     \\  --wait-until-idle [MS]    Block until the screen has been quiet for MS
     \\                            milliseconds (default 100).
@@ -69,6 +74,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var json_output = false;
 
     var snapshot_flag = false;
+    var no_wait = false;
     var ansi_output = false;
     var wait_duration_str: ?[]const u8 = null;
     var wait_until_idle = false;
@@ -118,6 +124,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--snapshot")) {
             snapshot_flag = true;
+        } else if (std.mem.eql(u8, arg, "--no-wait")) {
+            no_wait = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi_output = true;
         } else if (std.mem.eql(u8, arg, "--wait-duration")) {
@@ -208,12 +216,21 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         try common.printErr("--wait-duration without --snapshot is just a delay; add --snapshot");
         std.process.exit(common.ExitCode.generic);
     }
-    // Spec: `run --snapshot` with no wait flags is almost always wrong (the
-    // snapshot would fire before the spawned program had a chance to paint
-    // anything). Surface the helpful error rather than silently racing.
-    if (snapshot_flag and wait_kind_count == 0 and wait_duration_str == null) {
-        try common.printErr("--snapshot on `hty run` almost always wants --wait-until-idle or --wait-duration");
+    if (no_wait and (wait_kind_count > 0 or wait_duration_str != null)) {
+        try common.printErr("--no-wait is incompatible with --wait-duration/--wait-until-*");
         std.process.exit(common.ExitCode.generic);
+    }
+    if (no_wait and !snapshot_flag) {
+        try common.printErr("--no-wait requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+
+    // `run --snapshot` with no wait flags would fire before the spawned
+    // program had a chance to paint anything (issue #96). Imply the default
+    // idle settle; --no-wait keeps the immediate capture.
+    if (send_cmd.shouldImplyIdleSettle(snapshot_flag, no_wait, wait_kind_count, wait_duration_str != null)) {
+        wait_until_idle = true;
+        wait_kind_count = 1;
     }
     if (ansi_output and !snapshot_flag) {
         try common.printErr("--ansi requires --snapshot");
@@ -285,11 +302,10 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         else => null,
     } else null;
 
-    // Fused wait + snapshot: only triggered when one of --wait-until-* or
-    // --wait-duration is set. The earlier validation rejected --snapshot
-    // alone (without a wait flag) on `run`, so any fused path here is
-    // accompanied by a wait condition.
-    const fused = wait_kind_count > 0 or wait_duration_str != null;
+    // Fused wait + snapshot: triggered by any --wait-until-*/--wait-duration
+    // flag or by --snapshot itself (with --no-wait the wait kind is "none"
+    // and the server snapshots immediately).
+    const fused = wait_kind_count > 0 or wait_duration_str != null or snapshot_flag;
     if (fused) {
         const wait_kind: []const u8 = if (wait_until_idle)
             "idle"
@@ -302,7 +318,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         else if (wait_duration_str != null)
             "duration"
         else
-            unreachable;
+            "none";
 
         const timeout_ms: u64 = if (timeout_str) |t| common.parseDurationMs(t) catch {
             try common.printErr("invalid --timeout value");
