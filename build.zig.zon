@@ -1,6 +1,6 @@
 .{
     .name = .hty,
-    .version = "0.9.0",
+    .version = "0.9.1",
     .fingerprint = 0xdb0f36e00d6a41f5,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
