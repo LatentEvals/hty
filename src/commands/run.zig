@@ -47,6 +47,9 @@ pub fn helpText() []const u8 {
     \\  --wait-until-exit         Block until the child process exits.
     \\  --timeout DUR             Cap on any --wait-until-* (default 30s; 0 = none).
     \\  --ansi                    With --snapshot, print styled ANSI rendering.
+    \\  --lines N:M               With --snapshot, print only rows N through M
+    \\                            (1-indexed, inclusive; `N:` and `:M` open
+    \\                            ends allowed). Not valid with --json.
     \\
     \\`--detach` is accepted as a no-op — every `hty run` session is
     \\detached by default. Use `hty attach` afterwards, or `--attach`
@@ -69,6 +72,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var json_output = false;
 
     var snapshot_flag = false;
+    var lines_range: ?common.LineRange = null;
     var ansi_output = false;
     var wait_duration_str: ?[]const u8 = null;
     var wait_until_idle = false;
@@ -120,6 +124,11 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             snapshot_flag = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi_output = true;
+        } else if (std.mem.eql(u8, arg, "--lines")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--lines requires a value (N:M, N:, or :M)");
+            lines_range = common.parseLineRange(args[i]) catch
+                return common.printUsageAndExit("invalid --lines range: expected N:M, N:, or :M with 1-indexed rows and N <= M");
         } else if (std.mem.eql(u8, arg, "--wait-duration")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--wait-duration requires a value");
@@ -217,6 +226,14 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     }
     if (ansi_output and !snapshot_flag) {
         try common.printErr("--ansi requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (lines_range != null and !snapshot_flag) {
+        try common.printErr("--lines requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (lines_range != null and json_output) {
+        try common.printErr("--lines is incompatible with --json (the JSON response always carries the full snapshot)");
         std.process.exit(common.ExitCode.generic);
     }
     if (json_output and ansi_output) {
@@ -354,7 +371,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         }
 
         if (snapshot_flag) {
-            try send_cmd.printSnapshotBody(wait_object, ansi_output);
+            try send_cmd.printSnapshotBody(wait_object, ansi_output, lines_range);
         } else {
             try printStartedLine(alloc, display_name, id_str);
         }
