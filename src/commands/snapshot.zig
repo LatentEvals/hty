@@ -19,6 +19,10 @@ pub fn helpText() []const u8 {
     \\                last row, `:M` from the first row through M. Rows past
     \\                the end of the screen are clamped. Not valid with
     \\                --json (which always carries the full snapshot).
+    \\                Tip: editors show status lines and prompts on the
+    \\                LAST rows — `--lines 1:12` misses a prompt on row
+    \\                24. Prefer open `N:` ranges, or read the full
+    \\                frame when state is unclear.
     \\
     ;
 }
@@ -92,4 +96,5 @@ test "snapshot helpText documents --lines flag" {
     const text = helpText();
     try std.testing.expect(std.mem.indexOf(u8, text, "--lines N:M") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "1-indexed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "LAST rows") != null);
 }

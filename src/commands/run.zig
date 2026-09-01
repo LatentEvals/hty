@@ -50,6 +50,9 @@ pub fn helpText() []const u8 {
     \\  --lines N:M               With --snapshot, print only rows N through M
     \\                            (1-indexed, inclusive; `N:` and `:M` open
     \\                            ends allowed). Not valid with --json.
+    \\                            Tip: editors show status lines and prompts
+    \\                            on the LAST rows — `1:12` misses a prompt
+    \\                            on row 24; prefer `N:`.
     \\
     \\`--detach` is accepted as a no-op — every `hty run` session is
     \\detached by default. Use `hty attach` afterwards, or `--attach`
