@@ -5921,3 +5921,216 @@ test "wait polls skip snapshots while the screen is unchanged" {
         _ = try expectTestOk(parsed);
     }
 }
+
+// ============================================================================
+// snapshot --diff (row-diff snapshots against a per-session baseline)
+// ============================================================================
+
+fn getDiffObject(object: std.json.ObjectMap) !std.json.ObjectMap {
+    const diff_val = object.get("diff") orelse return error.InvalidResponse;
+    return switch (diff_val) {
+        .object => |o| o,
+        else => error.InvalidResponse,
+    };
+}
+
+fn diffChanged(diff: std.json.ObjectMap) ![]const std.json.Value {
+    const changed_val = diff.get("changed") orelse return error.InvalidResponse;
+    return switch (changed_val) {
+        .array => |a| a.items,
+        else => error.InvalidResponse,
+    };
+}
+
+test "snapshot diff: first call is full, idle is no-change, edits report only changed rows" {
+    var registry = SessionRegistry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+
+    const uuid = try spawnCatSession(&registry, "diffcat");
+    defer std.testing.allocator.free(uuid);
+
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "diffcat",
+            .text = "alpha\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "diffcat",
+            .text = "alpha",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    // Let echo + cat output both land before baselining.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "diffcat",
+            .idle_ms = 150,
+            .timeout_ms = 3_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+
+    // First diff: no baseline — full frame, every row reported.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "snapshot",
+            .session = "diffcat",
+            .diff = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const diff = try getDiffObject(object);
+        try std.testing.expectEqual(true, diff.get("full").?.bool);
+        const changed = try diffChanged(diff);
+        // The plain buffer spans the written region only: the tty echo
+        // row plus cat's output row.
+        try std.testing.expectEqual(@as(usize, 2), changed.len);
+        try std.testing.expectEqual(@as(i64, 1), changed[0].object.get("row").?.integer);
+        try std.testing.expect(std.mem.indexOf(u8, changed[0].object.get("text").?.string, "alpha") != null);
+    }
+
+    // Second diff with nothing new: empty changed set.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "snapshot",
+            .session = "diffcat",
+            .diff = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const diff = try getDiffObject(object);
+        try std.testing.expectEqual(false, diff.get("full").?.bool);
+        const changed = try diffChanged(diff);
+        try std.testing.expectEqual(@as(usize, 0), changed.len);
+    }
+
+    // Type more; only the newly written rows come back.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "diffcat",
+            .text = "beta\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "diffcat",
+            .text = "beta",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "diffcat",
+            .idle_ms = 150,
+            .timeout_ms = 3_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "snapshot",
+            .session = "diffcat",
+            .diff = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const diff = try getDiffObject(object);
+        try std.testing.expectEqual(false, diff.get("full").?.bool);
+        const changed = try diffChanged(diff);
+        try std.testing.expect(changed.len >= 1);
+        try std.testing.expect(changed.len < 8);
+        var saw_beta = false;
+        for (changed) |entry| {
+            // Row 1 still shows "alpha" — it must not be re-reported.
+            try std.testing.expect(entry.object.get("row").?.integer >= 2);
+            if (std.mem.indexOf(u8, entry.object.get("text").?.string, "beta") != null) saw_beta = true;
+        }
+        try std.testing.expect(saw_beta);
+    }
+
+    // Ranged diff: rows 1..1 are unchanged even though later rows moved.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "send_text",
+            .session = "diffcat",
+            .text = "gamma\n",
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_text",
+            .session = "diffcat",
+            .text = "gamma",
+            .timeout_ms = 2_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "wait_for_idle",
+            .session = "diffcat",
+            .idle_ms = 150,
+            .timeout_ms = 3_000,
+        });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "snapshot",
+            .session = "diffcat",
+            .diff = true,
+            .line_start = 1,
+            .line_end = 1,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const diff = try getDiffObject(object);
+        try std.testing.expectEqual(@as(i64, 1), diff.get("range_start").?.integer);
+        try std.testing.expectEqual(@as(i64, 1), diff.get("range_end").?.integer);
+        const changed = try diffChanged(diff);
+        try std.testing.expectEqual(@as(usize, 0), changed.len);
+    }
+
+    // The ranged diff still refreshed the full-frame baseline (documented
+    // rule), so a follow-up unbounded diff reports nothing.
+    {
+        var parsed = try testRequest(&registry, .{
+            .op = "snapshot",
+            .session = "diffcat",
+            .diff = true,
+        });
+        defer parsed.deinit();
+        const object = try expectTestOk(parsed);
+        const diff = try getDiffObject(object);
+        const changed = try diffChanged(diff);
+        try std.testing.expectEqual(@as(usize, 0), changed.len);
+    }
+
+    {
+        var parsed = try testRequest(&registry, .{ .op = "kill", .session = "diffcat" });
+        defer parsed.deinit();
+        _ = try expectTestOk(parsed);
+    }
+}

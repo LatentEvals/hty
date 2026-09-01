@@ -1337,7 +1337,7 @@ const op_table = [_]OpEntry{
     .{ .name = "spawn", .handler = .{ .registry_obj = ops.handleSpawn } },
     .{ .name = "list", .handler = .{ .registry = ops.handleList } },
     .{ .name = "info", .handler = .{ .registry = ops.handleInfo } },
-    .{ .name = "snapshot", .handler = .{ .session = ops.handleSnapshot } },
+    .{ .name = "snapshot", .handler = .{ .session_obj = ops.handleSnapshot } },
     .{ .name = "send_text", .handler = .{ .session_obj = ops.handleSendText } },
     .{ .name = "send_key", .handler = .{ .session_obj = ops.handleSendKey } },
     .{ .name = "send_bytes_hex", .handler = .{ .session_obj = ops.handleSendBytesHex } },
