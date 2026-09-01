@@ -12,8 +12,13 @@ pub fn helpText() []const u8 {
     \\hty send [SESSION] --text "..." | --raw-text "..." | --key NAME | --seq "..." | --bytes-hex HEX
     \\                   | --click ROW COL | --scroll up|down
     \\
-    \\Send input to a session. Exactly one of --text, --raw-text, --key,
-    \\--seq, --bytes-hex, --click, --scroll is required.
+    \\Send input to a session. At least one input flag is required.
+    \\The keyboard input flags (--text, --raw-text, --key, --seq,
+    \\--bytes-hex) may be repeated and combined; they execute in the
+    \\order given, as one sequence. Example:
+    \\  hty send S --key esc --text ':wq' --key enter
+    \\Mouse input (--click, --scroll) cannot be combined with keyboard
+    \\input flags or with each other.
     \\
     \\Flags:
     \\  --text STRING        UTF-8 text with C-style escapes (\n \t \r \\ \e).
@@ -78,11 +83,8 @@ pub fn helpText() []const u8 {
 
 pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
-    var text: ?[]const u8 = null;
-    var raw_text: ?[]const u8 = null;
-    var key: ?[]const u8 = null;
-    var bytes_hex: ?[]const u8 = null;
-    var seq: ?[]const u8 = null;
+    var inputs_buf: [256]InputSpec = undefined;
+    var inputs_len: usize = 0;
     var delay_before: ?[]const u8 = null;
     var delay_after: ?[]const u8 = null;
     var delay_char: ?[]const u8 = null;
@@ -111,26 +113,27 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--text")) {
+        const input_kind: ?InputKind = if (std.mem.eql(u8, arg, "--text"))
+            .text
+        else if (std.mem.eql(u8, arg, "--raw-text"))
+            .raw_text
+        else if (std.mem.eql(u8, arg, "--key"))
+            .key
+        else if (std.mem.eql(u8, arg, "--bytes-hex"))
+            .bytes_hex
+        else if (std.mem.eql(u8, arg, "--seq"))
+            .seq
+        else
+            null;
+        if (input_kind) |kind| {
             i += 1;
-            if (i >= args.len) return common.printUsageAndExit("--text requires a value");
-            text = args[i];
-        } else if (std.mem.eql(u8, arg, "--raw-text")) {
-            i += 1;
-            if (i >= args.len) return common.printUsageAndExit("--raw-text requires a value");
-            raw_text = args[i];
-        } else if (std.mem.eql(u8, arg, "--key")) {
-            i += 1;
-            if (i >= args.len) return common.printUsageAndExit("--key requires a value");
-            key = args[i];
-        } else if (std.mem.eql(u8, arg, "--bytes-hex")) {
-            i += 1;
-            if (i >= args.len) return common.printUsageAndExit("--bytes-hex requires a value");
-            bytes_hex = args[i];
-        } else if (std.mem.eql(u8, arg, "--seq")) {
-            i += 1;
-            if (i >= args.len) return common.printUsageAndExit("--seq requires a value");
-            seq = args[i];
+            if (i >= args.len) {
+                try common.printErrFmt("{s} requires a value", .{arg});
+                std.process.exit(common.ExitCode.generic);
+            }
+            if (inputs_len >= inputs_buf.len) return common.printUsageAndExit("too many input flags in one call");
+            inputs_buf[inputs_len] = .{ .kind = kind, .value = args[i] };
+            inputs_len += 1;
         } else if (std.mem.eql(u8, arg, "--delay-before")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--delay-before requires a value");
@@ -248,22 +251,16 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     if (click_row != null) mouse_mode_count += 1;
     if (scroll_dir != null) mouse_mode_count += 1;
 
-    const kb_mode_count: u8 = blk: {
-        var c: u8 = 0;
-        if (text != null) c += 1;
-        if (raw_text != null) c += 1;
-        if (key != null) c += 1;
-        if (bytes_hex != null) c += 1;
-        if (seq != null) c += 1;
-        break :blk c;
-    };
-
-    if (mouse_mode_count + kb_mode_count == 0) {
-        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq, --click, --scroll");
+    if (mouse_mode_count == 0 and inputs_len == 0) {
+        try common.printErr("hty send requires at least one of --text, --raw-text, --key, --bytes-hex, --seq, --click, --scroll");
         std.process.exit(common.ExitCode.generic);
     }
-    if (mouse_mode_count + kb_mode_count > 1) {
-        try common.printErr("hty send: --click, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive");
+    if (mouse_mode_count > 1) {
+        try common.printErr("hty send: --click and --scroll are mutually exclusive");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (mouse_mode_count > 0 and inputs_len > 0) {
+        try common.printErr("hty send: --click/--scroll cannot be combined with keyboard input flags");
         std.process.exit(common.ExitCode.generic);
     }
 
@@ -318,16 +315,10 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         return;
     }
 
-    countInputModes(.{
-        .text = text,
-        .raw_text = raw_text,
-        .key = key,
-        .bytes_hex = bytes_hex,
-        .seq = seq,
-    }) catch {
-        try common.printErr("hty send requires exactly one of --text, --raw-text, --key, --bytes-hex, --seq");
+    if (inputs_len == 0) {
+        try common.printErr("hty send requires at least one of --text, --raw-text, --key, --bytes-hex, --seq");
         std.process.exit(common.ExitCode.generic);
-    };
+    }
 
     // Parse delay flags.
     const before_ms: u64 = if (delay_before) |d| common.parseDurationMs(d) catch {
@@ -346,47 +337,32 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         unreachable;
     } else 0;
 
-    if (char_ms > 0 and text == null and raw_text == null and seq == null) {
+    const has_text_like = blk: {
+        for (inputs_buf[0..inputs_len]) |spec| switch (spec.kind) {
+            .text, .raw_text, .seq => break :blk true,
+            .key, .bytes_hex => {},
+        };
+        break :blk false;
+    };
+    if (char_ms > 0 and !has_text_like) {
         try common.printErr("--delay-char only applies to --text, --raw-text, or --seq");
         std.process.exit(common.ExitCode.generic);
     }
 
-    // Build token list — everything becomes a sequence internally.
-    var token_list: SeqTokenList = undefined;
-
-    if (seq) |s| {
-        token_list = parseSeqTokens(s) catch {
-            try common.printErr("invalid --seq syntax: unmatched quote");
-            std.process.exit(common.ExitCode.generic);
-            unreachable;
+    // Build token list — every input flag appends to one sequence,
+    // executed in argv order.
+    var token_list = buildInputTokens(alloc, inputs_buf[0..inputs_len]) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.InvalidSeq => "invalid --seq syntax: unmatched quote",
+            error.EmptySeq => "--seq requires at least one token",
+            error.TooManyTokens => "too much input in one hty send call",
+            error.InvalidEscape => "invalid escape sequence in --text value",
+            error.OutOfMemory => return err,
         };
-        if (token_list.len == 0) {
-            try common.printErr("--seq requires at least one token");
-            std.process.exit(common.ExitCode.generic);
-        }
-    } else if (text) |t| {
-        token_list = .{};
-        const unescaped = unescapeText(alloc, t) catch {
-            try common.printErr("invalid escape sequence in --text value");
-            std.process.exit(common.ExitCode.generic);
-            unreachable;
-        };
-        token_list.tokens[0] = .{ .kind = .text, .value = unescaped };
-        token_list.len = 1;
-    } else if (raw_text) |t| {
-        // --raw-text: bytes sent verbatim, no escape decoding.
-        token_list = .{};
-        token_list.tokens[0] = .{ .kind = .text, .value = t };
-        token_list.len = 1;
-    } else if (key) |k| {
-        token_list = .{};
-        token_list.tokens[0] = .{ .kind = .key, .value = k };
-        token_list.len = 1;
-    } else if (bytes_hex) |b| {
-        token_list = .{};
-        token_list.tokens[0] = .{ .kind = .bytes_hex, .value = b };
-        token_list.len = 1;
-    } else unreachable;
+        try common.printErr(msg);
+        std.process.exit(common.ExitCode.generic);
+        unreachable;
+    };
 
     // Expand --delay-char: split text tokens into per-character tokens
     // with delay tokens interleaved.
@@ -923,26 +899,63 @@ fn expandDelayChar(input: SeqTokenList, char_ms: u64) SeqTokenList {
     return expanded;
 }
 
-/// The five mutually-exclusive input modes accepted by `hty send`. Exactly
-/// one must be non-null; any other count is a user error.
-const InputModes = struct {
-    text: ?[]const u8,
-    raw_text: ?[]const u8,
-    key: ?[]const u8,
-    bytes_hex: ?[]const u8,
-    seq: ?[]const u8,
+/// The five keyboard input flags accepted by `hty send`. They may be
+/// repeated and combined; each occurrence appends to one input sequence
+/// executed in argv order.
+const InputKind = enum { text, raw_text, key, bytes_hex, seq };
+
+const InputSpec = struct {
+    kind: InputKind,
+    value: []const u8,
 };
 
-/// Enforce the "exactly one input mode" rule. Returns an error on zero or
-/// multiple non-null fields so the caller can emit a stable error message.
-fn countInputModes(modes: InputModes) error{InvalidInputModeCount}!void {
-    var op_count: u8 = 0;
-    if (modes.text != null) op_count += 1;
-    if (modes.raw_text != null) op_count += 1;
-    if (modes.key != null) op_count += 1;
-    if (modes.bytes_hex != null) op_count += 1;
-    if (modes.seq != null) op_count += 1;
-    if (op_count != 1) return error.InvalidInputModeCount;
+/// Expand the parsed input flags, in argv order, into one flat token list.
+/// Per-flag semantics are unchanged: --text processes C-style escapes,
+/// --raw-text is verbatim, --seq tokenizes, --key and --bytes-hex map to
+/// single tokens.
+fn buildInputTokens(
+    alloc: Allocator,
+    inputs: []const InputSpec,
+) error{ InvalidSeq, EmptySeq, TooManyTokens, InvalidEscape, OutOfMemory }!SeqTokenList {
+    var result: SeqTokenList = .{};
+    for (inputs) |spec| {
+        switch (spec.kind) {
+            .seq => {
+                const sub = try parseSeqTokens(spec.value);
+                if (sub.len == 0) return error.EmptySeq;
+                for (sub.slice()) |token| {
+                    if (result.len >= result.tokens.len) return error.TooManyTokens;
+                    result.tokens[result.len] = token;
+                    result.len += 1;
+                }
+            },
+            .text => {
+                const unescaped = unescapeText(alloc, spec.value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidEscape,
+                };
+                if (result.len >= result.tokens.len) return error.TooManyTokens;
+                result.tokens[result.len] = .{ .kind = .text, .value = unescaped };
+                result.len += 1;
+            },
+            .raw_text => {
+                if (result.len >= result.tokens.len) return error.TooManyTokens;
+                result.tokens[result.len] = .{ .kind = .text, .value = spec.value };
+                result.len += 1;
+            },
+            .key => {
+                if (result.len >= result.tokens.len) return error.TooManyTokens;
+                result.tokens[result.len] = .{ .kind = .key, .value = spec.value };
+                result.len += 1;
+            },
+            .bytes_hex => {
+                if (result.len >= result.tokens.len) return error.TooManyTokens;
+                result.tokens[result.len] = .{ .kind = .bytes_hex, .value = spec.value };
+                result.len += 1;
+            },
+        }
+    }
+    return result;
 }
 
 // ============================================================================
@@ -1110,27 +1123,81 @@ test "helpText documents --raw-text" {
     try std.testing.expect(std.mem.indexOf(u8, text, "verbatim") != null);
 }
 
-test "countInputModes: exactly one mode is required" {
-    // Exactly one of each kind is OK.
-    try countInputModes(.{ .text = "y", .raw_text = null, .key = null, .bytes_hex = null, .seq = null });
-    try countInputModes(.{ .text = null, .raw_text = "y", .key = null, .bytes_hex = null, .seq = null });
-    try countInputModes(.{ .text = null, .raw_text = null, .key = "enter", .bytes_hex = null, .seq = null });
-    try countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = "2020", .seq = null });
-    try countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = null, .seq = "enter" });
+test "buildInputTokens: flags compose in argv order" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // --key ctrl-x --text hello --key enter
+    const inputs = [_]InputSpec{
+        .{ .kind = .key, .value = "ctrl-x" },
+        .{ .kind = .text, .value = "hello" },
+        .{ .kind = .key, .value = "enter" },
+    };
+    const result = try buildInputTokens(arena, &inputs);
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("ctrl-x", tokens[0].value);
+    try std.testing.expectEqual(.text, tokens[1].kind);
+    try std.testing.expectEqualStrings("hello", tokens[1].value);
+    try std.testing.expectEqual(.key, tokens[2].kind);
+    try std.testing.expectEqualStrings("enter", tokens[2].value);
 }
 
-test "countInputModes: zero modes is an error" {
-    try std.testing.expectError(
-        error.InvalidInputModeCount,
-        countInputModes(.{ .text = null, .raw_text = null, .key = null, .bytes_hex = null, .seq = null }),
-    );
+test "buildInputTokens: single flags behave as before" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // --text still processes C-style escapes.
+    const text_result = try buildInputTokens(arena, &.{.{ .kind = .text, .value = "a\\nb" }});
+    try std.testing.expectEqual(@as(usize, 1), text_result.slice().len);
+    try std.testing.expectEqualStrings("a\nb", text_result.slice()[0].value);
+
+    // --raw-text stays verbatim.
+    const raw_result = try buildInputTokens(arena, &.{.{ .kind = .raw_text, .value = "a\\nb" }});
+    try std.testing.expectEqualStrings("a\\nb", raw_result.slice()[0].value);
+
+    // --key and --bytes-hex map to single tokens.
+    const key_result = try buildInputTokens(arena, &.{.{ .kind = .key, .value = "enter" }});
+    try std.testing.expectEqual(.key, key_result.slice()[0].kind);
+    const hex_result = try buildInputTokens(arena, &.{.{ .kind = .bytes_hex, .value = "2020" }});
+    try std.testing.expectEqual(.bytes_hex, hex_result.slice()[0].kind);
 }
 
-test "countInputModes: --text and --raw-text together is a mutual-exclusion error" {
-    try std.testing.expectError(
-        error.InvalidInputModeCount,
-        countInputModes(.{ .text = "foo", .raw_text = "bar", .key = null, .bytes_hex = null, .seq = null }),
-    );
+test "buildInputTokens: --seq expands inline between other flags" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // --key esc --seq '"hi" enter' --text bye
+    const inputs = [_]InputSpec{
+        .{ .kind = .key, .value = "esc" },
+        .{ .kind = .seq, .value = "\"hi\" enter" },
+        .{ .kind = .text, .value = "bye" },
+    };
+    const result = try buildInputTokens(arena, &inputs);
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 4), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("esc", tokens[0].value);
+    try std.testing.expectEqual(.text, tokens[1].kind);
+    try std.testing.expectEqualStrings("hi", tokens[1].value);
+    try std.testing.expectEqual(.key, tokens[2].kind);
+    try std.testing.expectEqualStrings("enter", tokens[2].value);
+    try std.testing.expectEqual(.text, tokens[3].kind);
+    try std.testing.expectEqualStrings("bye", tokens[3].value);
+}
+
+test "buildInputTokens: seq errors surface" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectError(error.InvalidSeq, buildInputTokens(arena, &.{.{ .kind = .seq, .value = "\"unclosed" }}));
+    try std.testing.expectError(error.EmptySeq, buildInputTokens(arena, &.{.{ .kind = .seq, .value = "  " }}));
+    try std.testing.expectError(error.InvalidEscape, buildInputTokens(arena, &.{.{ .kind = .text, .value = "bad\\q" }}));
 }
 
 test "expandDelayChar: raw-text composes with --delay-char" {
@@ -1168,17 +1235,20 @@ test "expandDelayChar: raw-text keeps literal backslash-n as two separate steps"
     try std.testing.expectEqualStrings("n", tokens[4].value);
 }
 
-test "countInputModes: --raw-text with any other mode is a mutual-exclusion error" {
-    try std.testing.expectError(
-        error.InvalidInputModeCount,
-        countInputModes(.{ .text = null, .raw_text = "x", .key = "enter", .bytes_hex = null, .seq = null }),
-    );
-    try std.testing.expectError(
-        error.InvalidInputModeCount,
-        countInputModes(.{ .text = null, .raw_text = "x", .key = null, .bytes_hex = "2020", .seq = null }),
-    );
-    try std.testing.expectError(
-        error.InvalidInputModeCount,
-        countInputModes(.{ .text = null, .raw_text = "x", .key = null, .bytes_hex = null, .seq = "enter" }),
-    );
+test "buildInputTokens: --raw-text composes with other input flags" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const inputs = [_]InputSpec{
+        .{ .kind = .raw_text, .value = "x" },
+        .{ .kind = .key, .value = "enter" },
+        .{ .kind = .bytes_hex, .value = "2020" },
+    };
+    const result = try buildInputTokens(arena, &inputs);
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqual(.text, tokens[0].kind);
+    try std.testing.expectEqual(.key, tokens[1].kind);
+    try std.testing.expectEqual(.bytes_hex, tokens[2].kind);
 }
