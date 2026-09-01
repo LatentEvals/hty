@@ -739,7 +739,8 @@ pub fn readTimedOut(object: std.json.ObjectMap) bool {
 
 /// Print either the plain `buffer` field or the styled `screen_ansi` field
 /// from the response's `snapshot` sub-object, with a trailing newline.
-/// Plain output strips per-line trailing padding (LatentEvals/hty#97).
+/// Plain output strips per-line trailing padding and collapses trailing
+/// fill-row runs, same as `hty snapshot`.
 pub fn printSnapshotBody(object: std.json.ObjectMap, ansi_output: bool) !void {
     const snap_val = object.get("snapshot") orelse return;
     if (snap_val != .object) return;

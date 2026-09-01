@@ -259,3 +259,124 @@ test "stripTrailingSpaces leaves unpadded text untouched" {
     defer alloc.free(stripped);
     try std.testing.expectEqualStrings("no padding here", stripped);
 }
+
+/// Minimum length of a trailing fill-row run before it is collapsed into
+/// a marker line; shorter runs read fine as-is and a marker would not
+/// save anything.
+const collapse_min_run = 3;
+
+/// A trailing run of visually identical fill rows: rows[start..end) all
+/// render as `content` (their shared right-trimmed text).
+const FillRun = struct {
+    start: usize,
+    end: usize,
+    content: []const u8,
+};
+
+/// Collapse trailing runs of identical fill rows in a plain snapshot into
+/// single marker lines: `~ ×14` for fourteen `~` rows, `×14` for fourteen
+/// blank ones. A fill row is a row that is blank or a single character
+/// once trailing spaces (terminal padding) are ignored. Runs of different
+/// fill rows never merge into one marker — vim's blank-row-vs-`~`-row
+/// distinction at the end of a buffer is how a trailing blank line at EOF
+/// is visible at all. Only the tail of the frame is touched; identical
+/// rows above a non-fill row are real content and stay as-is. The marker
+/// uses `×` (U+00D7), which terminal programs do not emit as a fill
+/// character, so it cannot be mistaken for a rendered row. Returns the
+/// collapsed text (caller owns) or null when nothing collapses.
+pub fn collapseTrailingFillRows(alloc: Allocator, buffer: []const u8) !?[]u8 {
+    var rows = std.array_list.Managed([]const u8).init(alloc);
+    defer rows.deinit();
+    var row_iter = std.mem.splitScalar(u8, buffer, '\n');
+    while (row_iter.next()) |row| try rows.append(row);
+
+    // Walk runs of matching fill rows bottom-up; `head` ends up at the
+    // first row that belongs to the collapsible tail.
+    var runs = std.array_list.Managed(FillRun).init(alloc);
+    defer runs.deinit();
+    var head = rows.items.len;
+    while (head > 0) {
+        const content = std.mem.trimEnd(u8, rows.items[head - 1], " ");
+        if (content.len > 1) break;
+        var start = head - 1;
+        while (start > 0) {
+            const above = std.mem.trimEnd(u8, rows.items[start - 1], " ");
+            if (!std.mem.eql(u8, above, content)) break;
+            start -= 1;
+        }
+        try runs.append(.{ .start = start, .end = head, .content = content });
+        head = start;
+    }
+
+    var collapses = false;
+    for (runs.items) |run| {
+        if (run.end - run.start >= collapse_min_run) collapses = true;
+    }
+    if (!collapses) return null;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    for (rows.items[0..head]) |row| {
+        try out.writer.writeAll(row);
+        try out.writer.writeAll("\n");
+    }
+    // Runs were collected bottom-up; emit them top-down.
+    var run_idx = runs.items.len;
+    while (run_idx > 0) {
+        run_idx -= 1;
+        const run = runs.items[run_idx];
+        if (run.end - run.start >= collapse_min_run) {
+            if (run.content.len == 0) {
+                try out.writer.print("×{d}", .{run.end - run.start});
+            } else {
+                try out.writer.print("{s} ×{d}", .{ run.content, run.end - run.start });
+            }
+            if (run_idx > 0) try out.writer.writeAll("\n");
+        } else {
+            for (rows.items[run.start..run.end], run.start..) |row, i| {
+                try out.writer.writeAll(row);
+                if (run_idx > 0 or i + 1 < run.end) try out.writer.writeAll("\n");
+            }
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+test "trailing run of padded ~ fill rows collapses with the count" {
+    const buffer = "hello\n" ++
+        ("~" ++ " " ** 79 ++ "\n") ** 4 ++
+        "~" ++ " " ** 79;
+    const collapsed = (try collapseTrailingFillRows(std.testing.allocator, buffer)).?;
+    defer std.testing.allocator.free(collapsed);
+    try std.testing.expectEqualStrings("hello\n~ ×5", collapsed);
+}
+
+test "mixed ~ and blank tail runs collapse separately, never merging" {
+    const buffer = "hello\n~\n~\n~\n\n\n";
+    const collapsed = (try collapseTrailingFillRows(std.testing.allocator, buffer)).?;
+    defer std.testing.allocator.free(collapsed);
+    try std.testing.expectEqualStrings("hello\n~ ×3\n×3", collapsed);
+}
+
+test "identical rows above a non-fill row stay untouched" {
+    const buffer = "~\n~\n~\n~\n\"file\" [New File]";
+    try std.testing.expectEqual(
+        null,
+        try collapseTrailingFillRows(std.testing.allocator, buffer),
+    );
+}
+
+test "short fill runs stay untouched" {
+    const buffer = "hello\n~\n~";
+    try std.testing.expectEqual(
+        null,
+        try collapseTrailingFillRows(std.testing.allocator, buffer),
+    );
+}
+
+test "a sub-threshold run below a collapsed one is kept verbatim" {
+    const buffer = "hello\n\n\n\n\n~";
+    const collapsed = (try collapseTrailingFillRows(std.testing.allocator, buffer)).?;
+    defer std.testing.allocator.free(collapsed);
+    try std.testing.expectEqualStrings("hello\n×4\n~", collapsed);
+}

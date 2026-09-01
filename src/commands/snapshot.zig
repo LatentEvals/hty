@@ -11,8 +11,10 @@ pub fn helpText() []const u8 {
     \\hty snapshot [SESSION] [--ansi] [--json]
     \\
     \\Read the session's current rendered screen. Default output is plain
-    \\text. Use --ansi to get the styled ANSI rendering, --json for the full
-    \\structured response.
+    \\text, with a trailing run of identical fill rows (vim's `~` rows, or
+    \\blank rows) collapsed into a single `~ ×14`-style marker line. Use
+    \\--ansi to get the styled ANSI rendering, --json for the full
+    \\structured response (both uncollapsed).
     \\
     ;
 }
