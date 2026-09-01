@@ -217,3 +217,112 @@ pub fn writeJsonString(writer: *std.Io.Writer, s: []const u8) !void {
     }
     try writer.writeByte('"');
 }
+
+/// Row range for `--lines N:M`. 1-indexed, inclusive. A null `end` means
+/// "through the last row" (`N:`).
+pub const LineRange = struct {
+    start: usize,
+    end: ?usize,
+};
+
+/// Parse a `--lines` value: `N:M`, `N:` (row N through the last row), or
+/// `:M` (first row through row M). Rows are 1-indexed and the range is
+/// inclusive, matching snapshot's row conventions.
+pub fn parseLineRange(text: []const u8) !LineRange {
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidLineRange;
+    const start_str = text[0..colon];
+    const end_str = text[colon + 1 ..];
+    if (start_str.len == 0 and end_str.len == 0) return error.InvalidLineRange;
+    const start: usize = if (start_str.len == 0)
+        1
+    else
+        std.fmt.parseInt(usize, start_str, 10) catch return error.InvalidLineRange;
+    const end: ?usize = if (end_str.len == 0)
+        null
+    else
+        std.fmt.parseInt(usize, end_str, 10) catch return error.InvalidLineRange;
+    if (start == 0) return error.InvalidLineRange;
+    if (end) |e| {
+        if (e == 0 or e < start) return error.InvalidLineRange;
+    }
+    return .{ .start = start, .end = end };
+}
+
+/// Slice rows [start, end] out of a newline-joined frame (both `buffer`
+/// and `screen_ansi` join rows with a single '\n' and no trailing
+/// newline). An end past the last row is clamped, tmux capture-pane
+/// style; a start past the last row yields an empty slice.
+pub fn sliceLines(text: []const u8, range: LineRange) []const u8 {
+    var start_off: usize = 0;
+    var row: usize = 1;
+    while (row < range.start) : (row += 1) {
+        const nl = std.mem.indexOfScalarPos(u8, text, start_off, '\n') orelse
+            return text[text.len..];
+        start_off = nl + 1;
+    }
+    const last = range.end orelse return text[start_off..];
+    var end_off: usize = start_off;
+    row = range.start;
+    while (true) {
+        const nl = std.mem.indexOfScalarPos(u8, text, end_off, '\n') orelse {
+            end_off = text.len;
+            break;
+        };
+        if (row == last) {
+            end_off = nl;
+            break;
+        }
+        end_off = nl + 1;
+        row += 1;
+    }
+    return text[start_off..end_off];
+}
+
+test "parseLineRange accepts N:M, N:, and :M" {
+    const closed = try parseLineRange("22:24");
+    try std.testing.expectEqual(@as(usize, 22), closed.start);
+    try std.testing.expectEqual(@as(?usize, 24), closed.end);
+
+    const open_end = try parseLineRange("20:");
+    try std.testing.expectEqual(@as(usize, 20), open_end.start);
+    try std.testing.expectEqual(@as(?usize, null), open_end.end);
+
+    const open_start = try parseLineRange(":5");
+    try std.testing.expectEqual(@as(usize, 1), open_start.start);
+    try std.testing.expectEqual(@as(?usize, 5), open_start.end);
+
+    const single = try parseLineRange("3:3");
+    try std.testing.expectEqual(@as(usize, 3), single.start);
+    try std.testing.expectEqual(@as(?usize, 3), single.end);
+}
+
+test "parseLineRange rejects malformed and inverted ranges" {
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange(""));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange(":"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("5"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("a:b"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("1:x"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("0:3"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("3:0"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("4:2"));
+    try std.testing.expectError(error.InvalidLineRange, parseLineRange("-1:2"));
+}
+
+test "sliceLines extracts closed, open-ended, and open-start ranges" {
+    const frame = "row1\nrow2\nrow3\nrow4\nrow5";
+    try std.testing.expectEqualStrings("row2\nrow3", sliceLines(frame, .{ .start = 2, .end = 3 }));
+    try std.testing.expectEqualStrings("row4\nrow5", sliceLines(frame, .{ .start = 4, .end = null }));
+    try std.testing.expectEqualStrings("row1\nrow2", sliceLines(frame, .{ .start = 1, .end = 2 }));
+    try std.testing.expectEqualStrings("row3", sliceLines(frame, .{ .start = 3, .end = 3 }));
+    try std.testing.expectEqualStrings(frame, sliceLines(frame, .{ .start = 1, .end = null }));
+}
+
+test "sliceLines clamps out-of-range rows" {
+    const frame = "row1\nrow2\nrow3";
+    // End past the last row: clamp to the last row.
+    try std.testing.expectEqualStrings("row2\nrow3", sliceLines(frame, .{ .start = 2, .end = 99 }));
+    try std.testing.expectEqualStrings(frame, sliceLines(frame, .{ .start = 1, .end = 99 }));
+    // Start past the last row: empty output.
+    try std.testing.expectEqualStrings("", sliceLines(frame, .{ .start = 4, .end = null }));
+    try std.testing.expectEqualStrings("", sliceLines(frame, .{ .start = 10, .end = 12 }));
+}
