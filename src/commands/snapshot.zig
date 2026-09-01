@@ -8,11 +8,17 @@ const getString = @import("../json.zig").getString;
 
 pub fn helpText() []const u8 {
     return
-    \\hty snapshot [SESSION] [--ansi] [--json]
+    \\hty snapshot [SESSION] [--ansi] [--json] [--lines N:M]
     \\
     \\Read the session's current rendered screen. Default output is plain
     \\text. Use --ansi to get the styled ANSI rendering, --json for the full
     \\structured response.
+    \\
+    \\  --lines N:M   Print only rows N through M (1-indexed, inclusive).
+    \\                Open ends are allowed: `N:` reads from row N to the
+    \\                last row, `:M` from the first row through M. Rows past
+    \\                the end of the screen are clamped. Not valid with
+    \\                --json (which always carries the full snapshot).
     \\
     ;
 }
@@ -21,18 +27,31 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var json_output = false;
     var ansi_output = false;
+    var lines_range: ?common.LineRange = null;
 
-    for (args) |arg| {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi_output = true;
+        } else if (std.mem.eql(u8, arg, "--lines")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--lines requires a value (N:M, N:, or :M)");
+            lines_range = common.parseLineRange(args[i]) catch
+                return common.printUsageAndExit("invalid --lines range: expected N:M, N:, or :M with 1-indexed rows and N <= M");
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
         } else if (session_ref == null) {
             session_ref = arg;
         }
+    }
+
+    if (lines_range != null and json_output) {
+        try common.printErr("--lines is incompatible with --json (the JSON response always carries the full snapshot)");
+        std.process.exit(common.ExitCode.generic);
     }
 
     var payload_buf: std.Io.Writer.Allocating = .init(alloc);
@@ -64,10 +83,17 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     };
     const field = if (ansi_output) "screen_ansi" else "buffer";
     const text = getString(snap_obj, field) orelse "";
+    const body = if (lines_range) |r| common.sliceLines(text, r) else text;
     if (ansi_output) {
-        try common.printRaw(text);
+        try common.printRaw(body);
         try common.printRaw("\n");
     } else {
-        try common.printPlainSnapshot(text);
+        try common.printPlainSnapshot(body);
     }
+}
+
+test "snapshot helpText documents --lines flag" {
+    const text = helpText();
+    try std.testing.expect(std.mem.indexOf(u8, text, "--lines N:M") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "1-indexed") != null);
 }
