@@ -235,6 +235,12 @@ pub const Session = struct {
     /// anyway, and input must never stall the event loop).
     pending_input: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Baseline frame for `snapshot --diff`: the stripped rows of the
+    /// last diff snapshot delivered for this session, joined by '\n'.
+    /// Null until the first diff request. Owned by `alloc`; replaced by
+    /// `setDiffBaseline`, freed in `deinit`.
+    diff_baseline: ?[]u8 = null,
+
     pub fn getStatus(self: *const Session) SessionStatus {
         return self.status;
     }
@@ -360,6 +366,16 @@ pub const Session = struct {
         return self.pending_input.items.len != 0;
     }
 
+    /// Replace the `snapshot --diff` baseline with a copy of `frame`
+    /// (stripped rows joined by '\n'). On OOM the old baseline is kept:
+    /// the next diff then compares against a staler frame, which can
+    /// only over-report changes, never lose them.
+    pub fn setDiffBaseline(self: *Session, frame: []const u8) void {
+        const copy = self.alloc.dupe(u8, frame) catch return;
+        if (self.diff_baseline) |old| self.alloc.free(old);
+        self.diff_baseline = copy;
+    }
+
     pub fn deinit(self: *Session) void {
         // Tear down any still-attached clients before freeing the session.
         // Emit a disconnect for each still-open client — this is our last
@@ -389,6 +405,8 @@ pub const Session = struct {
         if (clients_snapshot.len > 0) self.alloc.free(clients_snapshot);
 
         self.pending_input.deinit(self.alloc);
+
+        if (self.diff_baseline) |baseline| self.alloc.free(baseline);
 
         if (self.log_file) |fd| {
             sys.close(fd);

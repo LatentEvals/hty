@@ -89,6 +89,9 @@ pub fn helpText() []const u8 {
     \\  --wait-until-regex RE    Block until RE (POSIX extended) matches.
     \\  --wait-until-exit        Block until the child process exits.
     \\  --timeout DUR        Cap on any --wait-until-* (default 30s; 0 = none).
+    \\  --diff               With --snapshot, print only rows changed since
+    \\                       the previous --diff snapshot of the session
+    \\                       (`hty snapshot --diff` format and baseline).
     \\  --json               With --snapshot, emit `{ok, matched, elapsed_ms,
     \\                       snapshot, ...}` instead of the plain buffer.
     \\  --ansi               With --snapshot, print the styled ANSI rendering
@@ -126,6 +129,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
 
     var snapshot_flag = false;
     var no_wait = false;
+    var diff_flag = false;
     var json_output = false;
     var ansi_output = false;
     var lines_range: ?common.LineRange = null;
@@ -177,6 +181,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             snapshot_flag = true;
         } else if (std.mem.eql(u8, arg, "--no-wait")) {
             no_wait = true;
+        } else if (std.mem.eql(u8, arg, "--diff")) {
+            diff_flag = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
@@ -303,6 +309,18 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         try common.printErr("--json and --ansi are mutually exclusive");
         std.process.exit(common.ExitCode.generic);
     }
+    if (diff_flag and !snapshot_flag) {
+        try common.printErr("--diff requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (diff_flag and (json_output or ansi_output)) {
+        try common.printErr("--diff is incompatible with --json and --ansi");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (diff_flag and lines_range != null) {
+        try common.printErr("--lines with --diff is only supported on `hty snapshot`");
+        std.process.exit(common.ExitCode.generic);
+    }
 
     // Count mouse-mode flags separately: they're mutually exclusive with
     // the keyboard/text input modes and with each other.
@@ -367,6 +385,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
                 .duration_ms = duration_ms,
                 .timeout_ms = timeout_ms,
                 .snapshot = snapshot_flag,
+                .diff = diff_flag,
                 .json_output = json_output,
                 .ansi_output = ansi_output,
                 .lines = lines_range,
@@ -549,6 +568,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             .duration_ms = duration_ms,
             .timeout_ms = timeout_ms,
             .snapshot = snapshot_flag,
+            .diff = diff_flag,
             .json_output = json_output,
             .ansi_output = ansi_output,
             .lines = lines_range,
@@ -670,6 +690,9 @@ pub const FusedRequest = struct {
     duration_ms: u64 = 0,
     timeout_ms: u64 = 30_000,
     snapshot: bool = false,
+    /// Ask the server for the row-diff payload instead of the full
+    /// snapshot payload (same baseline as `hty snapshot --diff`).
+    diff: bool = false,
 };
 
 /// Build and send the wait_and_snapshot RPC. Returns the parsed JSON
@@ -686,6 +709,7 @@ pub fn sendFusedWait(alloc: Allocator, io: std.Io, req: FusedRequest) !std.json.
         req.timeout_ms,
         if (req.snapshot) "true" else "false",
     });
+    if (req.diff) try writer.writeAll(",\"diff\":true");
     if (std.mem.eql(u8, req.wait_kind, "idle")) {
         try writer.print(",\"idle_ms\":{d}", .{req.idle_ms});
     } else if (std.mem.eql(u8, req.wait_kind, "duration")) {
@@ -714,6 +738,7 @@ const FusedWaitParams = struct {
     duration_ms: u64,
     timeout_ms: u64,
     snapshot: bool,
+    diff: bool = false,
     json_output: bool,
     ansi_output: bool,
     lines: ?common.LineRange = null,
@@ -731,6 +756,7 @@ pub fn issueFusedWait(alloc: Allocator, io: std.Io, params: FusedWaitParams) !vo
         .duration_ms = params.duration_ms,
         .timeout_ms = params.timeout_ms,
         .snapshot = params.snapshot,
+        .diff = params.diff,
     });
     defer parsed.deinit();
     const object = try common.expectOkOrExit(parsed);
@@ -743,7 +769,12 @@ pub fn issueFusedWait(alloc: Allocator, io: std.Io, params: FusedWaitParams) !vo
         return;
     }
 
-    if (params.snapshot) try printSnapshotBody(object, params.ansi_output, params.lines);
+    if (params.snapshot) {
+        if (params.diff)
+            try common.printDiffBody(alloc, object)
+        else
+            try printSnapshotBody(object, params.ansi_output, params.lines);
+    }
 
     if (timed_out) {
         try common.printErr("timed out");

@@ -58,6 +58,8 @@ pub fn helpText() []const u8 {
     \\                            Tip: editors show status lines and prompts
     \\                            on the LAST rows — `1:12` misses a prompt
     \\                            on row 24; prefer `N:`.
+    \\  --diff                    With --snapshot, print the row-diff format
+    \\                            (`hty snapshot --diff`) and seed its baseline.
     \\
     \\`--detach` is accepted as a no-op — every `hty run` session is
     \\detached by default. Use `hty attach` afterwards, or `--attach`
@@ -83,6 +85,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var no_wait = false;
     var lines_range: ?common.LineRange = null;
     var ansi_output = false;
+    var diff_flag = false;
     var wait_duration_str: ?[]const u8 = null;
     var wait_until_idle = false;
     var wait_until_idle_ms_str: ?[]const u8 = null;
@@ -140,6 +143,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             if (i >= args.len) return common.printUsageAndExit("--lines requires a value (N:M, N:, or :M)");
             lines_range = common.parseLineRange(args[i]) catch
                 return common.printUsageAndExit("invalid --lines range: expected N:M, N:, or :M with 1-indexed rows and N <= M");
+        } else if (std.mem.eql(u8, arg, "--diff")) {
+            diff_flag = true;
         } else if (std.mem.eql(u8, arg, "--wait-duration")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--wait-duration requires a value");
@@ -234,6 +239,18 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     }
     if (no_wait and !snapshot_flag) {
         try common.printErr("--no-wait requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (diff_flag and !snapshot_flag) {
+        try common.printErr("--diff requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (diff_flag and (json_output or ansi_output)) {
+        try common.printErr("--diff is incompatible with --json and --ansi");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (diff_flag and lines_range != null) {
+        try common.printErr("--lines with --diff is only supported on `hty snapshot`");
         std.process.exit(common.ExitCode.generic);
     }
 
@@ -371,6 +388,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             .duration_ms = duration_ms,
             .timeout_ms = timeout_ms,
             .snapshot = snapshot_flag,
+            .diff = diff_flag,
         });
         defer wait_parsed.deinit();
         const wait_object = try common.expectOkOrExit(wait_parsed);
@@ -390,7 +408,10 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         }
 
         if (snapshot_flag) {
-            try send_cmd.printSnapshotBody(wait_object, ansi_output, lines_range);
+            if (diff_flag)
+                try common.printDiffBody(alloc, wait_object)
+            else
+                try send_cmd.printSnapshotBody(wait_object, ansi_output, lines_range);
         } else {
             try printStartedLine(alloc, display_name, id_str);
         }

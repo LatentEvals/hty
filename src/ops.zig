@@ -29,6 +29,8 @@ const EventPayload = protocol.EventPayload;
 const WaitPayload = protocol.WaitPayload;
 const WaitTextMatch = protocol.WaitTextMatch;
 const WaitExitInfo = protocol.WaitExitInfo;
+const DiffPayload = protocol.DiffPayload;
+const DiffRow = protocol.DiffRow;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
@@ -180,41 +182,25 @@ pub fn handleList(arena: Allocator, registry: *SessionRegistry, id: ?i64) !Respo
     };
 }
 
-pub fn handleSnapshot(arena: Allocator, sess: *Session, id: ?i64) !Response {
+pub fn handleSnapshot(arena: Allocator, sess: *Session, object: std.json.ObjectMap, id: ?i64) !Response {
     var snapshot = try sess.terminal.snapshot();
     defer snapshot.deinit(sess.alloc);
 
-    const buffer = try arena.dupe(u8, snapshot.buffer);
-    const screen_ansi = try arena.dupe(u8, snapshot.screen_ansi);
-    const title = if (snapshot.title) |current_title|
-        try arena.dupe(u8, current_title)
-    else
-        null;
-    const lines = try arena.alloc([]const u8, snapshot.lines.len);
-    var line_iter = std.mem.splitScalar(u8, buffer, '\n');
-    var idx: usize = 0;
-    while (line_iter.next()) |line| : (idx += 1) {
-        lines[idx] = line;
+    // `diff: true` returns only the rows changed since the previous diff
+    // snapshot for this session (and replaces that baseline). Optional
+    // `line_start`/`line_end` (1-indexed inclusive, 0/absent = open)
+    // bound which rows are compared and reported.
+    if (try readOptionalBool(object, "diff", false)) {
+        const line_start = try readOptionalU64(object, "line_start", 0);
+        const line_end = try readOptionalU64(object, "line_end", 0);
+        return .{
+            .id = id,
+            .ok = true,
+            .diff = try buildDiffPayload(arena, sess, snapshot, line_start, line_end),
+        };
     }
-    const cells = try dupeCells(arena, snapshot.cells);
 
-    return .{
-        .id = id,
-        .ok = true,
-        .snapshot = .{
-            .rows = snapshot.rows,
-            .cols = snapshot.cols,
-            .cursor_row = snapshot.cursor_row,
-            .cursor_col = snapshot.cursor_col,
-            .title = title,
-            .buffer = buffer,
-            .screen_ansi = screen_ansi,
-            .lines = lines,
-            .cells = cells,
-            .status = statusName(sess.getStatus()),
-            .mouse = mouseWireFromSnapshot(sess.mouse_state.snapshot()),
-        },
-    };
+    return try snapshotResponse(arena, id, snapshot, sess);
 }
 
 /// Deep-copy the `cells` grid from `ScreenSnapshot` (terminal-owned) into
@@ -442,7 +428,7 @@ pub fn waitOpKind(op: []const u8) ?WaitOpKind {
 /// Which wire shape a wait outcome is formatted into: the standalone
 /// `wait_for_*` shape or the fused `wait_and_snapshot` shape (with or
 /// without the snapshot payload).
-pub const WaitFormat = enum { standalone, fused_bare, fused_snapshot };
+pub const WaitFormat = enum { standalone, fused_bare, fused_snapshot, fused_snapshot_diff };
 
 /// A parsed wait request: what to wait for, until when, and how to format
 /// the outcome. `condition == null` only for the fused op's
@@ -511,8 +497,14 @@ pub fn planWait(
             const wait_kind_opt = try readOptionalString(object, "wait_kind");
             const wait_kind = wait_kind_opt orelse "none";
             const include_snapshot = try readOptionalBool(object, "snapshot", false);
+            const want_diff = try readOptionalBool(object, "diff", false);
             const timeout_ms_field = try readOptionalU64(object, "timeout_ms", 30_000);
-            const format: WaitFormat = if (include_snapshot) .fused_snapshot else .fused_bare;
+            const format: WaitFormat = if (!include_snapshot)
+                .fused_bare
+            else if (want_diff)
+                .fused_snapshot_diff
+            else
+                .fused_snapshot;
             // timeout_ms == 0 means "no timeout" — pin the deadline at the
             // largest representable value so the wait never trips it.
             const deadline: i64 = if (timeout_ms_field == 0)
@@ -579,11 +571,11 @@ pub fn encodeWaitOutcome(
     const arena = arena_state.allocator();
     const response = switch (format) {
         .standalone => try standaloneWaitResponse(arena, id, sess, result),
-        .fused_bare, .fused_snapshot => try buildFusedResponse(
+        .fused_bare, .fused_snapshot, .fused_snapshot_diff => try buildFusedResponse(
             arena,
             id,
             sess,
-            format == .fused_snapshot,
+            format,
             result.matched,
             result.elapsed_ms,
             result.timed_out,
@@ -952,10 +944,9 @@ pub fn handleWaitAndSnapshot(
 ) !Response {
     const start_ms = sys.milliTimestamp();
     const plan = try planWait(arena, .fused, object, start_ms);
-    const include_snapshot = plan.format == .fused_snapshot;
 
     const condition = plan.condition orelse
-        return try buildFusedResponse(arena, id, sess, include_snapshot, null, 0, false, null, null);
+        return try buildFusedResponse(arena, id, sess, plan.format, null, 0, false, null, null);
     defer freeWaitConditionRegex(condition);
 
     const result = try runWait(arena, registry, sess, condition, start_ms, plan.deadline);
@@ -963,7 +954,7 @@ pub fn handleWaitAndSnapshot(
         arena,
         id,
         sess,
-        include_snapshot,
+        plan.format,
         result.matched,
         result.elapsed_ms,
         result.timed_out,
@@ -979,7 +970,7 @@ fn buildFusedResponse(
     arena: Allocator,
     id: ?i64,
     sess: *Session,
-    include_snapshot: bool,
+    format: WaitFormat,
     matched: ?[]const u8,
     elapsed_ms: i64,
     timed_out: bool,
@@ -996,7 +987,7 @@ fn buildFusedResponse(
         .exit = exit_info,
     };
 
-    if (!include_snapshot) {
+    if (format == .standalone or format == .fused_bare) {
         return .{
             .id = id,
             .ok = true,
@@ -1007,6 +998,17 @@ fn buildFusedResponse(
 
     var snapshot = try sess.terminal.snapshot();
     defer snapshot.deinit(sess.alloc);
+
+    if (format == .fused_snapshot_diff) {
+        return .{
+            .id = id,
+            .ok = true,
+            .timed_out = timed_out,
+            .wait = wait_payload,
+            .diff = try buildDiffPayload(arena, sess, snapshot, 0, 0),
+        };
+    }
+
     var response = try snapshotResponse(arena, id, snapshot, sess);
     response.wait = wait_payload;
     response.timed_out = timed_out;
@@ -1112,6 +1114,91 @@ pub fn snapshotResponse(arena: Allocator, id: ?i64, snapshot: hty.ScreenSnapshot
     };
 }
 
+/// Compare current stripped rows against `baseline` (the previous
+/// stripped frame, rows joined by '\n'; null = no baseline) and return
+/// the 1-indexed rows in [lo, hi] whose content differs. Rows past the
+/// end of the baseline count as changed. Caller guarantees
+/// `1 <= lo <= hi <= current.len`.
+pub fn diffChangedRows(
+    arena: Allocator,
+    baseline: ?[]const u8,
+    current: []const []const u8,
+    lo: usize,
+    hi: usize,
+) ![]const DiffRow {
+    var baseline_rows: std.ArrayListUnmanaged([]const u8) = .empty;
+    if (baseline) |frame| {
+        var it = std.mem.splitScalar(u8, frame, '\n');
+        while (it.next()) |line| try baseline_rows.append(arena, line);
+    }
+
+    var changed: std.ArrayListUnmanaged(DiffRow) = .empty;
+    var row_number = lo;
+    while (row_number <= hi) : (row_number += 1) {
+        const text = current[row_number - 1];
+        const unchanged = baseline != null and
+            row_number <= baseline_rows.items.len and
+            std.mem.eql(u8, baseline_rows.items[row_number - 1], text);
+        if (!unchanged) try changed.append(arena, .{
+            .row = @intCast(row_number),
+            .text = text,
+        });
+    }
+    return changed.items;
+}
+
+/// Build the `snapshot --diff` payload: rows changed since the session's
+/// stored baseline, with trailing spaces stripped, then replace the
+/// baseline with the current frame. `line_start`/`line_end` bound the
+/// compared range (1-indexed inclusive; 0 = unbounded on that side).
+/// The baseline always stores the full frame — a ranged diff refreshes
+/// rows outside its range too; the range only filters what is compared
+/// and reported.
+pub fn buildDiffPayload(
+    arena: Allocator,
+    sess: *Session,
+    snapshot: hty.ScreenSnapshot,
+    line_start: u64,
+    line_end: u64,
+) !DiffPayload {
+    // Copy the buffer into the arena first: the returned rows alias it,
+    // and the response is encoded after the caller's `snapshot.deinit`.
+    const buffer = try arena.dupe(u8, snapshot.buffer);
+    var rows_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, buffer, '\n');
+    while (it.next()) |line| {
+        try rows_list.append(arena, std.mem.trimEnd(u8, line, " "));
+    }
+    const row_count = rows_list.items.len;
+
+    const lo: usize = if (line_start == 0) 1 else @min(line_start, std.math.maxInt(u16));
+    const hi: usize = if (line_end == 0)
+        row_count
+    else
+        @min(@min(line_end, std.math.maxInt(u16)), row_count);
+    const in_range = lo <= hi and lo <= row_count;
+
+    const full = sess.diff_baseline == null;
+    const changed: []const DiffRow = if (in_range)
+        try diffChangedRows(arena, sess.diff_baseline, rows_list.items, lo, hi)
+    else
+        &.{};
+
+    sess.setDiffBaseline(try std.mem.join(arena, "\n", rows_list.items));
+
+    return .{
+        .rows = snapshot.rows,
+        .cols = snapshot.cols,
+        .cursor_row = snapshot.cursor_row,
+        .cursor_col = snapshot.cursor_col,
+        .range_start = @intCast(lo),
+        .range_end = @intCast(hi),
+        .full = full,
+        .changed = changed,
+        .status = statusName(sess.getStatus()),
+    };
+}
+
 pub fn buildSessionSummary(arena: Allocator, sess: *Session) !SessionSummary {
     return .{
         .id = try arena.dupe(u8, &sess.id),
@@ -1159,6 +1246,58 @@ pub fn eventToPayload(arena: Allocator, event: hty.OutputEvent) !EventPayload {
             .bytes_hex = try encodeHex(arena, bytes),
         },
     };
+}
+
+test "diffChangedRows: no baseline marks every in-range row changed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const current = [_][]const u8{ "alpha", "beta", "gamma" };
+    const changed = try diffChangedRows(arena, null, &current, 1, 3);
+    try std.testing.expectEqual(@as(usize, 3), changed.len);
+    try std.testing.expectEqual(@as(u16, 1), changed[0].row);
+    try std.testing.expectEqualStrings("alpha", changed[0].text);
+    try std.testing.expectEqual(@as(u16, 3), changed[2].row);
+    try std.testing.expectEqualStrings("gamma", changed[2].text);
+}
+
+test "diffChangedRows: only differing rows are reported" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const current = [_][]const u8{ "alpha", "BETA", "gamma", "delta" };
+    const changed = try diffChangedRows(arena, "alpha\nbeta\ngamma", &current, 1, 4);
+    try std.testing.expectEqual(@as(usize, 2), changed.len);
+    try std.testing.expectEqual(@as(u16, 2), changed[0].row);
+    try std.testing.expectEqualStrings("BETA", changed[0].text);
+    // Row 4 has no baseline counterpart (screen grew) — counts as changed.
+    try std.testing.expectEqual(@as(u16, 4), changed[1].row);
+    try std.testing.expectEqualStrings("delta", changed[1].text);
+}
+
+test "diffChangedRows: identical frames report nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const current = [_][]const u8{ "alpha", "", "~" };
+    const changed = try diffChangedRows(arena, "alpha\n\n~", &current, 1, 3);
+    try std.testing.expectEqual(@as(usize, 0), changed.len);
+}
+
+test "diffChangedRows: range bounds which rows are compared" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const current = [_][]const u8{ "ALPHA", "beta", "GAMMA" };
+    // Rows 1 and 3 both changed, but only row 2..3 is in range.
+    const changed = try diffChangedRows(arena, "alpha\nbeta\ngamma", &current, 2, 3);
+    try std.testing.expectEqual(@as(usize, 1), changed.len);
+    try std.testing.expectEqual(@as(u16, 3), changed[0].row);
+    try std.testing.expectEqualStrings("GAMMA", changed[0].text);
 }
 
 test "joinArgs handles empty, single, multi" {

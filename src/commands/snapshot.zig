@@ -10,7 +10,7 @@ const getInteger = json_mod.getInteger;
 
 pub fn helpText() []const u8 {
     return
-    \\hty snapshot [SESSION] [--ansi] [--json] [--meta] [--lines N:M]
+    \\hty snapshot [SESSION] [--ansi] [--json] [--meta] [--diff] [--lines N:M]
     \\
     \\Read the session's current rendered screen. Default output is plain
     \\text. Use --ansi to get the styled ANSI rendering, --json for the
@@ -20,6 +20,15 @@ pub fn helpText() []const u8 {
     \\screen size, session status) without the screen buffer. --meta cannot
     \\be combined with --ansi, --json, or --lines.
     \\
+    \\  --diff        Print only rows changed since the previous --diff
+    \\                snapshot of this session (for polling loops): a
+    \\                `rows LO-HI, N changed, cursor R,C` header, then one
+    \\                `ROW| text` line per changed row — or exactly
+    \\                `no change (cursor R,C)`. The first --diff (no
+    \\                baseline yet) prints every row. Only --diff calls
+    \\                update the baseline; plain/--json snapshots never do.
+    \\                With --lines, only rows in the range are compared
+    \\                and reported.
     \\  --lines N:M   Print only rows N through M (1-indexed, inclusive).
     \\                Open ends are allowed: `N:` reads from row N to the
     \\                last row, `:M` from the first row through M. Rows past
@@ -30,6 +39,17 @@ pub fn helpText() []const u8 {
     \\                24. Prefer open `N:` ranges, or read the full
     \\                frame when state is unclear.
     \\
+    \\  --diff       Print only rows changed since the previous --diff
+    \\               snapshot of this session (for polling loops): a
+    \\               `rows LO-HI, N changed, cursor R,C` header, then one
+    \\               `ROW| text` line per changed row — or exactly
+    \\               `no change (cursor R,C)`. The first --diff (no
+    \\               baseline yet) prints every row. Only --diff calls
+    \\               update the baseline; plain/--json snapshots never do.
+    \\  --lines N:M  With --diff, bound the compared/reported rows to
+    \\               N..M (1-indexed inclusive; either side may be
+    \\               omitted, e.g. `:5` or `20:`).
+    \\
     ;
 }
 
@@ -39,6 +59,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var ansi_output = false;
     var lines_range: ?common.LineRange = null;
     var meta_output = false;
+    var diff_output = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -54,6 +75,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
                 return common.printUsageAndExit("invalid --lines range: expected N:M, N:, or :M with 1-indexed rows and N <= M");
         } else if (std.mem.eql(u8, arg, "--meta")) {
             meta_output = true;
+        } else if (std.mem.eql(u8, arg, "--diff")) {
+            diff_output = true;
         } else if (std.mem.startsWith(u8, arg, "--")) {
             try common.printErrFmt("unknown flag: {s}", .{arg});
             std.process.exit(common.ExitCode.generic);
@@ -70,6 +93,10 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         try common.printErr("cannot combine --meta with --json, --ansi, or --lines");
         std.process.exit(common.ExitCode.generic);
     }
+    if (diff_output and (json_output or ansi_output or meta_output)) {
+        try common.printErr("--diff is incompatible with --json, --ansi, and --meta");
+        std.process.exit(common.ExitCode.generic);
+    }
 
     var payload_buf: std.Io.Writer.Allocating = .init(alloc);
     defer payload_buf.deinit();
@@ -77,6 +104,13 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     if (session_ref) |s| {
         try payload_buf.writer.writeAll(",\"session\":");
         try common.writeJsonString(&payload_buf.writer, s);
+    }
+    if (diff_output) {
+        try payload_buf.writer.writeAll(",\"diff\":true");
+        if (lines_range) |range| {
+            try payload_buf.writer.print(",\"line_start\":{d}", .{range.start});
+            if (range.end) |e| try payload_buf.writer.print(",\"line_end\":{d}", .{e});
+        }
     }
     try payload_buf.writer.writeAll("}");
 
@@ -94,6 +128,11 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
     defer parsed.deinit();
     const object = try common.expectOkOrExit(parsed);
+
+    if (diff_output) {
+        try common.printDiffBody(alloc, object);
+        return;
+    }
 
     const snap_val = object.get("snapshot") orelse return;
     const snap_obj = switch (snap_val) {
@@ -344,3 +383,4 @@ test "compactJsonResponse passes error responses through verbatim" {
     const out = try compactJsonResponse(alloc, "{\"ok\":false,\"error\":\"no such session\"}");
     try std.testing.expect(out == null);
 }
+

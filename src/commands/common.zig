@@ -368,3 +368,117 @@ test "sliceLines clamps out-of-range rows" {
     try std.testing.expectEqualStrings("", sliceLines(frame, .{ .start = 4, .end = null }));
     try std.testing.expectEqualStrings("", sliceLines(frame, .{ .start = 10, .end = 12 }));
 }
+
+/// Number of decimal digits in `n` (n >= 0).
+fn decimalWidth(n: i64) usize {
+    var width: usize = 1;
+    var value = n;
+    while (value >= 10) : (value = @divTrunc(value, 10)) width += 1;
+    return width;
+}
+
+/// Render the plain output for a `snapshot --diff` response's `diff`
+/// payload: a `rows LO-HI, N changed, cursor R,C` header followed by one
+/// `ROW| text` line per changed row (row numbers right-aligned to the
+/// grid's widest row number), or exactly `no change (cursor R,C)` when
+/// nothing changed. Caller owns the returned slice.
+pub fn formatDiffBody(alloc: Allocator, diff: std.json.ObjectMap) ![]u8 {
+    const json_mod = @import("../json.zig");
+    const rows = json_mod.getInteger(diff, "rows") orelse 0;
+    const cursor_row = json_mod.getInteger(diff, "cursor_row") orelse 0;
+    const cursor_col = json_mod.getInteger(diff, "cursor_col") orelse 0;
+    const range_start = json_mod.getInteger(diff, "range_start") orelse 1;
+    const range_end = json_mod.getInteger(diff, "range_end") orelse rows;
+
+    const changed: []const std.json.Value = blk: {
+        const value = diff.get("changed") orelse break :blk &.{};
+        break :blk switch (value) {
+            .array => |array| array.items,
+            else => &.{},
+        };
+    };
+
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    const writer = &buf.writer;
+
+    if (changed.len == 0) {
+        try writer.print("no change (cursor {d},{d})\n", .{ cursor_row, cursor_col });
+        return buf.toOwnedSlice();
+    }
+
+    try writer.print("rows {d}-{d}, {d} changed, cursor {d},{d}\n", .{
+        range_start, range_end, changed.len, cursor_row, cursor_col,
+    });
+
+    const width = decimalWidth(@max(rows, 1));
+    for (changed) |entry| {
+        if (entry != .object) continue;
+        const row = json_mod.getInteger(entry.object, "row") orelse continue;
+        const raw = json_mod.getString(entry.object, "text") orelse "";
+        // Same trailing-space strip the plain snapshot path applies.
+        const text = std.mem.trimEnd(u8, raw, " ");
+        var pad = width -| decimalWidth(row);
+        while (pad > 0) : (pad -= 1) try writer.writeByte(' ');
+        try writer.print("{d}| {s}\n", .{ row, text });
+    }
+
+    return buf.toOwnedSlice();
+}
+
+/// Print the plain diff rendering from a response envelope carrying a
+/// `diff` payload. No-op when the payload is absent.
+pub fn printDiffBody(alloc: Allocator, object: std.json.ObjectMap) !void {
+    const diff_val = object.get("diff") orelse return;
+    if (diff_val != .object) return;
+    const text = try formatDiffBody(alloc, diff_val.object);
+    defer alloc.free(text);
+    try printRaw(text);
+}
+
+test "formatDiffBody: changed rows with aligned numbers" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"rows":24,"cols":80,"cursor_row":4,"cursor_col":17,
+        \\ "range_start":1,"range_end":24,"full":false,
+        \\ "changed":[{"row":4,"text":"def parse_duration(value):"},
+        \\            {"row":12,"text":"    return ms"}]}
+    , .{});
+    defer parsed.deinit();
+    const out = try formatDiffBody(alloc, parsed.value.object);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "rows 1-24, 2 changed, cursor 4,17\n" ++
+            " 4| def parse_duration(value):\n" ++
+            "12|     return ms\n",
+        out,
+    );
+}
+
+test "formatDiffBody: changed row text loses trailing padding" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"rows":24,"cols":80,"cursor_row":1,"cursor_col":1,
+        \\ "range_start":1,"range_end":24,"full":false,
+        \\ "changed":[{"row":3,"text":"abc   "}]}
+    , .{});
+    defer parsed.deinit();
+    const out = try formatDiffBody(alloc, parsed.value.object);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "rows 1-24, 1 changed, cursor 1,1\n 3| abc\n",
+        out,
+    );
+}
+
+test "formatDiffBody: no change is a single cursor line" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"rows":24,"cols":80,"cursor_row":4,"cursor_col":17,
+        \\ "range_start":1,"range_end":24,"full":false,"changed":[]}
+    , .{});
+    defer parsed.deinit();
+    const out = try formatDiffBody(alloc, parsed.value.object);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("no change (cursor 4,17)\n", out);
+}
