@@ -29,6 +29,9 @@ pub fn helpText() []const u8 {
     \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
     \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
     \\                       are pauses, and bare words are key names.
+    \\                       Quoted strings are sent literally — backslash
+    \\                       escapes like \n are NOT interpreted (use --text
+    \\                       for C-style escapes).
     \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
     \\  --bytes-hex HEX      Raw bytes encoded as hex.
     \\
@@ -409,6 +412,9 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         if (token_list.len == 0) {
             try common.printErr("--seq requires at least one token");
             std.process.exit(common.ExitCode.generic);
+        }
+        if (seqTextLooksEscaped(token_list)) {
+            try common.printErr("warning: quoted --seq strings are sent literally; backslash sequences like \\n are NOT interpreted. Use --text for C-style escapes or --raw-text for verbatim bytes.");
         }
     } else if (text) |t| {
         token_list = .{};
@@ -909,6 +915,19 @@ fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
     return result;
 }
 
+/// Returns true if any quoted text token contains a backslash escape
+/// (`\n`, `\t`, `\e`) that `--text` would decode but `--seq` sends
+/// literally (issue #102). Keys and delay tokens never trigger this.
+fn seqTextLooksEscaped(list: SeqTokenList) bool {
+    for (list.slice()) |token| {
+        if (token.kind != .text) continue;
+        if (std.mem.indexOf(u8, token.value, "\\n") != null) return true;
+        if (std.mem.indexOf(u8, token.value, "\\t") != null) return true;
+        if (std.mem.indexOf(u8, token.value, "\\e") != null) return true;
+    }
+    return false;
+}
+
 /// Returns true if the word starts with a digit and ends with a duration
 /// suffix (ms, s, m, h). This avoids misinterpreting key names like "f1"
 /// as durations.
@@ -923,8 +942,9 @@ fn looksLikeDuration(word: []const u8) bool {
 }
 
 /// Process C-style escape sequences in --text values.
-/// Supports: \n \t \r \\ \e (ESC). A trailing backslash or an
-/// unrecognised escape like \z is an error.
+/// Supports: \n \t \r \\ \e (ESC). An unrecognised escape like \< passes
+/// through verbatim (backslash + char, issue #102); a trailing backslash
+/// is an error.
 /// If the input contains no backslashes the original slice is returned
 /// (no allocation).
 fn unescapeText(alloc: Allocator, input: []const u8) ![]const u8 {
@@ -944,7 +964,10 @@ fn unescapeText(alloc: Allocator, input: []const u8) ![]const u8 {
                 'r' => try buf.append('\r'),
                 'e' => try buf.append(0x1B),
                 '\\' => try buf.append('\\'),
-                else => return error.InvalidEscape,
+                else => {
+                    try buf.append('\\');
+                    try buf.append(input[i]);
+                },
             }
         } else {
             try buf.append(input[i]);
@@ -1127,8 +1150,46 @@ test "unescapeText: trailing backslash is an error" {
     try std.testing.expectError(error.InvalidEscape, unescapeText(std.testing.allocator, "hello\\"));
 }
 
-test "unescapeText: unknown escape is an error" {
-    try std.testing.expectError(error.InvalidEscape, unescapeText(std.testing.allocator, "hello\\z"));
+test "unescapeText: unknown escape passes through verbatim" {
+    const result = try unescapeText(std.testing.allocator, "hello\\z");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello\\z", result);
+}
+
+test "unescapeText: vim-style escapes pass through verbatim" {
+    // issue #102: `--text '/\<word\>'` used to fail with "invalid escape
+    // sequence"; vim regex atoms must survive untouched.
+    const result = try unescapeText(std.testing.allocator, "/\\<word\\>");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("/\\<word\\>", result);
+}
+
+test "unescapeText: known and unknown escapes mixed" {
+    const result = try unescapeText(std.testing.allocator, "a\\n\\<b");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("a\n\\<b", result);
+}
+
+test "seqTextLooksEscaped: quoted backslash-n triggers" {
+    const tokens = try parseSeqTokens("ctrl-x \"line1\\nline2\" enter");
+    try std.testing.expect(seqTextLooksEscaped(tokens));
+}
+
+test "seqTextLooksEscaped: backslash-t and backslash-e trigger" {
+    try std.testing.expect(seqTextLooksEscaped(try parseSeqTokens("\"a\\tb\"")));
+    try std.testing.expect(seqTextLooksEscaped(try parseSeqTokens("\"\\e[31m\"")));
+}
+
+test "seqTextLooksEscaped: plain tokens do not trigger" {
+    const tokens = try parseSeqTokens("\"hello\" 200ms enter \"world\"");
+    try std.testing.expect(!seqTextLooksEscaped(tokens));
+}
+
+test "seqTextLooksEscaped: bare key words never trigger" {
+    // A hypothetical key token containing a backslash must not warn;
+    // only quoted text tokens are checked.
+    const tokens = try parseSeqTokens("enter tab escape");
+    try std.testing.expect(!seqTextLooksEscaped(tokens));
 }
 
 test "unescapeText: multiple escapes in one string" {
