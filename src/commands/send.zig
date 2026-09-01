@@ -263,7 +263,9 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         std.process.exit(common.ExitCode.generic);
     }
     if (mouse_mode_count + kb_mode_count > 1) {
-        try common.printErr("hty send: --click, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive");
+        try common.printErr("hty send: --click, --scroll, --text, --raw-text, --key, --bytes-hex, --seq are mutually exclusive.\n" ++
+            "          To combine keys and text in one call use --seq, e.g.:\n" ++
+            "          hty send SESSION --seq 'esc \":wq\" enter'");
         std.process.exit(common.ExitCode.generic);
     }
 
