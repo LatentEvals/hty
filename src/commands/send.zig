@@ -373,13 +373,6 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             try common.printErr("quoted --seq strings are literal; backslash sequences like \\n are NOT interpreted, so nothing was sent. Use --text for C-style escapes, or --text with \\\\n (escaped backslash) / --raw-text to intentionally send a literal backslash sequence.");
             std.process.exit(common.ExitCode.generic);
         }
-        if (try findInvalidSeqKey(alloc, token_list)) |bad_key| {
-            const max_shown = 40;
-            const shown = if (bad_key.len > max_shown) bad_key[0..max_shown] else bad_key;
-            const ellipsis: []const u8 = if (bad_key.len > max_shown) "..." else "";
-            try common.printErrFmt("invalid key name \"{s}{s}\" in --seq; bare words are key names — quote free text (\"like this\"); run `hty keys` for the list", .{ shown, ellipsis });
-            std.process.exit(common.ExitCode.generic);
-        }
     } else if (text) |t| {
         token_list = .{};
         const unescaped = unescapeText(alloc, t) catch {
@@ -403,6 +396,16 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         token_list.tokens[0] = .{ .kind = .bytes_hex, .value = b };
         token_list.len = 1;
     } else unreachable;
+
+    // Validate key tokens client-side for --seq and --key (issue #102):
+    // reject before anything is sent, naming the offending token.
+    if (try findInvalidKeyToken(alloc, token_list)) |bad_key| {
+        const flag: []const u8 = if (seq != null) "--seq" else "--key";
+        const msg = try invalidKeyMessage(alloc, flag, bad_key);
+        defer alloc.free(msg);
+        try common.printErr(msg);
+        std.process.exit(common.ExitCode.generic);
+    }
 
     // Expand --delay-char: split text tokens into per-character tokens
     // with delay tokens interleaved.
@@ -875,10 +878,11 @@ fn seqTextLooksEscaped(list: SeqTokenList) bool {
 }
 
 /// Returns the first `.key` token whose name `keyToBytes` rejects, or null
-/// when every key token is valid. Runs before anything is sent so an
-/// invalid key aborts the whole sequence instead of failing mid-send with
-/// earlier tokens already delivered.
-fn findInvalidSeqKey(alloc: Allocator, list: SeqTokenList) error{OutOfMemory}!?[]const u8 {
+/// when every key token is valid. Covers both `--seq` bare words and the
+/// single `--key` token. Runs before anything is sent so an invalid key
+/// aborts the whole command instead of failing mid-send with earlier
+/// tokens already delivered.
+fn findInvalidKeyToken(alloc: Allocator, list: SeqTokenList) error{OutOfMemory}!?[]const u8 {
     for (list.slice()) |token| {
         if (token.kind != .key) continue;
         _ = keyToBytes(alloc, token.value) catch |err| switch (err) {
@@ -887,6 +891,25 @@ fn findInvalidSeqKey(alloc: Allocator, list: SeqTokenList) error{OutOfMemory}!?[
         };
     }
     return null;
+}
+
+/// Build the invalid-key error for `token` (from `flag`, "--seq" or
+/// "--key"). Names the offending token (truncated past 40 bytes). --seq
+/// adds a bare-words-vs-quoted hint; a token containing a space adds a
+/// tail pointing --key users at --seq. Caller frees.
+fn invalidKeyMessage(alloc: Allocator, flag: []const u8, token: []const u8) ![]const u8 {
+    const max_shown = 40;
+    const shown = if (token.len > max_shown) token[0..max_shown] else token;
+    const ellipsis: []const u8 = if (token.len > max_shown) "..." else "";
+    const seq_hint: []const u8 = if (std.mem.eql(u8, flag, "--seq"))
+        "; bare words are key names — quote free text (\"like this\")"
+    else
+        "";
+    const space_hint: []const u8 = if (std.mem.indexOfScalar(u8, token, ' ') != null)
+        ". --key sends a single key; use --seq for a sequence (e.g. --seq 'ctrl-x \"u\"')"
+    else
+        "";
+    return std.fmt.allocPrint(alloc, "invalid key name \"{s}{s}\" in {s}{s}; run `hty keys` for the list{s}", .{ shown, ellipsis, flag, seq_hint, space_hint });
 }
 
 /// Returns true if the word starts with a digit and ends with a duration
@@ -1152,27 +1175,64 @@ test "seqTextLooksEscaped: bare key words never trigger the check" {
     try std.testing.expect(!seqTextLooksEscaped(tokens));
 }
 
-test "findInvalidSeqKey: names the offending token" {
+test "findInvalidKeyToken: names the offending token" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const tokens = try parseSeqTokens("ctrl-x notakey enter");
-    const bad = try findInvalidSeqKey(arena.allocator(), tokens);
+    const bad = try findInvalidKeyToken(arena.allocator(), tokens);
     try std.testing.expectEqualStrings("notakey", bad.?);
 }
 
-test "findInvalidSeqKey: all-valid sequence returns null" {
+test "findInvalidKeyToken: all-valid sequence returns null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const tokens = try parseSeqTokens("\"hello\" 200ms ctrl-alt-f shift-up f12 enter");
-    try std.testing.expectEqual(@as(?[]const u8, null), try findInvalidSeqKey(arena.allocator(), tokens));
+    try std.testing.expectEqual(@as(?[]const u8, null), try findInvalidKeyToken(arena.allocator(), tokens));
 }
 
-test "findInvalidSeqKey: quoted text is never treated as a key" {
+test "findInvalidKeyToken: quoted text is never treated as a key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     // "notakey" would be invalid as a bare word, but quoted it is text.
     const tokens = try parseSeqTokens("\"notakey definitely not a key\" enter");
-    try std.testing.expectEqual(@as(?[]const u8, null), try findInvalidSeqKey(arena.allocator(), tokens));
+    try std.testing.expectEqual(@as(?[]const u8, null), try findInvalidKeyToken(arena.allocator(), tokens));
+}
+
+test "findInvalidKeyToken: single --key-shaped token" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // What run() builds for `--key "ctrl-x u"` — one key token.
+    var list: SeqTokenList = .{};
+    list.tokens[0] = .{ .kind = .key, .value = "ctrl-x u" };
+    list.len = 1;
+    const bad = try findInvalidKeyToken(arena.allocator(), list);
+    try std.testing.expectEqualStrings("ctrl-x u", bad.?);
+}
+
+test "invalidKeyMessage: --seq names token and adds quoting hint" {
+    const msg = try invalidKeyMessage(std.testing.allocator, "--seq", "notakey");
+    defer std.testing.allocator.free(msg);
+    try std.testing.expectEqualStrings("invalid key name \"notakey\" in --seq; bare words are key names — quote free text (\"like this\"); run `hty keys` for the list", msg);
+}
+
+test "invalidKeyMessage: --key names token, no seq hint, no space tail" {
+    const msg = try invalidKeyMessage(std.testing.allocator, "--key", "notakey");
+    defer std.testing.allocator.free(msg);
+    try std.testing.expectEqualStrings("invalid key name \"notakey\" in --key; run `hty keys` for the list", msg);
+}
+
+test "invalidKeyMessage: --key token with space adds --seq suggestion tail" {
+    const msg = try invalidKeyMessage(std.testing.allocator, "--key", "ctrl-x u");
+    defer std.testing.allocator.free(msg);
+    try std.testing.expectEqualStrings("invalid key name \"ctrl-x u\" in --key; run `hty keys` for the list. --key sends a single key; use --seq for a sequence (e.g. --seq 'ctrl-x \"u\"')", msg);
+}
+
+test "invalidKeyMessage: huge token is truncated" {
+    const long = "x" ** 60;
+    const msg = try invalidKeyMessage(std.testing.allocator, "--seq", long);
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "\"" ++ ("x" ** 40) ++ "...\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "x" ** 41) == null);
 }
 
 test "unescapeText: multiple escapes in one string" {
