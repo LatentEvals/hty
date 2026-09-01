@@ -56,6 +56,12 @@ pub fn helpText() []const u8 {
     \\Wait + snapshot flags (fuse send + wait + snapshot into one round-trip):
     \\  --snapshot           Include the post-action snapshot in the response.
     \\                       Combines with --json and --ansi like `hty snapshot`.
+    \\                       Without an explicit --wait-* flag this implies
+    \\                       --wait-until-idle 100 so the frame reflects the
+    \\                       input just sent; pass --no-wait for the immediate
+    \\                       (possibly stale) frame.
+    \\  --no-wait            With --snapshot, capture the frame immediately
+    \\                       instead of the implied --wait-until-idle 100.
     \\  --wait-duration DUR  Sleep DUR after sending, then snapshot. Requires
     \\                       --snapshot (otherwise use --delay-after).
     \\  --wait-until-idle [MS]
@@ -98,6 +104,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var mouse_button: []const u8 = "left";
 
     var snapshot_flag = false;
+    var no_wait = false;
     var json_output = false;
     var ansi_output = false;
     var wait_duration_str: ?[]const u8 = null;
@@ -145,6 +152,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             delay_char = args[i];
         } else if (std.mem.eql(u8, arg, "--snapshot")) {
             snapshot_flag = true;
+        } else if (std.mem.eql(u8, arg, "--no-wait")) {
+            no_wait = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
@@ -233,9 +242,26 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         try common.printErr("--wait-duration without --snapshot is just a delay; use --delay-after, or add --snapshot");
         std.process.exit(common.ExitCode.generic);
     }
+    if (no_wait and (wait_kind_count > 0 or wait_duration_str != null)) {
+        try common.printErr("--no-wait is incompatible with --wait-duration/--wait-until-*");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (no_wait and !snapshot_flag) {
+        try common.printErr("--no-wait requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
     if ((json_output or ansi_output) and !snapshot_flag) {
         try common.printErr("--json and --ansi require --snapshot");
         std.process.exit(common.ExitCode.generic);
+    }
+
+    // A fused snapshot with no explicit wait races the program's redraw and
+    // can return a stale frame (issue #96). Imply the default idle settle so
+    // the frame reflects the input just sent; --no-wait restores the
+    // immediate capture.
+    if (shouldImplyIdleSettle(snapshot_flag, no_wait, wait_kind_count, wait_duration_str != null)) {
+        wait_until_idle = true;
+        wait_kind_count = 1;
     }
     if (json_output and ansi_output) {
         try common.printErr("--json and --ansi are mutually exclusive");
@@ -603,6 +629,15 @@ pub fn parseIdleArg(text: []const u8) !u64 {
     if (i == 0) return error.InvalidDuration;
     if (i == text.len) return try std.fmt.parseInt(u64, text, 10);
     return try common.parseDurationMs(text);
+}
+
+/// Decide whether a fused `--snapshot` should get the implied idle settle
+/// (issue #96): a snapshot with no explicit wait flag races the program's
+/// redraw and can capture a stale frame, so unless the caller picked a wait
+/// condition — or opted out with --no-wait — we default to
+/// `--wait-until-idle` with the standard 100ms window.
+pub fn shouldImplyIdleSettle(snapshot: bool, no_wait: bool, wait_kind_count: u8, has_wait_duration: bool) bool {
+    return snapshot and !no_wait and wait_kind_count == 0 and !has_wait_duration;
 }
 
 pub const FusedRequest = struct {
@@ -1181,4 +1216,19 @@ test "countInputModes: --raw-text with any other mode is a mutual-exclusion erro
         error.InvalidInputModeCount,
         countInputModes(.{ .text = null, .raw_text = "x", .key = null, .bytes_hex = null, .seq = "enter" }),
     );
+}
+test "shouldImplyIdleSettle: bare --snapshot gets the settle" {
+    try std.testing.expect(shouldImplyIdleSettle(true, false, 0, false));
+}
+
+test "shouldImplyIdleSettle: --no-wait opts out" {
+    try std.testing.expect(!shouldImplyIdleSettle(true, true, 0, false));
+}
+
+test "shouldImplyIdleSettle: explicit wait flags are left alone" {
+    // Any --wait-until-* (wait_kind_count > 0) or --wait-duration suppresses
+    // the implied settle; without --snapshot there is nothing to settle.
+    try std.testing.expect(!shouldImplyIdleSettle(true, false, 1, false));
+    try std.testing.expect(!shouldImplyIdleSettle(true, false, 0, true));
+    try std.testing.expect(!shouldImplyIdleSettle(false, false, 0, false));
 }
