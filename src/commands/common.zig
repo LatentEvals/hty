@@ -138,14 +138,17 @@ pub fn stripTrailingSpaces(alloc: Allocator, text: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Print a plain snapshot `buffer`, trailing spaces stripped, plus a final
+/// Print a plain snapshot `buffer`: trailing spaces stripped per line
+/// (#97) and trailing fill-row runs collapsed (#98), plus a final
 /// newline. Only for the plain rendering — `--ansi` output keeps trailing
 /// cells because they can carry styling (e.g. a painted background).
 pub fn printPlainSnapshot(text: []const u8) !void {
     const alloc = std.heap.c_allocator;
     const stripped = try stripTrailingSpaces(alloc, text);
     defer alloc.free(stripped);
-    try printRaw(stripped);
+    const collapsed = try collapseTrailingFillRows(alloc, stripped);
+    defer if (collapsed) |owned| alloc.free(owned);
+    try printRaw(collapsed orelse stripped);
     try printRaw("\n");
 }
 
