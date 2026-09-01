@@ -28,6 +28,7 @@ pub fn helpText() []const u8 {
     \\
     \\Examples:
     \\  ctrl-x            Ctrl+X
+    \\  ctrl-space        NUL / C-SPC (set-mark in emacs; ctrl-@ also works)
     \\  c-a               Ctrl+A (short form)
     \\  alt-f             Alt+F (Meta+F in emacs)
     \\  shift-tab         Backtab

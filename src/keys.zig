@@ -165,7 +165,7 @@ pub fn keyToBytes(arena: Allocator, key: []const u8) ![]const u8 {
                 // ESC + ctrl-char
                 const bytes = try arena.alloc(u8, 2);
                 bytes[0] = '\x1b';
-                if (std.ascii.isAlphanumeric(char) or char == '[' or char == '\\' or char == ']' or char == '^' or char == '_') {
+                if (std.ascii.isAlphanumeric(char) or char == '@' or char == '[' or char == '\\' or char == ']' or char == '^' or char == '_') {
                     bytes[1] = char & 0x1f;
                 } else {
                     return error.InvalidKey;
@@ -174,7 +174,7 @@ pub fn keyToBytes(arena: Allocator, key: []const u8) ![]const u8 {
             }
 
             if (mods.ctrl) {
-                if (!std.ascii.isAlphanumeric(char) and char != '[' and char != '\\' and char != ']' and char != '^' and char != '_') {
+                if (!std.ascii.isAlphanumeric(char) and char != '@' and char != '[' and char != '\\' and char != ']' and char != '^' and char != '_') {
                     return error.InvalidKey;
                 }
                 const bytes = try arena.alloc(u8, 1);
@@ -203,6 +203,13 @@ pub fn keyToBytes(arena: Allocator, key: []const u8) ![]const u8 {
             }
 
             if (!mods.any()) return try arena.dupe(u8, &[_]u8{base.code});
+
+            // Special case: ctrl-space = NUL (C-SPC, emacs set-mark),
+            // ctrl-alt-space = ESC + NUL
+            if (base.code == ' ' and mods.ctrl and !mods.shift) {
+                if (mods.alt) return "\x1b\x00";
+                return "\x00";
+            }
 
             // For other simple keys with modifiers, only alt makes sense
             // (e.g. alt-enter = ESC + \r, alt-space = ESC + space)
@@ -342,6 +349,22 @@ test "key encoding: shift modifier" {
     try std.testing.expectEqualStrings("\x1b[1;2P", try keyToBytes(arena, "shift-f1"));
     // Shift on printable is an error
     try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "shift-a"));
+}
+
+test "key encoding: ctrl-space is NUL" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("\x00", try keyToBytes(arena, "ctrl-space"));
+    try std.testing.expectEqualStrings("\x00", try keyToBytes(arena, "c-space"));
+    try std.testing.expectEqualStrings("\x1b\x00", try keyToBytes(arena, "ctrl-alt-space"));
+    // C-@ is the traditional NUL alias
+    try std.testing.expectEqualStrings("\x00", try keyToBytes(arena, "ctrl-@"));
+    try std.testing.expectEqualStrings("\x1b\x00", try keyToBytes(arena, "ctrl-alt-@"));
+    // shift combos stay invalid
+    try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "ctrl-shift-space"));
+    try std.testing.expectError(error.InvalidKey, keyToBytes(arena, "shift-space"));
 }
 
 test "key encoding: multi-modifier combos" {
