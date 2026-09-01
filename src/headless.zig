@@ -42,6 +42,8 @@ comptime {
     _ = @import("commands/replay.zig");
     _ = @import("commands/asciicast.zig");
     _ = @import("commands/export.zig");
+    _ = @import("commands/common.zig");
+    _ = @import("commands/snapshot.zig");
 }
 
 /// Suppress std.log output below error level across the whole binary.

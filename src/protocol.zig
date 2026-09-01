@@ -16,6 +16,7 @@ pub const Response = struct {
     @"error": ?[]const u8 = null,
     timed_out: bool = false,
     snapshot: ?SnapshotPayload = null,
+    diff: ?DiffPayload = null,
     event: ?EventPayload = null,
     session: ?SessionSummary = null,
     sessions: ?[]const SessionSummary = null,
@@ -58,6 +59,33 @@ pub const MouseStateWire = struct {
     button_event: bool = false,
     any_event: bool = false,
     sgr: bool = false,
+};
+
+/// `hty snapshot --diff` payload — only the rows that changed since the
+/// previous diff snapshot delivered for the session, so polling loops
+/// don't resend near-identical frames. Additive: present only when the
+/// request set `diff: true` (older clients never see it).
+pub const DiffPayload = struct {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    /// Compared/reported row range, 1-indexed inclusive — the full grid
+    /// unless the request bounded it with `line_start`/`line_end`.
+    range_start: u16,
+    range_end: u16,
+    /// True when no baseline existed (first diff for the session);
+    /// `changed` then carries every in-range row.
+    full: bool,
+    changed: []const DiffRow,
+    status: []const u8 = "running",
+};
+
+/// One changed row: 1-indexed position and its content with trailing
+/// spaces stripped.
+pub const DiffRow = struct {
+    row: u16,
+    text: []const u8,
 };
 
 pub const EventPayload = struct {
