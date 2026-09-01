@@ -85,7 +85,9 @@ pub fn helpText() []const u8 {
     \\                       (1-indexed, inclusive). Open ends allowed: `N:`
     \\                       reads to the last row, `:M` from the first. Rows
     \\                       past the end of the screen are clamped. Not
-    \\                       valid with --json.
+    \\                       valid with --json. Tip: editors show status
+    \\                       lines and prompts on the LAST rows — `1:12`
+    \\                       misses a prompt on row 24; prefer `N:`.
     \\
     ;
 }
