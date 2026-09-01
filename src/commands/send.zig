@@ -6,6 +6,7 @@ const sys = @import("hty").sys;
 const Allocator = std.mem.Allocator;
 
 const common = @import("common.zig");
+const keyToBytes = @import("../keys.zig").keyToBytes;
 
 pub fn helpText() []const u8 {
     return
@@ -28,7 +29,10 @@ pub fn helpText() []const u8 {
     \\                       ctrl-alt-f or shift-up. Run `hty keys` for details.
     \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
     \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
-    \\                       are pauses, and bare words are key names.
+    \\                       are pauses, and bare words are key names. A bare
+    \\                       word that is not a key name is typed literally
+    \\                       (tmux send-keys convention) — key names win, so
+    \\                       quote a literal "enter".
     \\                       Example: --seq '"hello" 200ms enter 500ms "world"'
     \\  --bytes-hex HEX      Raw bytes encoded as hex.
     \\
@@ -364,6 +368,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             try common.printErr("--seq requires at least one token");
             std.process.exit(common.ExitCode.generic);
         }
+        try bareWordsToText(alloc, &token_list);
     } else if (text) |t| {
         token_list = .{};
         const unescaped = unescapeText(alloc, t) catch {
@@ -797,7 +802,8 @@ const SeqTokenList = struct {
 /// Parse a --seq string into tokens.
 /// Quoted strings ("..." or '...') become text tokens.
 /// Bare words that look like durations (e.g. 200ms, 1s) become delay tokens.
-/// All other bare words become key tokens.
+/// All other bare words become key tokens; `bareWordsToText` then
+/// reclassifies the ones that are not recognized key names as text.
 /// Token values are slices into the input string (no allocation needed for values).
 fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
     var result: SeqTokenList = .{};
@@ -842,6 +848,24 @@ fn parseSeqTokens(input: []const u8) error{InvalidSeq}!SeqTokenList {
     }
 
     return result;
+}
+
+/// tmux send-keys parity: reclassify any bare `--seq` word that is not a
+/// recognized key name as literal text instead of letting it fail as a
+/// key. Key names win over text — bare "enter" is the key; quote it to
+/// type the word. Runs on the parsed token list before anything is sent.
+fn bareWordsToText(alloc: Allocator, list: *SeqTokenList) error{OutOfMemory}!void {
+    for (list.tokens[0..list.len]) |*token| {
+        if (token.kind != .key) continue;
+        if (keyToBytes(alloc, token.value)) |_| {
+            // Recognized key name — keep it a key token.
+        } else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                token.kind = .text;
+            },
+        }
+    }
 }
 
 /// Returns true if the word starts with a digit and ends with a duration
@@ -1102,6 +1126,78 @@ test "raw-text: common C-style escape-looking sequences stay literal" {
     try std.testing.expectEqualStrings("\\t\\n\\\\\\e", raw);
     // No LF, no TAB, no ESC — every byte is either '\\' or an ASCII letter.
     for (raw) |b| try std.testing.expect(b == '\\' or (b >= 'a' and b <= 'z'));
+}
+
+test "bareWordsToText: bare non-key word becomes text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tokens = try parseSeqTokens("alt-x replace-string enter");
+    try bareWordsToText(arena.allocator(), &tokens);
+    const list = tokens.slice();
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqual(.key, list[0].kind);
+    try std.testing.expectEqualStrings("alt-x", list[0].value);
+    try std.testing.expectEqual(.text, list[1].kind);
+    try std.testing.expectEqualStrings("replace-string", list[1].value);
+    try std.testing.expectEqual(.key, list[2].kind);
+    try std.testing.expectEqualStrings("enter", list[2].value);
+}
+
+test "bareWordsToText: key names still win over text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tokens = try parseSeqTokens("ctrl-c enter f1 up space ctrl-alt-f");
+    try bareWordsToText(arena.allocator(), &tokens);
+    for (tokens.slice()) |token| {
+        try std.testing.expectEqual(.key, token.kind);
+    }
+}
+
+test "bareWordsToText: mixed sequence produces expected op kinds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tokens = try parseSeqTokens("alt-x replace-string enter \"with space\" 300ms ctrl-s");
+    try bareWordsToText(arena.allocator(), &tokens);
+    const list = tokens.slice();
+    try std.testing.expectEqual(@as(usize, 6), list.len);
+    try std.testing.expectEqual(.key, list[0].kind); // alt-x
+    try std.testing.expectEqual(.text, list[1].kind); // replace-string
+    try std.testing.expectEqual(.key, list[2].kind); // enter
+    try std.testing.expectEqual(.text, list[3].kind); // "with space" (quoted)
+    try std.testing.expectEqual(.delay, list[4].kind); // 300ms
+    try std.testing.expectEqual(@as(u64, 300), list[4].delay_ms);
+    try std.testing.expectEqual(.key, list[5].kind); // ctrl-s
+}
+
+test "bareWordsToText: vim ex command tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // ":e" is no key name -> text; "." is a single printable -> stays a
+    // key that types "." — same bytes on the wire either way.
+    var tokens = try parseSeqTokens(":e . enter");
+    try bareWordsToText(arena.allocator(), &tokens);
+    const list = tokens.slice();
+    try std.testing.expectEqual(.text, list[0].kind);
+    try std.testing.expectEqualStrings(":e", list[0].value);
+    try std.testing.expectEqual(.key, list[1].kind);
+    try std.testing.expectEqual(.key, list[2].kind);
+}
+
+test "bareWordsToText: quoted tokens are untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // A quoted "enter" is text before and after the pass.
+    var tokens = try parseSeqTokens("\"enter\" enter");
+    try bareWordsToText(arena.allocator(), &tokens);
+    const list = tokens.slice();
+    try std.testing.expectEqual(.text, list[0].kind);
+    try std.testing.expectEqual(.key, list[1].kind);
+}
+
+test "helpText documents --seq bare-word text fallback" {
+    const text = helpText();
+    try std.testing.expect(std.mem.indexOf(u8, text, "typed literally") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "tmux send-keys convention") != null);
 }
 
 test "helpText documents --raw-text" {
