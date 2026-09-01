@@ -78,6 +78,11 @@ pub fn helpText() []const u8 {
     \\                       snapshot, ...}` instead of the plain buffer.
     \\  --ansi               With --snapshot, print the styled ANSI rendering
     \\                       instead of the plain buffer.
+    \\  --lines N:M          With --snapshot, print only rows N through M
+    \\                       (1-indexed, inclusive). Open ends allowed: `N:`
+    \\                       reads to the last row, `:M` from the first. Rows
+    \\                       past the end of the screen are clamped. Not
+    \\                       valid with --json.
     \\
     ;
 }
@@ -107,6 +112,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var no_wait = false;
     var json_output = false;
     var ansi_output = false;
+    var lines_range: ?common.LineRange = null;
     var wait_duration_str: ?[]const u8 = null;
     var wait_until_idle = false;
     var wait_until_idle_ms_str: ?[]const u8 = null;
@@ -158,6 +164,11 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--ansi")) {
             ansi_output = true;
+        } else if (std.mem.eql(u8, arg, "--lines")) {
+            i += 1;
+            if (i >= args.len) return common.printUsageAndExit("--lines requires a value (N:M, N:, or :M)");
+            lines_range = common.parseLineRange(args[i]) catch
+                return common.printUsageAndExit("invalid --lines range: expected N:M, N:, or :M with 1-indexed rows and N <= M");
         } else if (std.mem.eql(u8, arg, "--wait-duration")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--wait-duration requires a value");
@@ -254,6 +265,14 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         try common.printErr("--json and --ansi require --snapshot");
         std.process.exit(common.ExitCode.generic);
     }
+    if (lines_range != null and !snapshot_flag) {
+        try common.printErr("--lines requires --snapshot");
+        std.process.exit(common.ExitCode.generic);
+    }
+    if (lines_range != null and json_output) {
+        try common.printErr("--lines is incompatible with --json (the JSON response always carries the full snapshot)");
+        std.process.exit(common.ExitCode.generic);
+    }
 
     // A fused snapshot with no explicit wait races the program's redraw and
     // can return a stale frame (issue #96). Imply the default idle settle so
@@ -339,6 +358,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
                 .snapshot = snapshot_flag,
                 .json_output = json_output,
                 .ansi_output = ansi_output,
+                .lines = lines_range,
             });
         }
         return;
@@ -530,6 +550,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
             .snapshot = snapshot_flag,
             .json_output = json_output,
             .ansi_output = ansi_output,
+            .lines = lines_range,
         });
     }
 }
@@ -694,6 +715,7 @@ const FusedWaitParams = struct {
     snapshot: bool,
     json_output: bool,
     ansi_output: bool,
+    lines: ?common.LineRange = null,
 };
 
 /// Build and issue the wait_and_snapshot RPC, then format the response
@@ -720,7 +742,7 @@ pub fn issueFusedWait(alloc: Allocator, io: std.Io, params: FusedWaitParams) !vo
         return;
     }
 
-    if (params.snapshot) try printSnapshotBody(object, params.ansi_output);
+    if (params.snapshot) try printSnapshotBody(object, params.ansi_output, params.lines);
 
     if (timed_out) {
         try common.printErr("timed out");
@@ -740,18 +762,20 @@ pub fn readTimedOut(object: std.json.ObjectMap) bool {
 /// Print either the plain `buffer` field or the styled `screen_ansi` field
 /// from the response's `snapshot` sub-object, with a trailing newline.
 /// Plain output strips per-line trailing padding and collapses trailing
-/// fill-row runs, same as `hty snapshot`.
-pub fn printSnapshotBody(object: std.json.ObjectMap, ansi_output: bool) !void {
+/// fill-row runs, same as `hty snapshot`. `lines` (from `--lines N:M`)
+/// restricts the output to that row range, applied before the collapse.
+pub fn printSnapshotBody(object: std.json.ObjectMap, ansi_output: bool, lines: ?common.LineRange) !void {
     const snap_val = object.get("snapshot") orelse return;
     if (snap_val != .object) return;
     const field = if (ansi_output) "screen_ansi" else "buffer";
     const body = snap_val.object.get(field) orelse return;
     if (body != .string) return;
+    const text = if (lines) |r| common.sliceLines(body.string, r) else body.string;
     if (ansi_output) {
-        try common.printRaw(body.string);
+        try common.printRaw(text);
         try common.printRaw("\n");
     } else {
-        try common.printPlainSnapshot(body.string);
+        try common.printPlainSnapshot(text);
     }
 }
 
