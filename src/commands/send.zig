@@ -26,6 +26,8 @@ pub fn helpText() []const u8 {
     \\                       Supports ctrl-, alt-/meta-, shift- prefixes,
     \\                       function keys (f1-f12), and combinations like
     \\                       ctrl-alt-f or shift-up. Run `hty keys` for details.
+    \\                       May be repeated; the keys are sent in order,
+    \\                       equivalent to the same names in --seq.
     \\  --seq STRING         Send a sequence of keys, text, and delays in one call.
     \\                       Quoted strings are text, durations (e.g. 200ms, 1s)
     \\                       are pauses, and bare words are key names.
@@ -76,11 +78,28 @@ pub fn helpText() []const u8 {
     ;
 }
 
+/// Assign a single-value flag slot, rejecting a second occurrence so a
+/// repeated flag never silently overwrites the first value.
+fn setOnce(slot: *?[]const u8, value: []const u8) error{DuplicateFlag}!void {
+    if (slot.* != null) return error.DuplicateFlag;
+    slot.* = value;
+}
+
+fn dupFlagExit(comptime flag: []const u8) !void {
+    const hint = if (comptime std.mem.eql(u8, flag, "--seq"))
+        " given more than once; combine everything into one --seq"
+    else
+        " given more than once; use --seq to compose a sequence";
+    try common.printErr(flag ++ hint);
+    std.process.exit(common.ExitCode.generic);
+}
+
 pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     var session_ref: ?[]const u8 = null;
     var text: ?[]const u8 = null;
     var raw_text: ?[]const u8 = null;
-    var key: ?[]const u8 = null;
+    var keys_buf: [256][]const u8 = undefined;
+    var keys_len: usize = 0;
     var bytes_hex: ?[]const u8 = null;
     var seq: ?[]const u8 = null;
     var delay_before: ?[]const u8 = null;
@@ -114,23 +133,25 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         if (std.mem.eql(u8, arg, "--text")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--text requires a value");
-            text = args[i];
+            setOnce(&text, args[i]) catch return dupFlagExit("--text");
         } else if (std.mem.eql(u8, arg, "--raw-text")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--raw-text requires a value");
-            raw_text = args[i];
+            setOnce(&raw_text, args[i]) catch return dupFlagExit("--raw-text");
         } else if (std.mem.eql(u8, arg, "--key")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--key requires a value");
-            key = args[i];
+            if (keys_len >= keys_buf.len) return common.printUsageAndExit("too many --key flags");
+            keys_buf[keys_len] = args[i];
+            keys_len += 1;
         } else if (std.mem.eql(u8, arg, "--bytes-hex")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--bytes-hex requires a value");
-            bytes_hex = args[i];
+            setOnce(&bytes_hex, args[i]) catch return dupFlagExit("--bytes-hex");
         } else if (std.mem.eql(u8, arg, "--seq")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--seq requires a value");
-            seq = args[i];
+            setOnce(&seq, args[i]) catch return dupFlagExit("--seq");
         } else if (std.mem.eql(u8, arg, "--delay-before")) {
             i += 1;
             if (i >= args.len) return common.printUsageAndExit("--delay-before requires a value");
@@ -252,7 +273,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         var c: u8 = 0;
         if (text != null) c += 1;
         if (raw_text != null) c += 1;
-        if (key != null) c += 1;
+        if (keys_len > 0) c += 1;
         if (bytes_hex != null) c += 1;
         if (seq != null) c += 1;
         break :blk c;
@@ -321,7 +342,7 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     countInputModes(.{
         .text = text,
         .raw_text = raw_text,
-        .key = key,
+        .key = if (keys_len > 0) keys_buf[0] else null,
         .bytes_hex = bytes_hex,
         .seq = seq,
     }) catch {
@@ -378,10 +399,8 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
         token_list = .{};
         token_list.tokens[0] = .{ .kind = .text, .value = t };
         token_list.len = 1;
-    } else if (key) |k| {
-        token_list = .{};
-        token_list.tokens[0] = .{ .kind = .key, .value = k };
-        token_list.len = 1;
+    } else if (keys_len > 0) {
+        token_list = keysTokenList(keys_buf[0..keys_len]);
     } else if (bytes_hex) |b| {
         token_list = .{};
         token_list.tokens[0] = .{ .kind = .bytes_hex, .value = b };
@@ -794,6 +813,18 @@ const SeqTokenList = struct {
     }
 };
 
+/// Build a token list from repeated --key flags, preserving order.
+/// The caller guarantees key_names.len <= 256 (enforced at parse time,
+/// matching the SeqTokenList capacity).
+fn keysTokenList(key_names: []const []const u8) SeqTokenList {
+    var result: SeqTokenList = .{};
+    for (key_names) |k| {
+        result.tokens[result.len] = .{ .kind = .key, .value = k };
+        result.len += 1;
+    }
+    return result;
+}
+
 /// Parse a --seq string into tokens.
 /// Quoted strings ("..." or '...') become text tokens.
 /// Bare words that look like durations (e.g. 200ms, 1s) become delay tokens.
@@ -1108,6 +1139,32 @@ test "helpText documents --raw-text" {
     const text = helpText();
     try std.testing.expect(std.mem.indexOf(u8, text, "--raw-text") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "verbatim") != null);
+}
+
+test "keysTokenList: repeated --key values become ordered key tokens" {
+    const result = keysTokenList(&.{ "ctrl-x", "d" });
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 2), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("ctrl-x", tokens[0].value);
+    try std.testing.expectEqual(.key, tokens[1].kind);
+    try std.testing.expectEqualStrings("d", tokens[1].value);
+}
+
+test "keysTokenList: single --key is one key token" {
+    const result = keysTokenList(&.{"enter"});
+    const tokens = result.slice();
+    try std.testing.expectEqual(@as(usize, 1), tokens.len);
+    try std.testing.expectEqual(.key, tokens[0].kind);
+    try std.testing.expectEqualStrings("enter", tokens[0].value);
+}
+
+test "setOnce: second occurrence of a single-value flag is an error" {
+    var slot: ?[]const u8 = null;
+    try setOnce(&slot, "a");
+    try std.testing.expectEqualStrings("a", slot.?);
+    try std.testing.expectError(error.DuplicateFlag, setOnce(&slot, "b"));
+    try std.testing.expectEqualStrings("a", slot.?);
 }
 
 test "countInputModes: exactly one mode is required" {
