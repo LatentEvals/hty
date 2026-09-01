@@ -64,6 +64,10 @@ pub fn run(alloc: Allocator, io: std.Io, args: []const []const u8) !void {
     };
     const field = if (ansi_output) "screen_ansi" else "buffer";
     const text = getString(snap_obj, field) orelse "";
-    try common.printRaw(text);
-    try common.printRaw("\n");
+    if (ansi_output) {
+        try common.printRaw(text);
+        try common.printRaw("\n");
+    } else {
+        try common.printPlainSnapshot(text);
+    }
 }
